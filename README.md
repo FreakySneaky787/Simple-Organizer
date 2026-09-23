@@ -271,7 +271,7 @@ Get-FileHash simple_organizer_windows_v3.3.1\simple_organizer.exe -Algorithm SHA
 1. Run a **Scan**
 2. Open the **Duplicates** tab
 3. Click file rows to select — Ctrl+click for multiple, Shift+click for range
-4. Click **🗑 Move Selected to Trash**
+4. Click **Move Selected to Trash**
 5. Review the confirmation dialog
 6. Click **Yes** — files go to Trash/Recycle Bin
 
