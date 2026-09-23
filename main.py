@@ -21,6 +21,7 @@ from organizer import (
     organise_files,
     revert_staging,
     scan_folder,
+    trash_files,
     undo_last_run,
     undo_specific_run,
 )
@@ -33,7 +34,7 @@ from scheduler import OrganizerScheduler
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.2.2"
+APP_VERSION  = "3.3.1"
 MIN_W, MIN_H = 980, 720
 
 _FONT_UI     = ("Segoe UI", 10)
@@ -387,7 +388,8 @@ class SimpleOrganizerApp(tk.Tk):
         self._scan_result:    ScanResult | None = None
         self._dark_mode:      bool              = bool(self._settings["dark_mode"])
         self._auto_mode:      bool              = False
-        self._busy_flag:      bool              = False   # M5 fix — initialised here
+        self._busy_flag:      bool              = False
+        self._dup_groups:     dict[str, list[str]] = {}  # group_node -> [file_iids]   # M5 fix — initialised here
 
         self._recursive:      tk.BooleanVar = tk.BooleanVar(
             value=bool(self._settings.get("recursive", False)))
@@ -661,7 +663,7 @@ class SimpleOrganizerApp(tk.Tk):
 
         dup_cols = ("file", "size", "location")
         self._dup_tree = ttk.Treeview(
-            dup_tab, columns=dup_cols, show="tree headings", selectmode="browse")
+            dup_tab, columns=dup_cols, show="tree headings", selectmode="extended")
         self._dup_tree.heading("file",     text="File")
         self._dup_tree.heading("size",     text="Size")
         self._dup_tree.heading("location", text="Folder")
@@ -677,11 +679,36 @@ class SimpleOrganizerApp(tk.Tk):
         dup_vsb.grid(row=0, column=1, sticky="ns")
         dup_hsb.grid(row=1, column=0, sticky="ew")
         self._dup_tree.bind("<Button-3>", self._on_dup_context)
+
+        # Duplicates action bar
+        dup_action = ttk.Frame(dup_tab)
+        dup_action.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        self._trash_btn = ttk.Button(
+            dup_action, text="🗑  Move Selected to Trash",
+            style="Warn.TButton", command=self._confirm_and_trash,
+            state="disabled",
+        )
+        self._trash_btn.pack(side="left", padx=(0, 10))
+        _Tooltip(
+            self._trash_btn,
+            "Move selected duplicate files to the system Trash/Recycle Bin.\n"
+            "Files can be restored from Trash.\n"
+            "Select files with click / Ctrl+click / Shift+click.\n"
+            "At least one file per group must remain unselected."
+        )
+
+        self._dup_sel_var = tk.StringVar(value="")
+        ttk.Label(dup_action, textvariable=self._dup_sel_var,
+                  style="Hint.TLabel").pack(side="left")
+
         ttk.Label(
             dup_tab,
-            text="Duplicates are listed for reference only -- nothing is deleted automatically.",
-            font=("Segoe UI", 9, "italic"),
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            text="Select duplicates to remove — keep at least one file per group.",
+            font=("Segoe UI", 8, "italic"),
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self._dup_tree.bind("<<TreeviewSelect>>", self._on_dup_select)
 
         # Tab 2 — Log
         log_tab = ttk.Frame(self._notebook, padding=(4, 4))
@@ -1150,12 +1177,21 @@ class SimpleOrganizerApp(tk.Tk):
                 f"Found {len(result.duplicate_groups)} duplicate group(s) "
                 f"({dup_count} file(s) total)."
             )
+            # _dup_groups: group_node_iid -> list of file iids in that group
+            self._dup_groups: dict[str, list[str]] = {}
             for group_idx, group in enumerate(result.duplicate_groups, start=1):
                 node = self._dup_tree.insert("", "end", text=f"Group {group_idx}",
-                                             values=("", "", ""), open=True)
+                                             values=("", "", ""), open=True,
+                                             tags=("group",))
+                file_iids: list[str] = []
                 for dup in group:
-                    self._dup_tree.insert(node, "end",
-                                          values=(dup.name, _human_size(dup), str(dup.parent)))
+                    iid = self._dup_tree.insert(
+                        node, "end",
+                        values=(dup.name, _human_size(dup), str(dup.parent)),
+                        tags=("file", str(dup)),   # full path in tags
+                    )
+                    file_iids.append(iid)
+                self._dup_groups[node] = file_iids
         else:
             self._log("No duplicate files detected.")
 
@@ -1426,6 +1462,8 @@ class SimpleOrganizerApp(tk.Tk):
                     self._handle_commit_done(event["errors"])
                 elif etype == "revert_done":
                     self._handle_revert_done(event["errors"])
+                elif etype == "trash_done":
+                    self._handle_trash_done(event["errors"], event["count"])
                 elif etype == "schedule_fire":
                     self._run_scheduled_organize()
                 elif etype == "error":
@@ -1476,9 +1514,121 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _clear_duplicates(self) -> None:
         self._dup_tree.delete(*self._dup_tree.get_children())
+        self._dup_groups = {}
+        self._dup_sel_var.set("")
+        self._trash_btn.configure(state="disabled")
 
     def _status(self, message: str) -> None:
         self._status_var.set(message)
+
+    # =========================================================================
+    # Duplicate trash
+    # =========================================================================
+
+    def _on_dup_select(self, _event: Any = None) -> None:
+        """Update selection label and Trash button state when selection changes."""
+        file_iids = self._get_selected_file_iids()
+        count     = len(file_iids)
+        if count == 0:
+            self._dup_sel_var.set("")
+            self._trash_btn.configure(state="disabled")
+        else:
+            self._dup_sel_var.set(f"{count} file(s) selected")
+            # Enable only if the selection is valid (not wiping a whole group)
+            if self._selection_is_valid(file_iids):
+                self._trash_btn.configure(state="normal")
+            else:
+                self._dup_sel_var.set(f"{count} selected — keep at least 1 per group")
+                self._trash_btn.configure(state="disabled")
+
+    def _get_selected_file_iids(self) -> list[str]:
+        """Return selected iids that are file rows (not group headers)."""
+        return [
+            iid for iid in self._dup_tree.selection()
+            if "file" in self._dup_tree.item(iid, "tags")
+        ]
+
+    def _selection_is_valid(self, file_iids: list[str]) -> bool:
+        """Return True if at least one file per group remains unselected."""
+        selected_set = set(file_iids)
+        for group_node, members in self._dup_groups.items():
+            if all(m in selected_set for m in members):
+                return False
+        return True
+
+    def _confirm_and_trash(self) -> None:
+        """Confirm then move selected duplicates to Trash."""
+        file_iids = self._get_selected_file_iids()
+        if not file_iids:
+            return
+        if not self._selection_is_valid(file_iids):
+            messagebox.showwarning(
+                "Invalid selection",
+                "At least one file per duplicate group must remain.\n"
+                "Deselect one file from each fully-selected group.",
+                parent=self,
+            )
+            return
+
+        # Build path list from tags
+        paths: list[Path] = []
+        for iid in file_iids:
+            tags = self._dup_tree.item(iid, "tags")
+            for t in tags:
+                if t != "file":
+                    paths.append(Path(t))
+                    break
+
+        # Build preview list for the dialog
+        preview = "\n".join(f"  • {p.name}  ({p.parent})" for p in paths[:10])
+        if len(paths) > 10:
+            preview += f"\n  … and {len(paths) - 10} more"
+
+        confirmed = messagebox.askyesno(
+            title="Move to Trash",
+            message=(
+                f"Move {len(paths)} file(s) to the system Trash?\n\n"
+                f"{preview}\n\n"
+                "Files can be restored from your Trash / Recycle Bin."
+            ),
+            parent=self,
+        )
+        if not confirmed:
+            return
+
+        self._set_busy(True)
+        self._set_progress(0.0)
+        self._status(f"Moving {len(paths)} file(s) to Trash...")
+        self._notebook.select(self._log_tab_idx)
+
+        t = threading.Thread(target=self._trash_worker, args=(paths,), daemon=True)
+        t.start()
+
+    def _trash_worker(self, paths: list[Path]) -> None:
+        def progress(c: int, t: int) -> None:
+            self._event_queue.put({"type": "progress",
+                                   "value": (c / t * 100) if t else 0})
+        def log_msg(msg: str) -> None:
+            self._event_queue.put({"type": "log", "value": msg})
+        try:
+            errors = trash_files(paths, log_callback=log_msg,
+                                 progress_callback=progress)
+            self._event_queue.put({"type": "trash_done", "errors": errors,
+                                   "count": len(paths)})
+        except Exception as exc:  # noqa: BLE001
+            self._event_queue.put({"type": "error", "value": str(exc)})
+
+    def _handle_trash_done(self, errors: list[str], count: int) -> None:
+        self._set_busy(False)
+        self._set_progress(100.0)
+        # Refresh the duplicates view — re-scan to get updated state
+        self._clear_duplicates()
+        if errors:
+            self._log(f"Trash finished with {len(errors)} error(s). See log.")
+            self._status(f"Trash done — {len(errors)} error(s).")
+        else:
+            self._log(f"{count} file(s) moved to Trash successfully.")
+            self._status(f"Done — {count} file(s) moved to Trash.")
 
     # =========================================================================
     # Context menus
