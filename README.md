@@ -1,26 +1,18 @@
 # Simple Organizer
 
 > Safe, automatic file organisation for Linux and Windows — with sub-categories,
-> a rules engine, multi-level undo, auto-scheduling, and duplicate detection.
+> a rules engine, multi-level undo, auto-scheduling, duplicate detection,
+> and now a built-in duplicate deleter.
 > No data loss. No internet. No background services.
 
-**GitHub:** https://github.com/FreakySneaky787/Simple-Organizer
-**Codeberg:** https://codeberg.org/Simple-Project/Simple-Organizer
-
----
-
-## Welcome Back
-
-After a period of false suspension, i found a way to get the Project back to Github.
-Releases are now published on **both GitHub and Codeberg** simultaneously.
-
-Thank you to everyone who followed the project on Codeberg during this time.
+**GitHub:** https://github.com/SchnekayOpen/Simple-Organizer
+**Codeberg:** https://codeberg.org/SchnekayOpen/Simple-Organizer
 
 ---
 
 ## Table of Contents
 
-- [What's New in v3.2.2](#whats-new-in-v322)
+- [What's New in v3.3.1](#whats-new-in-v331)
 - [Downloads](#downloads)
 - [Features](#features)
 - [Safety Guarantees](#safety-guarantees)
@@ -37,81 +29,72 @@ Thank you to everyone who followed the project on Codeberg during this time.
 
 ---
 
-## What's New in v3.2.2
+## What's New in v3.3.1
+
+### Duplicate Deleter
+
+The biggest new feature since the rules engine. The Duplicates tab now lets
+you act on duplicates — not just view them.
+
+After a scan, select any duplicate file rows using click, Ctrl+click, or
+Shift+click. Then click **🗑 Move Selected to Trash** to send them to the
+system Trash or Recycle Bin.
+
+**How it works:**
+- Multi-select is fully supported — click, Ctrl+click, Shift+click
+- A live label shows how many files are selected
+- The **Move to Trash** button is disabled until you make a valid selection
+- A confirmation dialog shows exactly which files will be moved before
+  anything happens
+- Every trashed file is logged in the Log tab
+
+**Safety rules — always enforced:**
+- At least one file per duplicate group must remain — you can never
+  trash an entire group accidentally. The button stays disabled and shows
+  `"keep at least 1 per group"` if the selection is invalid.
+- Files go to the **system Trash / Recycle Bin** only — nothing is ever
+  permanently deleted
+- App files are excluded from duplicate results entirely
+
+**Cross-platform implementation — no external packages:**
+
+| Platform | Method |
+|----------|--------|
+| Windows | `ctypes` → `SHFileOperation` with `FOF_ALLOWUNDO` (native Recycle Bin) |
+| Linux | `gio trash` → `trash-put` → manual XDG Trash fallback |
+
+No `send2trash` or any other pip dependency required.
 
 ### Bug Fixes
 
-**Window icon disappearing during runtime** — `main.py` · Medium
-The window icon was stored as a local variable inside `__init__`. Python's
-garbage collector could destroy the `PhotoImage` object after startup,
-removing the icon from the title bar mid-session. Fixed: stored as
-`self._icon` to keep it alive for the lifetime of the window.
+**`save_rules()` silently swallowed write errors** — `rules.py` · Low
+`save_rules()` caught all exceptions with `pass`, making a failed rules
+write invisible. Fixed: now returns `bool` and the caller logs a warning
+in the Log tab if saving fails.
 
-**History write errors invisible to user** — `organizer.py` · Medium
-`_write_history_run()` caught all exceptions silently. A full disk or
-permission error during history writing gave no feedback. Fixed: errors
-now surface via `log_callback` and appear in the Log tab.
-
-**Settings save failures invisible** — `config.py` · Low–Medium
-`save_settings()` always returned `None` regardless of success or failure.
-A failed write went completely unnoticed. Fixed: now returns `bool`. If
-saving fails, a warning appears in the Log tab immediately.
-
-**Rule numeric values not validated** — `main.py` · Low–Medium
-Entering `abc` for a numeric condition like `min_size_mb` saved without
-error and silently never matched any file. Fixed: the Add Rule dialog now
-validates numeric fields and shows a clear error message for invalid input.
-
-**Undo rename timestamp collision** — `organizer.py` · Low
-The `undone_*` history rename used a seconds-only timestamp. Two undo
-operations within the same second could target the same filename. Fixed:
-microseconds added (`%Y%m%dT%H%M%S_%f`) matching the rest of the history system.
-
-**`import time` inside function body** — `organizer.py` · Low
-`import time` was placed inside `_iter_files_recursive()` and executed on
-every scan. Moved to the top-level imports where it belongs.
-
-**Dead `entry_fg` key in theme dicts** — `utils.py` · Low
-Both `LIGHT_THEME` and `DARK_THEME` defined `entry_fg` which was never
-read anywhere in `_apply_ttk_theme`. Removed.
-
-### Dark Mode Overhaul
-
-The dark theme has been completely redesigned based on the **Tokyo Night**
-colour palette for a more modern, polished look.
-
-| Element | Before | After |
-|---------|--------|-------|
-| Background | `#1e1e2e` flat grey-blue | `#1a1b26` deep navy |
-| Text | `#cdd6f4` | `#c0caf5` warm lavender |
-| Accent | `#89b4fa` | `#7aa2f7` vivid blue |
-| Input fields | `#313244` | `#1f2335` distinct dark |
-| Log area | `#11111b` | `#0d0e17` near-black |
-| Row selection | `#89b4fa` blue on dark | `#2e4479` deep navy |
-
-Additional visual improvements across both themes:
-- Section headers and treeview column headings now use the accent colour
-- Button hover state uses a computed lighter shade of the accent
-- Treeview row height increased from 22 to 24 px for better readability
-- Light theme accent updated to a richer blue (`#2563ab`)
+**`_adjust_colour()` only lightened colours** — `main.py` · Low
+The hover colour helper always added to RGB channels, making colours
+lighter regardless of the theme. In light mode the hover was barely
+visible. Fixed: the function now supports negative amounts to darken,
+and the light theme hover correctly darkens the accent.
 
 ---
 
 ## Downloads
 
-### Latest — v3.2.2
+### Latest — v3.3.1
 
 | Platform | File |
 |----------|------|
-| Linux x86-64 | `simple_organizer_linux_v3.2.2.tar.gz` |
-| Linux x86-64 | `simple_organizer_linux_v3.2.2.sha256` |
-| Windows 10/11 | `simple_organizer_windows_v3.2.2.zip` |
-| Windows 10/11 | `simple_organizer_windows_v3.2.2.sha256` |
+| Linux x86-64 | `simple_organizer_linux_v3.3.1.tar.gz` |
+| Linux x86-64 | `simple_organizer_linux_v3.3.1.sha256` |
+| Windows 10/11 | `simple_organizer_windows_v3.3.1.zip` |
+| Windows 10/11 | `simple_organizer_windows_v3.3.1.sha256` |
 
-→ [GitHub Releases](Soon)
-→ [Codeberg Releases](https://codeberg.org/Simple-Project/Simple-Organizer)
+→ [GitHub Releases](../../releases/tag/v3.3.1)
+→ [Codeberg Releases](https://codeberg.org/SchnekayOpen/Simple-Organizer/releases/tag/v3.3.1)
 
-> **Note:** The `.sha256` file contains a checksum of the **binary or exe**
+> **Note:** The `.sha256` file is a checksum of the **binary or exe**
 > directly — not of the tar/zip archive.
 
 ---
@@ -128,7 +111,7 @@ Additional visual improvements across both themes:
 
 - Symbolic links are **never** followed
 - `/proc` and `/sys` unconditionally excluded on Linux
-- App's own directory excluded from all scans and duplicate detection
+- App directory excluded from all scans and duplicate detection
 - All scan options remembered between sessions
 
 ### Default File Categories
@@ -146,7 +129,7 @@ Additional visual improvements across both themes:
 ### Sub-Categories (Toggle)
 
 Enable **Use sub-categories** to sort into sub-folders inside each category.
-Off by default — existing workflows are completely unaffected.
+Off by default.
 
 ```
 Images/Photos/        Images/Raw/         Images/Editing/
@@ -156,10 +139,7 @@ Music/Lossless/       Music/MP3/          Music/AAC/
 Videos/MP4/           Videos/MKV/
 Archives/ZIP/         Archives/RAR/       Archives/TAR/
 Code/Python/          Code/JavaScript/    Code/Web/
-Code/Shell/           Code/Config/
 ```
-
-Custom Rules are never affected by this toggle.
 
 ### Rules Engine
 
@@ -172,42 +152,38 @@ Custom Rules are never affected by this toggle.
 | Older than (days) | `365` | Not modified in over a year |
 | Newer than (days) | `7` | Modified in the last week |
 
-Numeric rule values are now validated on entry — invalid values show an
-error dialog instead of silently never matching.
-
 ### Staging Mode
 
-Files move to a temporary area first. Inspect, then **Commit** to finalise
-or **Revert** to cancel.
+Files move to a temporary area first. Inspect, then **Commit** or **Revert**.
 
 - Linux: `~/.local/share/simple_organizer/staging/`
 - Windows: `%APPDATA%\simple_organizer\staging\`
 
 ### Multi-Level Undo
 
-Every organise operation is logged. **Undo Last Run** reverses the most
-recent operation. **History** lists the last 20 runs — undo any specific one.
+**Undo Last Run** reverses the most recent operation. **History** lists the
+last 20 runs — undo any specific one.
 
 ### Auto-Organize Scheduler
 
-Fixed-interval automatic organise runs from 1 to 1440 minutes. Runs
-silently. Stops when the app closes. Never runs as a system service.
+Fixed-interval automatic organise runs (1–1440 minutes). Stops when the
+app closes. Never runs as a system service.
 
-### Duplicate Detection
+### Duplicate Detection + Deletion
 
-Two-stage: size buckets then SHA-256. Files over 500 MB skipped. Nothing
-deleted. App files never included in results.
+Two-stage: size buckets then SHA-256. Files over 500 MB skipped. Select
+duplicates in the Duplicates tab and move them to Trash with one click.
+At least one file per group is always kept. Nothing is permanently deleted.
 
 ### Context Menus
 
-Right-click any row in the Preview or Duplicates tab to open the containing
-folder or copy the path to the clipboard.
+Right-click any row in Preview or Duplicates tab to open the folder or
+copy the path to the clipboard.
 
 ### Persistent Settings
 
 Remembers last folder, theme, all scan options, staging mode, sub-categories,
-scheduler state, and window size between sessions. Failed saves now shown in
-the Log tab instead of being invisible.
+scheduler state, and window size between sessions.
 
 ### Self-Protection
 
@@ -220,13 +196,14 @@ all scans, planning, and duplicate detection at three independent layers.
 
 | Guarantee | How enforced |
 |-----------|-------------|
-| No deletion | `os.remove()` and `shutil.rmtree()` never called |
-| No overwrites | `resolve_conflict()` runs before every single move |
+| No permanent deletion | Duplicates go to system Trash only — never `os.remove()` |
+| No overwrites | `resolve_conflict()` runs before every move |
 | No symlink traversal | `is_symlink()` checked before processing |
 | No system dirs | `/proc` and `/sys` hard-excluded on Linux |
 | Bounded scans | Hard limits on depth, dir count, and time |
 | Thread safety | All file ops in daemon threads via `queue.Queue` |
 | Self-protection | App directory excluded at three independent layers |
+| Group integrity | Cannot trash all files in a duplicate group |
 
 ---
 
@@ -238,8 +215,6 @@ all scans, planning, and duplicate detection at three independent layers.
 | Windows 10/11 | `.zip` + `.exe` | Windows 10, Windows 11 |
 | macOS | Not supported | — |
 
-One codebase. No feature differences between platforms.
-
 ---
 
 ## Installation
@@ -247,40 +222,15 @@ One codebase. No feature differences between platforms.
 ### Linux
 
 ```bash
-tar -xzf simple_organizer_linux_v3.2.2.tar.gz
-cd simple_organizer_linux_v3.2.2
+tar -xzf simple_organizer_linux_v3.3.1.tar.gz
+cd simple_organizer_linux_v3.3.1
 chmod +x simple_organizer
 ./simple_organizer
 ```
 
-**Add to application menu (optional):**
-
-```bash
-mkdir -p ~/.local/share/applications
-
-cat > ~/.local/share/applications/simple-organizer.desktop << 'DESK'
-[Desktop Entry]
-Name=Simple Organizer
-Comment=Safe file organiser with undo support
-Exec="/full/path/to/simple_organizer"
-Icon=/full/path/to/icon.png
-Terminal=false
-Type=Application
-Categories=Utility;
-DESK
-
-chmod +x ~/.local/share/applications/simple-organizer.desktop
-update-desktop-database ~/.local/share/applications
-```
-
-> **Bazzite / KDE Plasma:** run `kbuildsycoca6 --noincremental` if the icon
-> does not appear after the above.
->
-> **GNOME:** wrap the `Exec=` path in quotes if it contains spaces.
-
 ### Windows
 
-1. Download and extract `simple_organizer_windows_v3.2.2.zip`
+1. Download and extract `simple_organizer_windows_v3.3.1.zip`
 2. Double-click `simple_organizer.exe`
 3. If Windows Defender warns: right-click → **Properties** → **Unblock**
 
@@ -288,21 +238,18 @@ update-desktop-database ~/.local/share/applications
 
 ## Verifying Downloads
 
-The `.sha256` file contains a checksum of the **binary** directly, not the
-archive.
+The `.sha256` file is a checksum of the **binary** — not the archive.
 
-**Linux — verify after extracting:**
 ```bash
-tar -xzf simple_organizer_linux_v3.2.2.tar.gz
-cd simple_organizer_linux_v3.2.2
-sha256sum -c ../simple_organizer_linux_v3.2.2.sha256
-# Expected: simple_organizer: OK
+# Linux — verify after extracting
+tar -xzf simple_organizer_linux_v3.3.1.tar.gz
+cd simple_organizer_linux_v3.3.1
+sha256sum -c ../simple_organizer_linux_v3.3.1.sha256
 ```
 
-**Windows — verify the exe:**
 ```powershell
-Get-FileHash simple_organizer_windows_v3.2.2\simple_organizer.exe -Algorithm SHA256
-# Compare against simple_organizer_windows_v3.2.2.sha256
+# Windows
+Get-FileHash simple_organizer_windows_v3.3.1\simple_organizer.exe -Algorithm SHA256
 ```
 
 ---
@@ -313,11 +260,20 @@ Get-FileHash simple_organizer_windows_v3.2.2\simple_organizer.exe -Algorithm SHA
 
 1. Launch — last folder pre-selected automatically
 2. **Browse** to choose a folder
-3. Set scan options (recursive, sub-categories, staging mode)
+3. Set scan options
 4. **Scan** (`Ctrl+R`) — Preview tab shows planned moves with file count
 5. Review Preview; right-click rows for folder/path actions
 6. **Organize** (`Ctrl+O`) — confirms total count and size
 7. **Undo Last Run** (`Ctrl+Z`) or **History** to reverse if needed
+
+### Using the Duplicate Deleter
+
+1. Run a **Scan**
+2. Open the **Duplicates** tab
+3. Click file rows to select — Ctrl+click for multiple, Shift+click for range
+4. Click **🗑 Move Selected to Trash**
+5. Review the confirmation dialog
+6. Click **Yes** — files go to Trash/Recycle Bin
 
 ### Keyboard Shortcuts
 
@@ -345,12 +301,27 @@ Get-FileHash simple_organizer_windows_v3.2.2\simple_organizer.exe -Algorithm SHA
 ## Adding to Your App Menu — Linux
 
 ```bash
-# Find your binary path
-find ~/ -name "simple_organizer" -type f 2>/dev/null
+mkdir -p ~/.local/share/applications
+
+cat > ~/.local/share/applications/simple-organizer.desktop << 'DESK'
+[Desktop Entry]
+Name=Simple Organizer
+Comment=Safe file organiser with undo support
+Exec="/full/path/to/simple_organizer"
+Icon=/full/path/to/icon.png
+Terminal=false
+Type=Application
+Categories=Utility;
+DESK
+
+chmod +x ~/.local/share/applications/simple-organizer.desktop
+update-desktop-database ~/.local/share/applications
 ```
 
-Then create the desktop entry with the full path. See the Installation
-section above for the full command.
+> **Bazzite / KDE Plasma:** run `kbuildsycoca6 --noincremental` if the icon
+> does not appear.
+>
+> **GNOME:** wrap the `Exec=` path in quotes if it contains spaces.
 
 ---
 
@@ -384,7 +355,7 @@ pyinstaller --onefile --windowed --name simple_organizer \
     --add-data "icon.png:." main.py
 
 # Windows
-pyinstaller --onefile --windowed --name simple_organizer ^
+py -m PyInstaller --onefile --windowed --name simple_organizer ^
     --add-data "icon.png;." --icon icon.ico main.py
 ```
 
@@ -392,10 +363,9 @@ pyinstaller --onefile --windowed --name simple_organizer ^
 
 ## Known Limitations
 
-- Only direct organise runs appear in the History dialog — staging commits
-  recorded as a single last_run entry
-- In recursive mode, files land in the top-level category folder — original
-  subfolder structure not preserved
+- Trashing duplicates clears the Duplicates tab — re-scan to see updated results
+- Only direct organise runs appear in the History dialog
+- In recursive mode, files land in the top-level category folder
 - Files over 500 MB skipped for duplicate detection
 - Drag-and-drop requires the `tkdnd` Tcl extension (silently disabled if absent)
 - Network drives untested
@@ -405,22 +375,18 @@ pyinstaller --onefile --windowed --name simple_organizer ^
 
 ## Roadmap
 
-- Exclusion list editor in the UI
 - Filter / search bar in the Preview tab
 - CSV / HTML export of scan results
 - Watch mode — live folder monitoring
 - Flatpak / AppImage packaging for Linux
 - Code-signed Windows executable
 - Automated test suite with pytest
-- GitHub Actions CI with per-platform builds
 
 ---
 
 ## License
 
-MIT License
-
-Copyright (c) 2026 Simple-Project/FreakySneaky787
+MIT License — Copyright (c) 2026 SchnekayOpen
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -437,8 +403,5 @@ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
