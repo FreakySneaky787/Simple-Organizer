@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -773,8 +774,124 @@ def _remove_empty_staging_dirs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# State helpers
+# Duplicate trash
 # ---------------------------------------------------------------------------
+
+def _trash_file_platform(path: Path) -> None:
+    """Move a single file to the system Trash/Recycle Bin.
+
+    Uses platform-native methods only — no external packages required.
+    Raises OSError or subprocess.CalledProcessError on failure.
+    """
+    if sys.platform == "win32":
+        # Windows: SHFileOperation with FOF_ALLOWUNDO sends to Recycle Bin.
+        import ctypes
+        import ctypes.wintypes
+        SHFileOperationW = ctypes.windll.shell32.SHFileOperationW  # type: ignore[attr-defined]
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [
+                ("hwnd",                  ctypes.wintypes.HWND),
+                ("wFunc",                 ctypes.wintypes.UINT),
+                ("pFrom",                 ctypes.c_wchar_p),
+                ("pTo",                   ctypes.c_wchar_p),
+                ("fFlags",                ctypes.wintypes.WORD),
+                ("fAnyOperationsAborted", ctypes.wintypes.BOOL),
+                ("hNameMappings",         ctypes.c_void_p),
+                ("lpszProgressTitle",     ctypes.c_wchar_p),
+            ]
+
+        FO_DELETE     = 0x0003
+        FOF_ALLOWUNDO = 0x0040
+        FOF_NOCONFIRMATION = 0x0010
+        FOF_SILENT    = 0x0004
+
+        # pFrom must be double-null-terminated
+        src = str(path.resolve()) + "\0\0"
+        op  = SHFILEOPSTRUCTW()
+        op.wFunc  = FO_DELETE
+        op.pFrom  = src
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
+        result = SHFileOperationW(ctypes.byref(op))
+        if result != 0:
+            raise OSError(f"SHFileOperation failed with code {result}")
+
+    else:
+        # Linux / macOS: try gio trash first (GNOME), then trash-put (trash-cli),
+        # then fall back to a manual XDG Trash implementation.
+        resolved = path.resolve()
+
+        # Attempt 1: gio trash
+        try:
+            import subprocess as _sp
+            _sp.run(["gio", "trash", str(resolved)],
+                    check=True, capture_output=True)
+            return
+        except (FileNotFoundError, Exception):
+            pass
+
+        # Attempt 2: trash-put
+        try:
+            import subprocess as _sp
+            _sp.run(["trash-put", str(resolved)],
+                    check=True, capture_output=True)
+            return
+        except (FileNotFoundError, Exception):
+            pass
+
+        # Attempt 3: manual XDG Trash
+        from datetime import datetime as _dt
+        trash_dir   = Path.home() / ".local" / "share" / "Trash"
+        files_dir   = trash_dir / "files"
+        info_dir    = trash_dir / "info"
+        files_dir.mkdir(parents=True, exist_ok=True)
+        info_dir.mkdir(parents=True, exist_ok=True)
+
+        dest = resolve_conflict(files_dir / resolved.name)
+        info = info_dir / f"{dest.name}.trashinfo"
+        shutil.move(str(resolved), str(dest))
+        info.write_text(
+            "[Trash Info]\n"
+            f"Path={resolved}\n"
+            f"DeletionDate={_dt.now().strftime('%Y-%m-%dT%H:%M:%S')}\n",
+            encoding="utf-8",
+        )
+
+
+def trash_files(
+    paths:         list[Path],
+    log_callback:  Callable[[str], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[str]:
+    """Move a list of files to the system Trash/Recycle Bin.
+
+    Files are NEVER permanently deleted.
+    Returns a list of error strings for any files that could not be trashed.
+    """
+    errors: list[str] = []
+    total   = len(paths)
+
+    for idx, path in enumerate(paths, start=1):
+        if progress_callback:
+            progress_callback(idx, total)
+
+        if not path.exists():
+            msg = f"[SKIP]  {path.name} — not found, already moved or deleted."
+            if log_callback:
+                log_callback(msg)
+            continue
+
+        try:
+            _trash_file_platform(path)
+            if log_callback:
+                log_callback(f"[TRASHED]  {path.name}  ({path.parent})")
+        except Exception as exc:  # noqa: BLE001
+            err = f"[ERROR]  Could not trash {path.name}: {exc}"
+            errors.append(err)
+            if log_callback:
+                log_callback(err)
+
+    return errors
 
 def has_last_run() -> bool:
     return LAST_RUN_FILE.exists()
