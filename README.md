@@ -6,7 +6,7 @@
 > No data loss. No internet. No background services.
 
 **GitHub:** https://github.com/SchnekayOpen/Simple-Organizer
-**Codeberg:** https://codeberg.org/SchnekayOpen/Simple-Organizer
+**Codeberg:** https://codeberg.org/Simple-Project/Simple-Organizer
 
 ---
 
