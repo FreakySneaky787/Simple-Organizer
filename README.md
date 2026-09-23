@@ -37,7 +37,7 @@ The biggest new feature since the rules engine. The Duplicates tab now lets
 you act on duplicates — not just view them.
 
 After a scan, select any duplicate file rows using click, Ctrl+click, or
-Shift+click. Then click **🗑 Move Selected to Trash** to send them to the
+Shift+click. Then click **Move Selected to Trash** to send them to the
 system Trash or Recycle Bin.
 
 **How it works:**
