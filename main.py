@@ -876,6 +876,7 @@ class SimpleOrganizerApp(tk.Tk):
         self._dup_tree.column("location",  width=360, anchor="w", stretch=True)
         self._dup_tree.bind("<Button-3>", self._on_dup_context)
         self._dup_tree.bind("<<TreeviewSelect>>", self._on_dup_select)
+        self._dup_tree.bind("<Button-1>", self._on_dup_click)
 
         self._dup_empty = self._with_icon(ttk.Label(
             tab, text="No duplicates found yet.", style="Empty.TLabel", compound="top"),
@@ -1927,6 +1928,14 @@ class SimpleOrganizerApp(tk.Tk):
     # =========================================================================
     # Duplicate trash
     # =========================================================================
+
+    def _on_dup_click(self, event: Any) -> str | None:
+        """Clicking anywhere on a group row opens or closes it."""
+        row = self._dup_tree.identify_row(event.y)
+        if not row or "group" not in self._dup_tree.item(row, "tags"):
+            return None
+        self._dup_tree.item(row, open=not self._dup_tree.item(row, "open"))
+        return "break"
 
     def _on_dup_select(self, _event: Any = None) -> None:
         """Update selection label and Trash button state when selection changes."""
