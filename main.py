@@ -5,8 +5,9 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,8 @@ from organizer import (
     undo_specific_run,
 )
 from utils import DARK_THEME, LIGHT_THEME, safe_expanduser
+from theme import FONTS, apply_ttk_theme, float_key, load_fonts, set_titlebar_theme
+from icons import badge, icon
 from config import load_settings, save_settings
 from rules import Rule, CONDITION_TYPES, CONDITION_LABELS, load_rules, save_rules
 from scheduler import OrganizerScheduler
@@ -36,19 +39,27 @@ from scheduler import OrganizerScheduler
 APP_TITLE    = "Simple Organizer"
 APP_VERSION  = "3.3.1"
 MIN_W, MIN_H = 980, 720
+SIDEBAR_W    = 268
 
-_FONT_UI     = ("Segoe UI", 10)
-_FONT_BOLD   = ("Segoe UI", 10, "bold")
-_FONT_TITLE  = ("Segoe UI", 15, "bold")
-_FONT_HEADER = ("Segoe UI", 9, "bold")
-# "Courier New" renders correctly on both Windows and Linux
-_FONT_MONO   = ("Courier New", 9)
-
-_BTN_W = 14
+_LOG_TAGS = {
+    "[ERROR]":     "error",
+    "[WARN]":      "warn",
+    "[LIMIT]":     "warn",
+    "[TIMEOUT]":   "warn",
+    "[DEPTH]":     "muted",
+    "[SKIP]":      "muted",
+    "[MOVED]":     "ok",
+    "[STAGED]":    "ok",
+    "[UNDONE]":    "ok",
+    "[COMMITTED]": "ok",
+    "[REVERTED]":  "ok",
+    "[TRASHED]":   "ok",
+    "[SCHEDULE]":  "info",
+}
 
 
 # ---------------------------------------------------------------------------
-# Lightweight tooltip
+# Small widgets
 # ---------------------------------------------------------------------------
 
 class _Tooltip:
@@ -82,142 +93,291 @@ class _Tooltip:
             self._win = tk.Toplevel(self._widget)
             self._win.wm_overrideredirect(True)
             self._win.wm_geometry(f"+{x}+{y}")
-            tk.Label(
-                self._win, text=self._text,
-                background="#ffffe0", foreground="#333333",
-                relief="solid", borderwidth=1,
-                font=("Segoe UI", 9), padx=6, pady=3,
-                justify="left", wraplength=320,
-            ).pack()
+            border = ttk.Frame(self._win, style="Tooltip.TFrame", padding=1)
+            border.pack()
+            ttk.Label(border, text=self._text, style="Tooltip.TLabel",
+                      justify="left", wraplength=320).pack()
         except Exception:
             # Widget may have been destroyed before the timer fired.
             self._win = None
 
 
+class _AutoScrollbar(ttk.Scrollbar):
+    """Scrollbar that hides itself while everything fits."""
+
+    def set(self, first: float | str, last: float | str) -> None:
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.grid_remove()
+        else:
+            self.grid()
+        super().set(first, last)
+
+
+class _Stepper(ttk.Frame):
+    """Numeric input with − and + buttons. Also steps with the mouse wheel and arrow keys."""
+
+    def __init__(self, parent: tk.Misc, variable: tk.IntVar | tk.DoubleVar,
+                 low: float, high: float, step: float, width: int = 6,
+                 command: Any = None) -> None:
+        super().__init__(parent, style="Panel.TFrame")
+        self._var, self._low, self._high, self._step = variable, low, high, step
+        self._command = command
+
+        app: SimpleOrganizerApp = self._root()  # type: ignore[assignment]
+        side = app._px(26)
+
+        def square_button(glyph: str, direction: int) -> ttk.Button:
+            holder = ttk.Frame(self, style="Panel.TFrame", width=side, height=side)
+            holder.pack_propagate(False)
+            holder.pack(side="left")
+            button = ttk.Button(holder, style="Step.TButton",
+                                command=lambda: self._nudge(direction))
+            button.pack(fill="both", expand=True)
+            return app._with_icon(button, glyph)
+
+        self._minus = square_button("minus", -1)
+        self._entry = ttk.Entry(self, textvariable=variable, width=width,
+                                justify="center", style="Step.TEntry")
+        self._entry.pack(side="left", fill="y", padx=4)
+        self._plus = square_button("plus", 1)
+
+        self._entry.bind("<Up>",         lambda _e: self._nudge(1))
+        self._entry.bind("<Down>",       lambda _e: self._nudge(-1))
+        self._entry.bind("<MouseWheel>", lambda e: self._nudge(1 if e.delta > 0 else -1))
+        self._entry.bind("<Button-4>",   lambda _e: self._nudge(1))
+        self._entry.bind("<Button-5>",   lambda _e: self._nudge(-1))
+        self._entry.bind("<Return>",     lambda _e: self._nudge(0))
+        self._entry.bind("<FocusOut>",   lambda _e: self._nudge(0))
+
+    def _nudge(self, direction: int) -> str:
+        if str(self._entry.cget("state")) == "disabled":
+            return "break"
+        try:
+            value = self._var.get()
+        except tk.TclError:
+            value = self._low
+        value = min(self._high, max(self._low, value + direction * self._step))
+        self._var.set(int(value) if isinstance(self._var, tk.IntVar) else value)
+        if self._command:
+            self._command()
+        return "break"
+
+    def configure(self, cnf: Any = None, **kw: Any) -> Any:
+        state = kw.pop("state", None)
+        if state is not None:
+            for widget in (self._minus, self._entry, self._plus):
+                widget.configure(state=state)
+        if cnf or kw:
+            return super().configure(cnf, **kw)
+        return None
+
+    config = configure
+
+
 # ---------------------------------------------------------------------------
-# Undo history dialog
+# In-app dialogs
 # ---------------------------------------------------------------------------
 
-class _HistoryDialog(tk.Toplevel):
-    def __init__(self, parent: "SimpleOrganizerApp") -> None:
-        super().__init__(parent)
-        self._app = parent
-        self.title("Undo History")
-        self.resizable(False, False)
-        self.transient(parent)
+def _chroma_key(window: tk.Toplevel, theme: dict[str, str]) -> None:
+    """Make the square corners around a Float.TFrame card see-through (Windows only)."""
+    key = float_key(theme)
+    window.configure(bg=key)
+    if sys.platform == "win32":
+        window.attributes("-transparentcolor", key)
+
+
+def _set_alpha(window: tk.Toplevel, alpha: float) -> None:
+    try:
+        window.attributes("-alpha", alpha)
+    except tk.TclError:
+        pass
+
+
+class _Overlay(tk.Toplevel):
+    """Modal card centred over the main window, with a title bar, body and footer."""
+
+    _FADE_STEPS = 5
+
+    def __init__(self, parent: tk.Misc, title: str) -> None:
+        app: SimpleOrganizerApp = parent._root()  # type: ignore[attr-defined]
+        self._app = app
+
+        super().__init__(app)
+        self.overrideredirect(True)
+        _set_alpha(self, 0.0)
+        _chroma_key(self, app._theme)
+
+        card = ttk.Frame(self, style="Float.TFrame", padding=3)
+        card.pack(fill="both", expand=True)
+
+        head = ttk.Frame(card, style="Panel.TFrame", padding=(18, 10, 10, 10))
+        head.pack(fill="x")
+        ttk.Label(head, text=title, style="DialogTitle.TLabel").pack(side="left")
+        ttk.Button(
+            head, style="Card.Ghost.TButton", command=self.destroy,
+            image=(icon(self, "x", app._px(14), app._theme["fg_dim"]),
+                   "active", icon(self, "x", app._px(14), app._theme["fg"])),
+        ).pack(side="right")
+        ttk.Frame(card, style="Rule.TFrame", height=1).pack(fill="x")
+
+        self.body = ttk.Frame(card, style="Panel.TFrame", padding=(20, 16, 20, 18))
+        self.body.pack(fill="both", expand=True)
+
+        ttk.Frame(card, style="Rule.TFrame", height=1).pack(fill="x")
+        self.footer = ttk.Frame(card, style="Panel.TFrame", padding=(18, 12))
+        self.footer.pack(fill="x")
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def button(self, text: str, command: Any, primary: bool = False) -> ttk.Button:
+        """Add a footer button; buttons are laid out right to left."""
+        btn = ttk.Button(self.footer, text=text, command=command,
+                         style="Card.Primary.TButton" if primary else "Card.TButton")
+        btn.pack(side="right", padx=(8, 0))
+        return btn
+
+    def show(self, focus: tk.Widget | None = None) -> None:
+        self._app._overlays.append(self)
+        self.follow()
         self.grab_set()
+        (focus or self).focus_force()
+        self._fade(1)
+
+    def follow(self) -> None:
+        """Centre the card on the main window."""
+        app = self._app
+        # Raise first: raising an unmapped borderless window on Windows resets it to 0,0.
+        self.lift()
+        x, y = app.winfo_rootx(), app.winfo_rooty()
+        w, h = app.winfo_width(), app.winfo_height()
+        self.update_idletasks()
+        cw, ch = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"{cw}x{ch}+{x + (w - cw) // 2}+{y + (h - ch) // 2}")
+        # Changing the alpha before the geometry is applied snaps the window back to 0,0.
+        self.update_idletasks()
+
+    def _fade(self, step: int) -> None:
+        if not self.winfo_exists():
+            return
+        _set_alpha(self, step / self._FADE_STEPS)
+        if step < self._FADE_STEPS:
+            self.after(15, self._fade, step + 1)
+
+    def destroy(self) -> None:
+        if self in self._app._overlays:
+            self._app._overlays.remove(self)
+        super().destroy()
+
+
+class _HistoryDialog(_Overlay):
+    def __init__(self, parent: "SimpleOrganizerApp") -> None:
+        super().__init__(parent, "Undo history")
         self._build()
         self._load()
-        self.update_idletasks()
-        px = parent.winfo_rootx() + (parent.winfo_width()  - self.winfo_width())  // 2
-        py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
-        self.geometry(f"+{px}+{py}")
+        self.show(self._tree)
 
     def _build(self) -> None:
-        f = ttk.Frame(self, padding=12)
-        f.pack(fill="both", expand=True)
-        ttk.Label(f, text="Select a run to undo:", font=_FONT_BOLD).pack(anchor="w", pady=(0, 6))
-        lf = ttk.Frame(f)
-        lf.pack(fill="both", expand=True)
-        self._lb = tk.Listbox(lf, width=46, height=10, font=_FONT_UI, selectmode="single")
-        sb = ttk.Scrollbar(lf, orient="vertical", command=self._lb.yview)
-        self._lb.configure(yscrollcommand=sb.set)
-        self._lb.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        bf = ttk.Frame(f)
-        bf.pack(fill="x", pady=(10, 0))
-        self._undo_btn = ttk.Button(bf, text="Undo Selected",
-                                    style="Accent.TButton", command=self._on_undo)
-        self._undo_btn.pack(side="left", padx=(0, 6))
-        ttk.Button(bf, text="Close", command=self.destroy).pack(side="left")
+        f = self.body
+        ttk.Label(f, text="Pick a run to restore. Newest first.",
+                  style="CardHint.TLabel").pack(anchor="w", pady=(0, 10))
+
+        box = ttk.Frame(f, style="Panel.TFrame")
+        box.pack(fill="both", expand=True)
+        box.columnconfigure(0, weight=1)
+        self._tree = ttk.Treeview(box, show="tree", selectmode="browse", height=9)
+        self._tree.column("#0", width=420)
+        sb = _AutoScrollbar(box, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=sb.set)
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        self._tree.bind("<Double-1>", lambda _e: self._on_undo())
+        self._tree.bind("<Return>",   lambda _e: self._on_undo())
+        self._tree.tag_configure("empty", foreground=self._app._theme["fg_muted"])
+
         ttk.Label(
             f,
-            text="Note: undoing an older run may partially fail if files have moved since.",
-            font=("Segoe UI", 8, "italic"),
-        ).pack(anchor="w", pady=(8, 0))
+            text="Undoing an older run may partially fail if files have moved since.",
+            style="CardHint.TLabel",
+        ).pack(anchor="w", pady=(10, 0))
+
+        self.button("Close", self.destroy)
+        self._undo_btn = self.button("Undo selected", self._on_undo, primary=True)
 
     def _load(self) -> None:
         self._entries = list_undo_history()
-        self._lb.delete(0, "end")
+        self._tree.delete(*self._tree.get_children())
         if not self._entries:
-            self._lb.insert("end", "No history available.")
+            self._tree.insert("", "end", text="No history available.", tags=("empty",))
             self._undo_btn.configure(state="disabled")
-        else:
-            for e in self._entries:
-                self._lb.insert("end", f"  {e['label']}")
-            self._lb.selection_set(0)
+            return
+        for i, e in enumerate(self._entries):
+            self._tree.insert("", "end", iid=str(i), text=e["label"])
+        self._tree.selection_set("0")
+        self._tree.focus("0")
 
     def _on_undo(self) -> None:
-        sel = self._lb.curselection()
+        sel = self._tree.selection()
         if not sel or not self._entries:
             return
-        entry = self._entries[sel[0]]
+        entry = self._entries[int(sel[0])]
         self.destroy()
         self._app._undo_specific(entry["file_path"])
 
 
-# ---------------------------------------------------------------------------
-# Rule add/edit dialog
-# ---------------------------------------------------------------------------
-
-class _RuleDialog(tk.Toplevel):
+class _RuleDialog(_Overlay):
     def __init__(self, parent: "SimpleOrganizerApp", rule: Rule | None = None) -> None:
-        super().__init__(parent)
+        super().__init__(parent, "Edit rule" if rule else "New rule")
         self._rule  = rule
         self.result: Rule | None = None
-        self.title("Edit Rule" if rule else "Add Rule")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
-        self._build(rule)
-        self.update_idletasks()
-        px = parent.winfo_rootx() + (parent.winfo_width()  - self.winfo_width())  // 2
-        py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
-        self.geometry(f"+{px}+{py}")
+        name_entry = self._build(rule)
+        self.show(name_entry)
 
-    def _build(self, rule: Rule | None) -> None:
-        f = ttk.Frame(self, padding=14)
-        f.pack(fill="both", expand=True)
-        f.columnconfigure(1, weight=1)
+    def _build(self, rule: Rule | None) -> ttk.Entry:
+        f = self.body
+        f.columnconfigure(0, weight=1)
 
-        def lbl(r: int, text: str) -> None:
-            ttk.Label(f, text=text, anchor="e", width=16).grid(
-                row=r, column=0, sticky="e", padx=(0, 8), pady=4)
+        def label(r: int, text: str) -> None:
+            ttk.Label(f, text=text, style="CardDim.TLabel").grid(
+                row=r, column=0, sticky="w", pady=(0 if r == 0 else 10, 3))
 
-        lbl(0, "Name:")
+        def hint(r: int, text: str | None = None, var: tk.StringVar | None = None) -> None:
+            ttk.Label(f, text=text or "", textvariable=var or "", style="CardHint.TLabel").grid(
+                row=r, column=0, sticky="w", pady=(3, 0))
+
+        label(0, "Name")
         self._name_var = tk.StringVar(value=rule.name if rule else "")
-        ttk.Entry(f, textvariable=self._name_var, width=28).grid(row=0, column=1, sticky="ew")
+        name_entry = ttk.Entry(f, textvariable=self._name_var, width=38, style="Card.TEntry")
+        name_entry.grid(row=1, column=0, sticky="ew")
 
-        lbl(1, "Condition:")
+        label(2, "Condition")
         self._ctype_var = tk.StringVar(value=rule.condition_type if rule else CONDITION_TYPES[0])
         cb = ttk.Combobox(f, textvariable=self._ctype_var, values=CONDITION_TYPES,
-                          state="readonly", width=26)
-        cb.grid(row=1, column=1, sticky="ew")
+                          state="readonly", width=36, style="Card.TCombobox")
+        cb.grid(row=3, column=0, sticky="ew")
         cb.bind("<<ComboboxSelected>>", self._update_hint)
 
-        lbl(2, "Value:")
+        label(4, "Value")
         self._val_var = tk.StringVar(value=rule.condition_value if rule else "")
-        ttk.Entry(f, textvariable=self._val_var, width=28).grid(row=2, column=1, sticky="ew")
-
+        ttk.Entry(f, textvariable=self._val_var, width=38, style="Card.TEntry").grid(
+            row=5, column=0, sticky="ew")
         self._hint_var = tk.StringVar()
-        ttk.Label(f, textvariable=self._hint_var,
-                  font=("Segoe UI", 8, "italic")).grid(row=3, column=1, sticky="w")
+        hint(6, var=self._hint_var)
         self._update_hint()
 
-        lbl(4, "Target Folder:")
+        label(7, "Target folder")
         self._folder_var = tk.StringVar(value=rule.target_folder if rule else "")
-        ttk.Entry(f, textvariable=self._folder_var, width=28).grid(row=4, column=1, sticky="ew")
-        ttk.Label(f, text="Subfolder name inside scan root",
-                  font=("Segoe UI", 8, "italic")).grid(row=5, column=1, sticky="w")
+        ttk.Entry(f, textvariable=self._folder_var, width=38, style="Card.TEntry").grid(
+            row=8, column=0, sticky="ew")
+        hint(9, "Subfolder name inside the scanned folder.")
 
         self._enabled_var = tk.BooleanVar(value=rule.enabled if rule else True)
-        ttk.Checkbutton(f, text="Enabled", variable=self._enabled_var).grid(
-            row=6, column=1, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(f, text="Enabled", variable=self._enabled_var,
+                        style="Card.TCheckbutton").grid(row=10, column=0, sticky="w", pady=(14, 0))
 
-        bf = ttk.Frame(f)
-        bf.grid(row=7, column=0, columnspan=2, pady=(12, 0), sticky="e")
-        ttk.Button(bf, text="OK", style="Accent.TButton", command=self._ok).pack(side="left", padx=(0, 6))
-        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side="left")
+        self.button("Cancel", self.destroy)
+        self.button("Save", self._ok, primary=True)
+        self.bind("<Return>", lambda _e: self._ok())
+        return name_entry
 
     def _update_hint(self, _event: Any = None) -> None:
         self._hint_var.set(CONDITION_LABELS.get(self._ctype_var.get(), ""))
@@ -229,8 +389,8 @@ class _RuleDialog(tk.Toplevel):
         ctype  = self._ctype_var.get()
 
         if not name or not folder or not value:
-            messagebox.showwarning("Incomplete",
-                                   "Name, Value, and Target Folder are required.", parent=self)
+            _showwarning("Incomplete",
+                         "Name, Value, and Target Folder are required.", parent=self)
             return
 
         numeric_types = {"min_size_mb", "max_size_mb", "older_than_days", "newer_than_days"}
@@ -240,7 +400,7 @@ class _RuleDialog(tk.Toplevel):
                 if parsed < 0:
                     raise ValueError("negative")
             except ValueError:
-                messagebox.showwarning(
+                _showwarning(
                     "Invalid value",
                     f'"{value}" is not a valid number for "{ctype}".\nPlease enter a positive number (e.g. 100).',
                     parent=self,
@@ -257,94 +417,121 @@ class _RuleDialog(tk.Toplevel):
         self.destroy()
 
 
-# ---------------------------------------------------------------------------
-# Theme helpers
-# ---------------------------------------------------------------------------
+class _MessageDialog(_Overlay):
+    KINDS = {
+        "question": ("question", "accent"),
+        "info":     ("info",     "accent"),
+        "success":  ("check",    "success"),
+        "warning":  ("warning",  "warning"),
+        "error":    ("x-circle", "danger"),
+    }
 
-def _adjust_colour(hex_colour: str, amount: int) -> str:
-    """Lighten a hex colour by brightening each RGB channel by amount."""
-    hex_colour = hex_colour.lstrip("#")
-    r, g, b = (int(hex_colour[i:i+2], 16) for i in (0, 2, 4))
-    r = min(255, r + amount)
-    g = min(255, g + amount)
-    b = min(255, b + amount)
-    return f"#{r:02x}{g:02x}{b:02x}"
+    def __init__(self, parent: tk.Misc, title: str, message: str, kind: str) -> None:
+        super().__init__(parent, title)
+        self.result = False
+        app = self._app
+
+        glyph, colour = self.KINDS[kind]
+        ttk.Label(self.body, style="Card.TLabel",
+                  image=icon(self, glyph, app._px(26), app._theme[colour])).grid(
+            row=0, column=0, sticky="n", padx=(0, 14))
+        ttk.Label(self.body, text=message, style="Card.TLabel", wraplength=app._px(400),
+                  justify="left").grid(row=0, column=1, sticky="w")
+
+        if kind == "question":
+            self.button("Cancel", self.destroy)
+            default = self.button("Continue", self._accept, primary=True)
+        else:
+            default = self.button("OK", self._accept, primary=True)
+
+        self.bind("<Return>", lambda _e: self._accept())
+        self.show(default)
+        self.wait_window(self)
+
+    def _accept(self) -> None:
+        self.result = True
+        self.destroy()
 
 
-def _apply_ttk_theme(style: ttk.Style, theme: dict[str, str]) -> None:
-    style.theme_use("clam")
+def _askyesno(title: str, message: str, parent: tk.Misc) -> bool:
+    return _MessageDialog(parent, title, message, "question").result
 
-    bg     = theme["bg"]
-    fg     = theme["fg"]
-    accent = theme["accent"]
-    acc_fg = theme["accent_fg"]
-    entry  = theme["entry_bg"]
-    sel_bg = theme["list_sel_bg"]
-    sel_fg = theme["list_sel_fg"]
-    border = theme["border"]
-    frame  = theme["frame_bg"]
-    header_fg = theme.get("header_fg", accent)
-    accent_hover = _adjust_colour(accent, 20)
 
-    style.configure(".", background=bg, foreground=fg, font=_FONT_UI,
-                    borderwidth=0, relief="flat")
-    for cls in ("TFrame", "TLabelframe", "TLabelframe.Label"):
-        style.configure(cls, background=bg, foreground=fg)
+def _showinfo(title: str, message: str, parent: tk.Misc) -> None:
+    _MessageDialog(parent, title, message, "info")
 
-    style.configure("TLabel",        background=bg, foreground=fg, font=_FONT_UI)
-    style.configure("Title.TLabel",  background=bg, foreground=fg, font=_FONT_TITLE)
-    style.configure("Status.TLabel", background=bg, foreground=fg, font=_FONT_UI)
-    style.configure("Header.TLabel", background=bg, foreground=header_fg, font=_FONT_HEADER)
-    style.configure("Hint.TLabel",   background=bg, foreground=border,
-                    font=("Segoe UI", 8, "italic"))
 
-    style.configure("TButton",
-        background=accent, foreground=acc_fg, font=_FONT_UI, padding=(10, 5), relief="flat")
-    style.map("TButton",
-        background=[("active", accent_hover), ("disabled", border)],
-        foreground=[("disabled", border)])
-    style.configure("Accent.TButton",
-        background=accent, foreground=acc_fg, font=_FONT_BOLD, padding=(10, 6), relief="flat")
-    style.map("Accent.TButton",
-        background=[("active", accent_hover), ("disabled", border)],
-        foreground=[("disabled", border)])
-    style.configure("Warn.TButton",
-        background="#e67e22", foreground="#ffffff", font=_FONT_UI, padding=(10, 5), relief="flat")
-    style.map("Warn.TButton",
-        background=[("active", "#d35400"), ("disabled", border)],
-        foreground=[("disabled", border)])
+def _showwarning(title: str, message: str, parent: tk.Misc) -> None:
+    _MessageDialog(parent, title, message, "warning")
 
-    style.configure("TEntry",
-        fieldbackground=entry, foreground=fg, insertcolor=fg, borderwidth=1, relief="flat")
-    style.configure("TCheckbutton", background=bg, foreground=fg, font=_FONT_UI)
-    style.map("TCheckbutton",
-        background=[("active", bg)],
-        foreground=[("disabled", border)])
-    style.configure("TCombobox", fieldbackground=entry, foreground=fg)
-    style.configure("TProgressbar",
-        troughcolor=frame, background=accent, thickness=10, borderwidth=0)
-    style.configure("TNotebook", background=bg, borderwidth=0, tabmargins=[0, 0, 0, 0])
-    style.configure("TNotebook.Tab",
-        background=frame, foreground=fg, font=_FONT_UI, padding=(14, 6))
-    style.map("TNotebook.Tab",
-        background=[("selected", bg), ("active", entry)],
-        foreground=[("selected", accent)],
-        expand=[("selected", [1, 1, 1, 0])])
-    style.configure("Treeview",
-        background=theme["list_bg"], foreground=theme["list_fg"],
-        fieldbackground=theme["list_bg"], font=_FONT_MONO, rowheight=24, borderwidth=0)
-    style.configure("Treeview.Heading",
-        background=frame, foreground=header_fg, font=_FONT_BOLD, relief="flat", padding=(6, 4))
-    style.map("Treeview",
-        background=[("selected", sel_bg)],
-        foreground=[("selected", sel_fg)])
-    style.map("Treeview.Heading", background=[("active", entry)])
-    style.configure("TSeparator", background=border)
-    style.configure("TScrollbar",
-        background=frame, troughcolor=bg, arrowcolor=fg, borderwidth=0, relief="flat")
-    style.map("TScrollbar", background=[("active", border)])
-    style.configure("TSpinbox",
-        fieldbackground=entry, foreground=fg, insertcolor=fg, borderwidth=1)
+
+def _showerror(title: str, message: str, parent: tk.Misc) -> None:
+    _MessageDialog(parent, title, message, "error")
+
+
+class _Toast(tk.Toplevel):
+    """Short notification that drops in at the top of the main window and fades out."""
+
+    _SHOW_MS = {"success": 3000, "info": 3000, "warning": 4500, "error": 5500}
+
+    def __init__(self, app: "SimpleOrganizerApp", title: str, message: str, kind: str) -> None:
+        super().__init__(app)
+        self._app = app
+        self.overrideredirect(True)
+        _set_alpha(self, 0.0)
+        _chroma_key(self, app._theme)
+
+        t = app._theme
+        glyph, colour = _MessageDialog.KINDS[kind]
+        card = ttk.Frame(self, style="Float.TFrame", padding=(14, 10, 8, 10))
+        card.pack(fill="both", expand=True)
+        card.columnconfigure(1, weight=1)
+        ttk.Label(card, style="Card.TLabel",
+                  image=badge(self, glyph, app._px(32), app._px(18), t[colour], t["accent_fg"])).grid(
+            row=0, column=0, rowspan=2, padx=(0, 12))
+        ttk.Label(card, text=title, style="ToastTitle.TLabel").grid(row=0, column=1, sticky="sw")
+        ttk.Label(card, text=message, style="CardDim.TLabel",
+                  wraplength=app._px(320)).grid(row=1, column=1, sticky="nw")
+        ttk.Button(
+            card, style="Card.Ghost.TButton", command=self.destroy,
+            image=(icon(self, "x", app._px(12), t["fg_muted"]),
+                   "active", icon(self, "x", app._px(12), t["fg"])),
+        ).grid(row=0, column=2, rowspan=2, sticky="n", padx=(10, 0))
+
+        self.update_idletasks()
+        self._width = max(self.winfo_reqwidth(), app._px(360))
+        self._slide(0)
+        self.after(self._SHOW_MS[kind], self._fade_out, 0)
+
+    def _place(self, offset: int) -> None:
+        app = self._app
+        x = app.winfo_rootx() + (app.winfo_width() - self._width) // 2
+        y = app.winfo_rooty() + app._px(14) - offset
+        self.geometry(f"{self._width}x{self.winfo_reqheight()}+{x}+{y}")
+        self.update_idletasks()
+
+    def _slide(self, step: int) -> None:
+        if not self.winfo_exists():
+            return
+        progress = 1 - (1 - step / 8) ** 3
+        self._place(round(self._app._px(16) * (1 - progress)))
+        _set_alpha(self, progress)
+        if step < 8:
+            self.after(16, self._slide, step + 1)
+
+    def _fade_out(self, step: int) -> None:
+        if not self.winfo_exists():
+            return
+        _set_alpha(self, 1 - step / 6)
+        if step < 6:
+            self.after(20, self._fade_out, step + 1)
+        else:
+            self.destroy()
+
+    def destroy(self) -> None:
+        if self._app._toast is self:
+            self._app._toast = None
+        super().destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +543,7 @@ class SimpleOrganizerApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
+        load_fonts(self)
 
         # Load window icon — works for both PyInstaller binary and source mode
         try:
@@ -407,12 +595,15 @@ class SimpleOrganizerApp(tk.Tk):
             value=bool(self._settings.get("schedule_enabled", False)))
         self._schedule_interval: tk.IntVar = tk.IntVar(
             value=int(self._settings.get("schedule_interval_minutes", 60)))
-        self._schedule_status_var: tk.StringVar = tk.StringVar(value="Disabled")
+        self._schedule_status_var: tk.StringVar = tk.StringVar(value="Off")
 
         self._theme:       dict[str, str]              = DARK_THEME if self._dark_mode else LIGHT_THEME
         self._event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._style        = ttk.Style(self)
         self._resize_job:  str | None = None
+        self._icon_widgets: list[tuple[ttk.Widget, str, str]] = []
+        self._overlays:     list[_Overlay] = []
+        self._toast:        _Toast | None = None
 
         # S1 fix: pass log_callback to scheduler so errors surface in the UI
         self._scheduler = OrganizerScheduler(
@@ -423,9 +614,6 @@ class SimpleOrganizerApp(tk.Tk):
         # ── Build & configure ─────────────────────────────────────────────────
         self._build_ui()
         self._apply_theme()
-        self._theme_btn.configure(
-            text="☀  Light Mode" if self._dark_mode else "🌙  Dark Mode"
-        )
         self._bind_shortcuts()
         self._try_register_dnd()
         self._refresh_persistent_buttons()
@@ -450,88 +638,63 @@ class SimpleOrganizerApp(tk.Tk):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        top = ttk.Frame(self, padding=(16, 14, 16, 10))
-        top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(1, weight=1)
-        self._top = top
+        self._build_header()
 
-        ttk.Label(top, text=APP_TITLE, style="Title.TLabel").grid(
-            row=0, column=0, columnspan=7, sticky="w", pady=(0, 12))
+        body = ttk.Frame(self, padding=(16, 0, 16, 16))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+        self._build_sidebar(body)
+        self._build_workspace(body)
 
-        # ── Folder Selection ──────────────────────────────────────────────────
-        ttk.Label(top, text="Folder Selection", style="Header.TLabel").grid(
-            row=1, column=0, columnspan=7, sticky="w", pady=(0, 4))
+        self._build_status_bar()
+
+    def _build_header(self) -> None:
+        header = ttk.Frame(self, padding=(16, 14, 16, 14))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(2, weight=1)
+
+        ttk.Label(header, text=APP_TITLE.upper(), style="Brand.TLabel").grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(header, text=f"v{APP_VERSION}", style="Version.TLabel").grid(
+            row=0, column=1, sticky="w", padx=(8, 24), pady=(2, 0))
 
         self._folder_var   = tk.StringVar(value=str(self._folder))
         self._folder_entry = ttk.Entry(
-            top, textvariable=self._folder_var, state="readonly", font=_FONT_MONO)
-        self._folder_entry.grid(row=2, column=0, columnspan=2, sticky="ew", padx=(0, 6))
+            header, textvariable=self._folder_var, state="readonly", font=FONTS["mono"])
+        self._folder_entry.grid(row=0, column=2, sticky="ew", ipady=1)
+        _Tooltip(self._folder_entry, "Folder to organise. You can also drop a folder here.")
 
-        self._browse_btn = ttk.Button(top, text="Browse...", width=_BTN_W,
-                                      command=self._browse_folder)
-        self._browse_btn.grid(row=2, column=2, padx=(0, 20))
+        self._browse_btn = self._with_icon(
+            ttk.Button(header, text="Browse…", command=self._browse_folder), "folder-open")
+        self._browse_btn.grid(row=0, column=3, padx=(8, 0))
 
-        # ── Organisation ──────────────────────────────────────────────────────
-        ttk.Label(top, text="Organisation", style="Header.TLabel").grid(
-            row=3, column=0, columnspan=7, sticky="w", pady=(10, 4))
+        self._theme_btn = ttk.Button(header, style="Ghost.TButton",
+                                     command=self._toggle_dark_mode)
+        self._theme_btn.grid(row=0, column=4, padx=(8, 0))
+        _Tooltip(self._theme_btn, "Switch between light and dark theme.")
 
-        action_frame = ttk.Frame(top)
-        action_frame.grid(row=4, column=0, columnspan=7, sticky="w")
+    def _build_sidebar(self, parent: ttk.Frame) -> None:
+        side = ttk.Frame(parent, width=SIDEBAR_W)
+        side.grid(row=0, column=0, sticky="ns", padx=(0, 14))
+        side.pack_propagate(False)
 
-        self._scan_btn = ttk.Button(
-            action_frame, text="Scan", style="Accent.TButton",
-            width=_BTN_W, command=self._start_scan)
-        self._scan_btn.pack(side="left", padx=(0, 6))
-
-        self._organize_btn = ttk.Button(
-            action_frame, text="Organize", style="Accent.TButton",
-            width=_BTN_W, command=self._confirm_and_organize, state="disabled")
-        self._organize_btn.pack(side="left", padx=(0, 6))
-
-        self._undo_btn = ttk.Button(
-            action_frame, text="Undo Last", width=_BTN_W,
-            command=self._confirm_and_undo, state="disabled")
-        self._undo_btn.pack(side="left", padx=(0, 6))
-
-        self._history_btn = ttk.Button(
-            action_frame, text="History", width=_BTN_W,
-            command=self._open_history_dialog, state="disabled")
-        self._history_btn.pack(side="left", padx=(0, 6))
-
-        _Tooltip(self._scan_btn,     "Scan the selected folder and preview planned moves. (Ctrl+R)")
-        _Tooltip(self._organize_btn, "Move files into category subfolders. Shows total size first. (Ctrl+O)")
-        _Tooltip(self._undo_btn,     "Restore all files moved in the last organise run. (Ctrl+Z)")
-        _Tooltip(self._history_btn,  "Browse and undo any of the last 20 organise runs.")
-
-        # ── Scan Options ──────────────────────────────────────────────────────
-        ttk.Label(top, text="Scan Options", style="Header.TLabel").grid(
-            row=5, column=0, columnspan=7, sticky="w", pady=(10, 4))
-
-        opts = ttk.Frame(top)
-        opts.grid(row=6, column=0, columnspan=7, sticky="w")
+        scan = self._card(side, "Scan")
 
         self._recursive_cb = ttk.Checkbutton(
-            opts, text="Scan subdirectories", variable=self._recursive,
-            command=self._save_settings)
-        self._recursive_cb.pack(side="left")
+            scan, text="Scan subdirectories", variable=self._recursive,
+            style="Card.TCheckbutton", command=self._save_settings)
+        self._recursive_cb.pack(anchor="w")
 
         self._hidden_cb = ttk.Checkbutton(
-            opts, text="Include hidden files", variable=self._include_hidden,
-            command=self._save_settings)
-        self._hidden_cb.pack(side="left", padx=(20, 0))
-
-        self._staging_cb = ttk.Checkbutton(
-            opts, text="Use staging mode", variable=self._use_staging,
-            command=self._on_staging_toggle)
-        self._staging_cb.pack(side="left", padx=(20, 0))
-        _Tooltip(self._staging_cb,
-                 "Move files to a temporary staging area first.\n"
-                 "Use Commit Staging to finalise, or Revert Staging to cancel.")
+            scan, text="Include hidden files", variable=self._include_hidden,
+            style="Card.TCheckbutton", command=self._save_settings)
+        self._hidden_cb.pack(anchor="w")
 
         self._subcats_cb = ttk.Checkbutton(
-            opts, text="Use sub-categories", variable=self._use_subcats,
-            command=self._on_subcats_toggle)
-        self._subcats_cb.pack(side="left", padx=(20, 0))
+            scan, text="Use sub-categories", variable=self._use_subcats,
+            style="Card.TCheckbutton", command=self._on_subcats_toggle)
+        self._subcats_cb.pack(anchor="w")
         _Tooltip(
             self._subcats_cb,
             "Sort files into sub-folders inside each category.\n"
@@ -542,154 +705,195 @@ class SimpleOrganizerApp(tk.Tk):
             "Off by default. Does not affect custom Rules."
         )
 
-        limits = ttk.Frame(top)
-        limits.grid(row=7, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        limits = ttk.Frame(scan, style="Panel.TFrame")
+        limits.pack(fill="x", pady=(10, 0))
+        limits.columnconfigure(0, weight=1)
+        self._max_depth_spin = self._limit_row(
+            limits, 0, "Max depth", self._max_depth, 1, 50, 1)
+        self._max_dirs_spin = self._limit_row(
+            limits, 1, "Max folders", self._max_dirs, 100, 500_000, 1000)
+        self._timeout_spin = self._limit_row(
+            limits, 2, "Timeout (s)", self._scan_timeout, 5, 300, 5)
 
-        ttk.Label(limits, text="Max depth:").pack(side="left", padx=(0, 4))
-        self._max_depth_spin = ttk.Spinbox(limits, from_=1, to=50, width=5,
-                                           textvariable=self._max_depth)
-        self._max_depth_spin.pack(side="left", padx=(0, 16))
+        staging = self._card(side, "Staging")
 
-        ttk.Label(limits, text="Max dirs:").pack(side="left", padx=(0, 4))
-        self._max_dirs_spin = ttk.Spinbox(limits, from_=100, to=500_000, increment=1000,
-                                          width=8, textvariable=self._max_dirs)
-        self._max_dirs_spin.pack(side="left", padx=(0, 16))
+        self._staging_cb = ttk.Checkbutton(
+            staging, text="Use staging mode", variable=self._use_staging,
+            style="Card.TCheckbutton", command=self._on_staging_toggle)
+        self._staging_cb.pack(anchor="w")
+        _Tooltip(self._staging_cb,
+                 "Move files to a temporary staging area first.\n"
+                 "Use Commit to finalise, or Revert to cancel.")
 
-        ttk.Label(limits, text="Timeout (s):").pack(side="left", padx=(0, 4))
-        self._timeout_spin = ttk.Spinbox(limits, from_=5, to=300, increment=5, width=5,
-                                         textvariable=self._scan_timeout)
-        self._timeout_spin.pack(side="left")
+        staging_btns = ttk.Frame(staging, style="Panel.TFrame")
+        staging_btns.pack(fill="x", pady=(10, 0))
+        staging_btns.columnconfigure((0, 1), weight=1, uniform="staging")
 
-        # ── Staging ───────────────────────────────────────────────────────────
-        ttk.Label(top, text="Staging", style="Header.TLabel").grid(
-            row=8, column=0, columnspan=7, sticky="w", pady=(10, 4))
+        self._commit_btn = self._with_icon(ttk.Button(
+            staging_btns, text="Commit", style="Card.TButton",
+            command=self._confirm_and_commit, state="disabled"), "check")
+        self._commit_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        _Tooltip(self._commit_btn, "Move staged files to their final category folders.")
 
-        staging_btns = ttk.Frame(top)
-        staging_btns.grid(row=9, column=0, columnspan=7, sticky="w")
+        self._revert_btn = self._with_icon(ttk.Button(
+            staging_btns, text="Revert", style="Card.Danger.TButton",
+            command=self._confirm_and_revert, state="disabled"), "arrow-u-up-left", "danger")
+        self._revert_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        _Tooltip(self._revert_btn, "Send staged files back to where they came from.")
 
-        self._commit_btn = ttk.Button(
-            staging_btns, text="Commit Staging",
-            width=_BTN_W, command=self._confirm_and_commit, state="disabled")
-        self._commit_btn.pack(side="left", padx=(0, 6))
-
-        self._revert_btn = ttk.Button(
-            staging_btns, text="Revert Staging",
-            style="Warn.TButton", width=_BTN_W,
-            command=self._confirm_and_revert, state="disabled")
-        self._revert_btn.pack(side="left")
-
-        # ── Auto-Organize ─────────────────────────────────────────────────────
-        ttk.Label(top, text="Auto-Organize", style="Header.TLabel").grid(
-            row=10, column=0, columnspan=7, sticky="w", pady=(10, 4))
-
-        sched_frame = ttk.Frame(top)
-        sched_frame.grid(row=11, column=0, columnspan=7, sticky="w")
+        sched = self._card(side, "Auto-organize")
 
         self._sched_cb = ttk.Checkbutton(
-            sched_frame, text="Enable -- every",
-            variable=self._schedule_enabled, command=self._on_schedule_toggle)
-        self._sched_cb.pack(side="left")
+            sched, text="Run on a schedule",
+            variable=self._schedule_enabled, style="Card.TCheckbutton",
+            command=self._on_schedule_toggle)
+        self._sched_cb.pack(anchor="w")
         _Tooltip(self._sched_cb,
                  "Automatically scan and organise the selected folder on the set interval.\n"
                  "Runs silently without confirmation dialogs.")
 
-        self._sched_spin = ttk.Spinbox(
-            sched_frame, from_=1, to=1440, increment=15, width=5,
-            textvariable=self._schedule_interval, command=self._on_schedule_toggle)
-        self._sched_spin.pack(side="left", padx=(6, 4))
-        ttk.Label(sched_frame, text="minutes    ").pack(side="left")
-        ttk.Label(sched_frame, textvariable=self._schedule_status_var,
-                  style="Hint.TLabel").pack(side="left")
+        every = ttk.Frame(sched, style="Panel.TFrame")
+        every.pack(fill="x", pady=(8, 0))
+        ttk.Label(every, text="Every", style="CardDim.TLabel").pack(side="left")
+        self._sched_spin = _Stepper(
+            every, self._schedule_interval, 1, 1440, 15, width=5,
+            command=self._on_schedule_toggle)
+        self._sched_spin.pack(side="left", padx=8)
+        ttk.Label(every, text="minutes", style="CardDim.TLabel").pack(side="left")
 
-        # ── Progress ──────────────────────────────────────────────────────────
-        prog_frame = ttk.Frame(top)
-        prog_frame.grid(row=12, column=0, columnspan=7, sticky="ew", pady=(12, 0))
-        prog_frame.columnconfigure(0, weight=1)
+        ttk.Label(sched, textvariable=self._schedule_status_var,
+                  style="CardHint.TLabel").pack(anchor="w", pady=(8, 0))
 
-        self._progress_var = tk.DoubleVar(value=0.0)
-        self._progress = ttk.Progressbar(
-            prog_frame, variable=self._progress_var, maximum=100.0, mode="determinate")
-        self._progress.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+    def _card(self, parent: ttk.Frame, title: str) -> ttk.Frame:
+        card = ttk.Frame(parent, style="Card.TFrame", padding=(14, 12, 14, 14))
+        card.pack(fill="x", pady=(0, 12))
+        ttk.Label(card, text=title.upper(), style="CardTitle.TLabel").pack(
+            anchor="w", pady=(0, 8))
+        return card
 
-        self._pct_var = tk.StringVar(value="0%")
-        ttk.Label(prog_frame, textvariable=self._pct_var, width=5, anchor="e").grid(row=0, column=1)
+    def _limit_row(self, parent: ttk.Frame, row: int, text: str,
+                   var: tk.IntVar | tk.DoubleVar, low: float, high: float,
+                   step: float) -> _Stepper:
+        ttk.Label(parent, text=text, style="CardDim.TLabel").grid(
+            row=row, column=0, sticky="w", pady=3)
+        stepper = _Stepper(parent, var, low, high, step)
+        stepper.grid(row=row, column=1, sticky="e", pady=3)
+        return stepper
 
-        self._status_var = tk.StringVar(value="Ready.")
-        ttk.Label(top, textvariable=self._status_var, style="Status.TLabel").grid(
-            row=13, column=0, columnspan=7, sticky="w", pady=(4, 0))
+    def _build_workspace(self, parent: ttk.Frame) -> None:
+        work = ttk.Frame(parent)
+        work.grid(row=0, column=1, sticky="nsew")
+        work.columnconfigure(0, weight=1)
+        work.rowconfigure(1, weight=1)
 
-        ttk.Separator(self, orient="horizontal").grid(row=0, column=0, sticky="sew")
+        bar = ttk.Frame(work)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 12))
 
-        # ── Notebook ──────────────────────────────────────────────────────────
-        nb_frame = ttk.Frame(self, padding=(16, 8, 16, 0))
-        nb_frame.grid(row=1, column=0, sticky="nsew")
-        nb_frame.columnconfigure(0, weight=1)
-        nb_frame.rowconfigure(0, weight=1)
+        self._scan_btn = self._with_icon(ttk.Button(
+            bar, text="Scan", style="Primary.TButton", command=self._start_scan),
+            "magnifying-glass", "primary")
+        self._scan_btn.pack(side="left", padx=(0, 8))
 
-        self._notebook = ttk.Notebook(nb_frame)
-        self._notebook.grid(row=0, column=0, sticky="nsew")
+        self._organize_btn = self._with_icon(ttk.Button(
+            bar, text="Organize", style="Primary.TButton",
+            command=self._confirm_and_organize, state="disabled"), "folders", "primary")
+        self._organize_btn.pack(side="left")
 
-        # Tab 0 — Preview (M4 fix: store index dynamically)
-        preview_tab = ttk.Frame(self._notebook, padding=(4, 4))
-        preview_tab.columnconfigure(0, weight=1)
-        preview_tab.rowconfigure(0, weight=1)
-        self._notebook.add(preview_tab, text="  Preview  ")
-        self._preview_tab_idx = 0   # stored to avoid hardcoded index throughout
+        ttk.Frame(bar, style="Rule.TFrame", width=1).pack(side="left", fill="y", padx=12, pady=4)
 
-        preview_cols = ("file", "category", "destination")
-        self._preview_tree = ttk.Treeview(
-            preview_tab, columns=preview_cols, show="headings", selectmode="browse")
-        self._preview_tree.heading("file",        text="File")
-        self._preview_tree.heading("category",    text="Category")
-        self._preview_tree.heading("destination", text="Destination Folder")
-        self._preview_tree.column("file",        width=240, anchor="w",      stretch=True)
-        self._preview_tree.column("category",    width=140, anchor="center", stretch=False)
-        self._preview_tree.column("destination", width=340, anchor="w",      stretch=True)
+        self._undo_btn = self._with_icon(ttk.Button(
+            bar, text="Undo last", command=self._confirm_and_undo, state="disabled"),
+            "arrow-counter-clockwise")
+        self._undo_btn.pack(side="left", padx=(0, 8))
 
-        pv_vsb = ttk.Scrollbar(preview_tab, orient="vertical",   command=self._preview_tree.yview)
-        pv_hsb = ttk.Scrollbar(preview_tab, orient="horizontal", command=self._preview_tree.xview)
-        self._preview_tree.configure(yscrollcommand=pv_vsb.set, xscrollcommand=pv_hsb.set)
-        self._preview_tree.grid(row=0, column=0, sticky="nsew")
-        pv_vsb.grid(row=0, column=1, sticky="ns")
-        pv_hsb.grid(row=1, column=0, sticky="ew")
+        self._history_btn = self._with_icon(ttk.Button(
+            bar, text="History…", command=self._open_history_dialog, state="disabled"),
+            "clock-counter-clockwise")
+        self._history_btn.pack(side="left")
+
+        _Tooltip(self._scan_btn,     "Scan the selected folder and preview planned moves. (Ctrl+R)")
+        _Tooltip(self._organize_btn, "Move files into category subfolders. Shows total size first. (Ctrl+O)")
+        _Tooltip(self._undo_btn,     "Restore all files moved in the last organise run. (Ctrl+Z)")
+        _Tooltip(self._history_btn,  "Browse and undo any of the last 20 organise runs.")
+
+        panel = ttk.Frame(work, style="Card.TFrame", padding=3)
+        panel.grid(row=1, column=0, sticky="nsew")
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(2, weight=1)
+
+        self._tab_strip = ttk.Frame(panel, style="Panel.TFrame")
+        self._tab_strip.grid(row=0, column=0, sticky="ew")
+        self._summary_var = tk.StringVar()
+        ttk.Label(self._tab_strip, textvariable=self._summary_var,
+                  style="Summary.TLabel").pack(side="right", padx=14)
+        ttk.Frame(panel, style="Rule.TFrame", height=1).grid(row=1, column=0, sticky="ew")
+
+        self._notebook = ttk.Notebook(panel, style="Bare.TNotebook")
+        self._notebook.grid(row=2, column=0, sticky="nsew")
+        self._notebook.bind("<<NotebookTabChanged>>", lambda _e: self._sync_tabs())
+        self._tabs: list[tuple[ttk.Label, ttk.Label, ttk.Frame, str]] = []
+
+        self._build_preview_tab()
+        self._build_duplicates_tab()
+        self._build_log_tab()
+        self._build_rules_tab()
+
+    def _build_preview_tab(self) -> None:
+        tab = ttk.Frame(self._notebook, style="Panel.TFrame")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        self._preview_tab_idx = self._add_tab(tab, "Preview", "eye")
+
+        self._preview_tree = self._make_table(tab, ("file", "category", "destination"))
+        self._preview_tree.heading("file",        text="FILE",        anchor="w")
+        self._preview_tree.heading("category",    text="CATEGORY",    anchor="w")
+        self._preview_tree.heading("destination", text="DESTINATION", anchor="w")
+        self._preview_tree.column("file",        width=260, anchor="w", stretch=True)
+        self._preview_tree.column("category",    width=130, anchor="w", stretch=False)
+        self._preview_tree.column("destination", width=320, anchor="w", stretch=True)
         self._preview_tree.bind("<Button-3>", self._on_preview_context)
 
-        # Tab 1 — Duplicates
-        dup_tab = ttk.Frame(self._notebook, padding=(4, 4))
-        dup_tab.columnconfigure(0, weight=1)
-        dup_tab.rowconfigure(0, weight=1)
-        self._notebook.add(dup_tab, text="  Duplicates  ")
-        self._dup_tab_idx = 1   # stored to avoid hardcoded index throughout
+        self._preview_empty = self._with_icon(ttk.Label(
+            tab, text="Pick a folder and press Scan to see what would move.",
+            style="Empty.TLabel", compound="top"), "folder-dashed", "empty")
+        self._sync_empty(self._preview_tree, self._preview_empty)
 
-        dup_cols = ("file", "size", "location")
-        self._dup_tree = ttk.Treeview(
-            dup_tab, columns=dup_cols, show="tree headings", selectmode="extended")
-        self._dup_tree.heading("file",     text="File")
-        self._dup_tree.heading("size",     text="Size")
-        self._dup_tree.heading("location", text="Folder")
-        self._dup_tree.column("#0",        width=100, anchor="w", stretch=False)
+    def _build_duplicates_tab(self) -> None:
+        tab = ttk.Frame(self._notebook, style="Panel.TFrame")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        self._dup_tab_idx = self._add_tab(tab, "Duplicates", "copy")
+
+        self._dup_tree = self._make_table(
+            tab, ("file", "size", "location"), show="tree headings", selectmode="extended")
+        self._dup_tree.heading("#0",       text="GROUP",  anchor="w")
+        self._dup_tree.heading("file",     text="FILE",   anchor="w")
+        self._dup_tree.heading("size",     text="SIZE",   anchor="e")
+        self._dup_tree.heading("location", text="FOLDER", anchor="w")
+        self._dup_tree.column("#0",        width=110, anchor="w", stretch=False)
         self._dup_tree.column("file",      width=220, anchor="w", stretch=True)
-        self._dup_tree.column("size",      width=80,  anchor="e", stretch=False)
-        self._dup_tree.column("location",  width=380, anchor="w", stretch=True)
-
-        dup_vsb = ttk.Scrollbar(dup_tab, orient="vertical",   command=self._dup_tree.yview)
-        dup_hsb = ttk.Scrollbar(dup_tab, orient="horizontal", command=self._dup_tree.xview)
-        self._dup_tree.configure(yscrollcommand=dup_vsb.set, xscrollcommand=dup_hsb.set)
-        self._dup_tree.grid(row=0, column=0, sticky="nsew")
-        dup_vsb.grid(row=0, column=1, sticky="ns")
-        dup_hsb.grid(row=1, column=0, sticky="ew")
+        self._dup_tree.column("size",      width=90,  anchor="e", stretch=False)
+        self._dup_tree.column("location",  width=360, anchor="w", stretch=True)
         self._dup_tree.bind("<Button-3>", self._on_dup_context)
+        self._dup_tree.bind("<<TreeviewSelect>>", self._on_dup_select)
+        self._dup_tree.bind("<Button-1>", self._on_dup_click)
 
-        # Duplicates action bar
-        dup_action = ttk.Frame(dup_tab)
-        dup_action.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self._dup_empty = self._with_icon(ttk.Label(
+            tab, text="No duplicates found yet.", style="Empty.TLabel", compound="top"),
+            "copy", "empty")
+        self._sync_empty(self._dup_tree, self._dup_empty)
 
-        self._trash_btn = ttk.Button(
-            dup_action, text="🗑  Move Selected to Trash",
-            style="Warn.TButton", command=self._confirm_and_trash,
+        ttk.Frame(tab, style="Rule.TFrame", height=1).grid(
+            row=2, column=0, columnspan=2, sticky="ew")
+        action = ttk.Frame(tab, style="Panel.TFrame", padding=(12, 10))
+        action.grid(row=3, column=0, columnspan=2, sticky="ew")
+
+        self._trash_btn = self._with_icon(ttk.Button(
+            action, text="Move selected to Trash",
+            style="Card.Danger.TButton", command=self._confirm_and_trash,
             state="disabled",
-        )
-        self._trash_btn.pack(side="left", padx=(0, 10))
+        ), "trash", "danger")
+        self._trash_btn.pack(side="left")
         _Tooltip(
             self._trash_btn,
             "Move selected duplicate files to the system Trash/Recycle Bin.\n"
@@ -699,99 +903,184 @@ class SimpleOrganizerApp(tk.Tk):
         )
 
         self._dup_sel_var = tk.StringVar(value="")
-        ttk.Label(dup_action, textvariable=self._dup_sel_var,
-                  style="Hint.TLabel").pack(side="left")
+        ttk.Label(action, textvariable=self._dup_sel_var,
+                  style="CardDim.TLabel").pack(side="left", padx=(12, 0))
+        ttk.Label(action, text="Keep at least one file in every group.",
+                  style="CardHint.TLabel").pack(side="right")
 
-        ttk.Label(
-            dup_tab,
-            text="Select duplicates to remove — keep at least one file per group.",
-            font=("Segoe UI", 8, "italic"),
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    def _build_log_tab(self) -> None:
+        tab = ttk.Frame(self._notebook, style="Panel.TFrame")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        self._log_tab_idx = self._add_tab(tab, "Log", "terminal-window")
 
-        self._dup_tree.bind("<<TreeviewSelect>>", self._on_dup_select)
-
-        # Tab 2 — Log
-        log_tab = ttk.Frame(self._notebook, padding=(4, 4))
-        log_tab.columnconfigure(0, weight=1)
-        log_tab.rowconfigure(0, weight=1)
-        self._notebook.add(log_tab, text="  Log  ")
-        self._log_tab_idx = 2   # stored to avoid hardcoded index throughout
-
-        log_vsb = ttk.Scrollbar(log_tab, orient="vertical")
+        log_vsb = _AutoScrollbar(tab, orient="vertical")
         self._log_box = tk.Text(
-            log_tab, wrap="word", font=_FONT_MONO,
-            state="disabled", borderwidth=0, relief="flat",
+            tab, wrap="word", font=FONTS["mono"], state="disabled",
+            borderwidth=0, relief="flat", highlightthickness=0,
+            padx=14, pady=10, spacing1=2, spacing3=2,
             yscrollcommand=log_vsb.set)
         log_vsb.configure(command=self._log_box.yview)
         self._log_box.grid(row=0, column=0, sticky="nsew")
         log_vsb.grid(row=0, column=1, sticky="ns")
-        ttk.Button(log_tab, text="Clear Log", command=self._clear_log).grid(
-            row=1, column=0, sticky="e", pady=(6, 0))
 
-        # Tab 3 — Rules
-        self._build_rules_tab()
-
-        # ── Bottom panel ──────────────────────────────────────────────────────
-        ttk.Separator(self, orient="horizontal").grid(row=2, column=0, sticky="ew")
-
-        bottom = ttk.Frame(self, padding=(16, 6, 16, 10))
-        bottom.grid(row=3, column=0, sticky="ew")
-        bottom.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=0)
-
-        ttk.Label(
-            bottom,
-            text="Ctrl+R: Scan  Ctrl+O: Organize  Ctrl+Z: Undo  Ctrl+Q: Quit",
-            font=("Segoe UI", 8),
-        ).grid(row=0, column=0, sticky="w")
-
-        self._theme_btn = ttk.Button(
-            bottom, text="🌙  Dark Mode", command=self._toggle_dark_mode)
-        self._theme_btn.grid(row=0, column=1, sticky="e")
+        ttk.Frame(tab, style="Rule.TFrame", height=1).grid(
+            row=1, column=0, columnspan=2, sticky="ew")
+        action = ttk.Frame(tab, style="Panel.TFrame", padding=(12, 10))
+        action.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self._with_icon(ttk.Button(action, text="Clear log", style="Card.TButton",
+                                   command=self._clear_log), "eraser").pack(side="right")
 
     def _build_rules_tab(self) -> None:
-        rules_tab = ttk.Frame(self._notebook, padding=(4, 4))
-        rules_tab.columnconfigure(0, weight=1)
-        rules_tab.rowconfigure(0, weight=1)
-        self._notebook.add(rules_tab, text="  Rules  ")
+        tab = ttk.Frame(self._notebook, style="Panel.TFrame")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(2, weight=1)
+        self._add_tab(tab, "Rules", "funnel")
+
+        bar = ttk.Frame(tab, style="Panel.TFrame", padding=(12, 10))
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self._with_icon(ttk.Button(bar, text="Add rule", style="Card.Primary.TButton",
+                                   command=self._rule_add), "plus", "primary").pack(
+            side="left", padx=(0, 8))
+        self._with_icon(ttk.Button(bar, text="Edit", style="Card.TButton",
+                                   command=self._rule_edit), "pencil-simple").pack(
+            side="left", padx=(0, 8))
+        up = self._with_icon(ttk.Button(bar, style="Card.TButton",
+                                        command=lambda: self._rule_move(-1)), "arrow-up")
+        up.pack(side="left", padx=(0, 4))
+        down = self._with_icon(ttk.Button(bar, style="Card.TButton",
+                                          command=lambda: self._rule_move(1)), "arrow-down")
+        down.pack(side="left")
+        _Tooltip(up,   "Move rule up. Rules are checked top to bottom.")
+        _Tooltip(down, "Move rule down.")
+        self._with_icon(ttk.Button(bar, text="Delete", style="Card.Danger.TButton",
+                                   command=self._rule_delete), "trash", "danger").pack(side="right")
+
+        ttk.Frame(tab, style="Rule.TFrame", height=1).grid(
+            row=1, column=0, columnspan=2, sticky="ew")
 
         cols = ("enabled", "name", "condition", "value", "target")
-        self._rules_tree = ttk.Treeview(
-            rules_tab, columns=cols, show="headings", selectmode="browse")
-        self._rules_tree.heading("enabled",   text="On")
-        self._rules_tree.heading("name",      text="Name")
-        self._rules_tree.heading("condition", text="Condition")
-        self._rules_tree.heading("value",     text="Value")
-        self._rules_tree.heading("target",    text="Target Folder")
+        self._rules_tree = self._make_table(tab, cols, row=2)
+        self._rules_tree.heading("enabled",   text="")
+        self._rules_tree.heading("name",      text="NAME",          anchor="w")
+        self._rules_tree.heading("condition", text="CONDITION",     anchor="w")
+        self._rules_tree.heading("value",     text="VALUE",         anchor="w")
+        self._rules_tree.heading("target",    text="TARGET FOLDER", anchor="w")
         self._rules_tree.column("enabled",   width=40,  anchor="center", stretch=False)
-        self._rules_tree.column("name",      width=140, anchor="w",      stretch=True)
+        self._rules_tree.column("name",      width=160, anchor="w",      stretch=True)
         self._rules_tree.column("condition", width=140, anchor="w",      stretch=False)
-        self._rules_tree.column("value",     width=110, anchor="w",      stretch=False)
-        self._rules_tree.column("target",    width=140, anchor="w",      stretch=True)
+        self._rules_tree.column("value",     width=120, anchor="w",      stretch=False)
+        self._rules_tree.column("target",    width=160, anchor="w",      stretch=True)
+        self._rules_tree.bind("<Button-1>", self._on_rules_click)
+        self._rules_tree.bind("<Double-1>", self._on_rules_double_click)
+        self._rules_tree.bind("<space>",    lambda _e: self._toggle_selected_rule())
 
-        rv_sb = ttk.Scrollbar(rules_tab, orient="vertical", command=self._rules_tree.yview)
-        self._rules_tree.configure(yscrollcommand=rv_sb.set)
-        self._rules_tree.grid(row=0, column=0, sticky="nsew")
-        rv_sb.grid(row=0, column=1, sticky="ns")
+        self._rules_empty = self._with_icon(ttk.Label(
+            tab, text="No rules yet. Rules send files to a folder by extension, name, size or age.",
+            style="Empty.TLabel", compound="top"), "funnel", "empty")
 
-        rb = ttk.Frame(rules_tab)
-        rb.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        ttk.Button(rb, text="Add",      command=self._rule_add).pack(side="left", padx=(0, 6))
-        ttk.Button(rb, text="Edit",     command=self._rule_edit).pack(side="left", padx=(0, 6))
-        ttk.Button(rb, text="Toggle",   command=self._rule_toggle).pack(side="left", padx=(0, 6))
-        ttk.Button(rb, text="Delete",   style="Warn.TButton",
-                   command=self._rule_delete).pack(side="left", padx=(0, 6))
-        ttk.Button(rb, text="Move Up",  command=lambda: self._rule_move(-1)).pack(side="left", padx=(0, 6))
-        ttk.Button(rb, text="Move Down",command=lambda: self._rule_move(1)).pack(side="left")
-
+        ttk.Frame(tab, style="Rule.TFrame", height=1).grid(
+            row=4, column=0, columnspan=2, sticky="ew")
         ttk.Label(
-            rules_tab,
-            text="Rules run before extension-based categorisation. First match wins.",
-            font=("Segoe UI", 8, "italic"),
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            tab,
+            text="Rules run before extension-based categorisation. First match wins. "
+                 "Click the dot to turn a rule on or off.",
+            style="CardHint.TLabel", padding=(12, 10),
+        ).grid(row=5, column=0, columnspan=2, sticky="w")
 
         self._refresh_rules_tree()
+
+    def _build_status_bar(self) -> None:
+        ttk.Frame(self, style="Rule.TFrame", height=1).grid(row=2, column=0, sticky="ew")
+
+        bar = ttk.Frame(self, style="Bar.TFrame", padding=(16, 5))
+        bar.grid(row=3, column=0, sticky="ew")
+        bar.columnconfigure(2, weight=1)
+
+        self._state_dot = ttk.Label(bar, text="●", style="Idle.TLabel")
+        self._state_dot.grid(row=0, column=0)
+        self._state_var = tk.StringVar(value="READY")
+        ttk.Label(bar, textvariable=self._state_var, style="BarState.TLabel").grid(
+            row=0, column=1, padx=(6, 14))
+
+        self._status_var = tk.StringVar(value="Pick a folder and press Scan.")
+        ttk.Label(bar, textvariable=self._status_var, style="Bar.TLabel").grid(
+            row=0, column=2, sticky="w")
+
+        self._progress_var = tk.DoubleVar(value=0.0)
+        self._progress = ttk.Progressbar(
+            bar, variable=self._progress_var, maximum=100.0, mode="determinate", length=160)
+        self._progress.grid(row=0, column=3, padx=(14, 8))
+
+        self._pct_var = tk.StringVar(value="0%")
+        ttk.Label(bar, textvariable=self._pct_var, style="Pct.TLabel",
+                  width=4, anchor="e").grid(row=0, column=4)
+
+        ttk.Label(
+            bar,
+            text="Ctrl+R scan   Ctrl+O organize   Ctrl+Z undo   Ctrl+Q quit",
+            style="BarMuted.TLabel",
+        ).grid(row=0, column=5, padx=(20, 0))
+
+    def _make_table(self, parent: ttk.Frame, columns: tuple[str, ...], row: int = 0,
+                    show: str = "headings", selectmode: str = "browse") -> ttk.Treeview:
+        tree = ttk.Treeview(parent, columns=columns, show=show, selectmode=selectmode)
+        vsb = _AutoScrollbar(parent, orient="vertical",   command=tree.yview)
+        hsb = _AutoScrollbar(parent, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.grid(row=row, column=0, sticky="nsew")
+        vsb.grid(row=row, column=1, sticky="ns")
+        hsb.grid(row=row + 1, column=0, sticky="ew")
+        return tree
+
+    def _sync_empty(self, tree: ttk.Treeview, label: ttk.Label) -> None:
+        if tree.get_children():
+            label.place_forget()
+        else:
+            label.place(in_=tree, relx=0.5, rely=0.45, anchor="center")
+
+    # =========================================================================
+    # Tabs
+    # =========================================================================
+
+    def _add_tab(self, frame: ttk.Frame, title: str, glyph: str) -> int:
+        idx = len(self._tabs)
+        self._notebook.add(frame)
+
+        tab = ttk.Frame(self._tab_strip, style="Panel.TFrame", cursor="hand2")
+        tab.pack(side="left")
+        inner = ttk.Frame(tab, style="Panel.TFrame", padding=(14, 8, 14, 6))
+        inner.pack()
+        label = ttk.Label(inner, text=title.upper(), style="Tab.TLabel", compound="left")
+        label.pack(side="left")
+        badge = ttk.Label(inner, style="Badge.TLabel")
+        line = ttk.Frame(tab, style="TabLine.TFrame", height=2)
+        line.pack(fill="x")
+
+        for widget in (tab, inner, label, badge):
+            widget.bind("<Button-1>", lambda _e, i=idx: self._notebook.select(i))
+        self._tabs.append((label, badge, line, glyph))
+        return idx
+
+    def _set_tab_count(self, idx: int, count: int) -> None:
+        badge = self._tabs[idx][1]
+        if count:
+            badge.configure(text=str(count))
+            badge.pack(side="left", padx=(7, 0))
+        else:
+            badge.pack_forget()
+
+    def _sync_tabs(self) -> None:
+        current = self._notebook.index("current")
+        t = self._theme
+        for i, (label, badge, line, glyph) in enumerate(self._tabs):
+            active = i == current
+            label.configure(style="TabActive.TLabel" if active else "Tab.TLabel",
+                            image=icon(self, glyph, self._px(14),
+                                       t["accent"] if active else t["fg_muted"],
+                                       gap=self._px(6)))
+            badge.configure(style="BadgeActive.TLabel" if active else "Badge.TLabel")
+            line.configure(style="TabLineActive.TFrame" if active else "TabLine.TFrame")
 
     # =========================================================================
     # Theme
@@ -800,21 +1089,87 @@ class SimpleOrganizerApp(tk.Tk):
     def _apply_theme(self) -> None:
         t = self._theme
         self.configure(bg=t["bg"])
-        _apply_ttk_theme(self._style, t)
+        apply_ttk_theme(self._style, t)
+
+        self.option_add("*TCombobox*Listbox.background",       t["surface"])
+        self.option_add("*TCombobox*Listbox.foreground",       t["fg"])
+        self.option_add("*TCombobox*Listbox.selectBackground", t["selection"])
+        self.option_add("*TCombobox*Listbox.selectForeground", t["selection_fg"])
+        self.option_add("*TCombobox*Listbox.font",             FONTS["ui"])
+
         self._log_box.configure(
-            bg=t["log_bg"], fg=t["log_fg"],
+            bg=t["surface"], fg=t["fg_dim"],
             insertbackground=t["fg"],
-            selectbackground=t["list_sel_bg"],
-            selectforeground=t["list_sel_fg"],
+            selectbackground=t["selection"],
+            selectforeground=t["selection_fg"],
         )
+        for tag, key in (("time", "fg_muted"), ("muted", "fg_muted"), ("ok", "success"),
+                         ("warn", "warning"), ("error", "danger"), ("info", "accent")):
+            self._log_box.tag_configure(tag, foreground=t[key])
+
+        self._dup_tree.tag_configure("group", background=t["surface_alt"],
+                                     foreground=t["fg_dim"], font=FONTS["caption"])
+        self._rules_tree.tag_configure("off", foreground=t["fg_muted"])
+
+        self._apply_icons()
+        glyph = "sun" if self._dark_mode else "moon"
+        self._theme_btn.configure(image=(
+            icon(self, glyph, self._px(16), t["fg_dim"]),
+            "active", icon(self, glyph, self._px(16), t["fg"])))
+        self._sync_tabs()
+        set_titlebar_theme(self, self._dark_mode)
 
     def _toggle_dark_mode(self) -> None:
         self._dark_mode = not self._dark_mode
         self._theme = DARK_THEME if self._dark_mode else LIGHT_THEME
-        self._theme_btn.configure(
-            text="☀  Light Mode" if self._dark_mode else "🌙  Dark Mode")
         self._apply_theme()
         self._save_settings()
+
+    def _px(self, size: int) -> int:
+        """Scale a 96-dpi pixel size to the current display."""
+        return round(size * float(self.tk.call("tk", "scaling")) / (96 / 72))
+
+    _ICON_ROLES = {
+        "button":  ("fg_dim",    "fg",        16),
+        "primary": ("accent_fg", "accent_fg", 16),
+        "danger":  ("danger",    "accent_fg", 16),
+        "empty":   ("fg_muted",  "fg_muted",  40),
+    }
+
+    def _with_icon(self, widget: Any, glyph: str, role: str = "button") -> Any:
+        """Remember the widget so its icon is redrawn in the right colours on theme changes."""
+        self._icon_widgets.append((widget, glyph, role))
+        return widget
+
+    def _apply_icons(self) -> None:
+        t = self._theme
+        for widget, glyph, role in self._icon_widgets:
+            normal, over, size = self._ICON_ROLES[role]
+            beside_text = bool(widget.cget("text")) and role != "empty"
+            size = self._px(size if beside_text or role == "empty" else 14)
+            gap  = self._px(6) if beside_text else 0
+            widget.configure(image=(
+                icon(self, glyph, size, t[normal], gap),
+                "disabled", icon(self, glyph, size, t["fg_muted"], gap),
+                "active",   icon(self, glyph, size, t[over], gap),
+            ))
+            if beside_text:
+                widget.configure(compound="left")
+
+    def _notify(self, title: str, message: str, kind: str = "success") -> None:
+        if self._toast:
+            self._toast.destroy()
+        self._toast = _Toast(self, title, message, kind)
+
+    def _menu(self) -> tk.Menu:
+        t = self._theme
+        return tk.Menu(
+            self, tearoff=0, font=FONTS["ui"], relief="flat", borderwidth=1,
+            bg=t["surface_alt"], fg=t["fg"],
+            activebackground=t["accent"], activeforeground=t["accent_fg"],
+            activeborderwidth=0,
+        )
+
 
     # =========================================================================
     # Keyboard shortcuts & DnD
@@ -881,7 +1236,6 @@ class SimpleOrganizerApp(tk.Tk):
         self._scan_result = None
         self._organize_btn.configure(state="disabled")
         self._clear_preview()
-        self._notebook.tab(self._preview_tab_idx, text="  Preview  ")  # reset badge
         self._log(f"Folder set: {self._folder}")
         self._save_settings()
 
@@ -933,9 +1287,9 @@ class SimpleOrganizerApp(tk.Tk):
     def _update_schedule_status(self) -> None:
         if self._schedule_enabled.get():
             mins = self._schedule_interval.get()
-            self._schedule_status_var.set(f"Active -- runs every {mins} min")
+            self._schedule_status_var.set(f"Active, runs every {mins} min")
         else:
-            self._schedule_status_var.set("Disabled")
+            self._schedule_status_var.set("Off")
 
     def _on_schedule_fire(self) -> None:
         self._event_queue.put({"type": "schedule_fire"})
@@ -956,10 +1310,11 @@ class SimpleOrganizerApp(tk.Tk):
         self._rules_tree.delete(*self._rules_tree.get_children())
         for rule in load_rules():
             self._rules_tree.insert("", "end", values=(
-                "Y" if rule.enabled else "N",
+                "●" if rule.enabled else "○",
                 rule.name, rule.condition_type,
                 rule.condition_value, rule.target_folder,
-            ))
+            ), tags=() if rule.enabled else ("off",))
+        self._sync_empty(self._rules_tree, self._rules_empty)
 
     def _selected_rule_index(self) -> int | None:
         sel = self._rules_tree.selection()
@@ -979,7 +1334,7 @@ class SimpleOrganizerApp(tk.Tk):
     def _rule_edit(self) -> None:
         idx = self._selected_rule_index()
         if idx is None:
-            messagebox.showinfo("No selection", "Select a rule to edit.", parent=self)
+            _showinfo("No selection", "Select a rule to edit.", parent=self)
             return
         rules = load_rules()
         dlg   = _RuleDialog(self, rules[idx])
@@ -988,6 +1343,26 @@ class SimpleOrganizerApp(tk.Tk):
             rules[idx] = dlg.result
             save_rules(rules)
             self._refresh_rules_tree()
+
+    def _on_rules_click(self, event: Any) -> str | None:
+        row = self._rules_tree.identify_row(event.y)
+        if not row or self._rules_tree.identify_column(event.x) != "#1":
+            return None
+        self._rules_tree.selection_set(row)
+        self._toggle_selected_rule()
+        return "break"
+
+    def _on_rules_double_click(self, event: Any) -> None:
+        if self._rules_tree.identify_column(event.x) != "#1":
+            self._rule_edit()
+
+    def _toggle_selected_rule(self) -> None:
+        idx = self._selected_rule_index()
+        self._rule_toggle()
+        children = self._rules_tree.get_children()
+        if idx is not None and idx < len(children):
+            self._rules_tree.selection_set(children[idx])
+            self._rules_tree.focus(children[idx])
 
     def _rule_toggle(self) -> None:
         idx = self._selected_rule_index()
@@ -1003,7 +1378,7 @@ class SimpleOrganizerApp(tk.Tk):
         if idx is None:
             return
         rules = load_rules()
-        if not messagebox.askyesno("Delete Rule",
+        if not _askyesno("Delete Rule",
                                    f"Delete rule '{rules[idx].name}'?", parent=self):
             return
         del rules[idx]
@@ -1080,6 +1455,10 @@ class SimpleOrganizerApp(tk.Tk):
     def _on_configure(self, event: Any) -> None:
         if event.widget is not self:
             return
+        for overlay in self._overlays:
+            overlay.follow()
+        if self._toast:
+            self._toast._place(0)
         if self._resize_job:
             self.after_cancel(self._resize_job)
         self._resize_job = self.after(400, self._save_settings)
@@ -1095,7 +1474,6 @@ class SimpleOrganizerApp(tk.Tk):
         self._clear_duplicates()
         self._scan_result = None
         self._organize_btn.configure(state="disabled")
-        self._notebook.tab(self._preview_tab_idx, text="  Preview  ")  # M4 fix
         self._set_progress(0.0)
         self._status("Scanning...")
 
@@ -1160,10 +1538,8 @@ class SimpleOrganizerApp(tk.Tk):
                 tags=(str(plan.source),)   # source path stored for context menu
             )
 
-        # Preview tab badge (M4 fix: use named index)
-        count = len(actionable)
-        badge = f"  Preview ({count})  " if count else "  Preview  "
-        self._notebook.tab(self._preview_tab_idx, text=badge)
+        self._set_tab_count(self._preview_tab_idx, len(actionable))
+        self._sync_empty(self._preview_tree, self._preview_empty)
 
         self._clear_duplicates()
         dup_msg = ""
@@ -1192,8 +1568,15 @@ class SimpleOrganizerApp(tk.Tk):
                     )
                     file_iids.append(iid)
                 self._dup_groups[node] = file_iids
+            self._set_tab_count(self._dup_tab_idx, len(result.duplicate_groups))
+            self._sync_empty(self._dup_tree, self._dup_empty)
         else:
             self._log("No duplicate files detected.")
+
+        summary = f"{len(actionable)} to move  ·  {len(skipped)} in place"
+        if result.duplicate_groups:
+            summary += f"  ·  {len(result.duplicate_groups)} duplicate groups"
+        self._summary_var.set(summary)
 
         if actionable:
             self._organize_btn.configure(state="normal")
@@ -1230,7 +1613,7 @@ class SimpleOrganizerApp(tk.Tk):
 
         actionable = [p for p in self._scan_result.plans if not p.skipped]
         if not actionable:
-            messagebox.showinfo("Nothing to do", "All files are already organised.", parent=self)
+            _showinfo("Nothing to do", "All files are already organised.", parent=self)
             return
 
         total_bytes = 0
@@ -1245,7 +1628,7 @@ class SimpleOrganizerApp(tk.Tk):
         dest_label = (
             "the staging area" if staging else "categorised sub-folders"
         )
-        confirmed = messagebox.askyesno(
+        confirmed = _askyesno(
             title="Confirm Organize",
             message=(
                 f"Move {len(actionable)} file(s) -- {size_str} total -- "
@@ -1288,25 +1671,28 @@ class SimpleOrganizerApp(tk.Tk):
         self._organize_btn.configure(state="disabled")
         self._scan_result = None
         self._clear_preview()
-        self._notebook.tab(self._preview_tab_idx, text="  Preview  ")
         self._refresh_persistent_buttons()
 
         if errors:
             self._log(f"Finished with {len(errors)} error(s). See log.")
             self._status(f"Done -- {len(errors)} error(s).")
+            self._notify("Organize finished with errors",
+                         f"{len(errors)} file(s) could not be moved. See the log.", "warning")
         elif staging:
             self._log("Files staged. Use Commit or Revert to finalise.")
             self._status("Staging complete -- commit or revert when ready.")
+            self._notify("Files staged", "Commit or revert when you are ready.", "info")
         else:
             self._log("All files organised successfully.")
             self._status("Done -- all files organised.")
+            self._notify("Folder organised", "All files were moved into their categories.")
 
     # =========================================================================
     # Undo last run
     # =========================================================================
 
     def _confirm_and_undo(self) -> None:
-        confirmed = messagebox.askyesno(
+        confirmed = _askyesno(
             title="Undo Last Organize",
             message=(
                 "Restore all files moved in the last organize run "
@@ -1344,16 +1730,19 @@ class SimpleOrganizerApp(tk.Tk):
         if errors:
             self._log(f"Undo finished with {len(errors)} error(s). See log.")
             self._status(f"Undo done -- {len(errors)} error(s).")
+            self._notify("Undo finished with errors",
+                         f"{len(errors)} file(s) could not be restored. See the log.", "warning")
         else:
             self._log("Undo complete -- files restored to original locations.")
             self._status("Undo complete.")
+            self._notify("Undo complete", "Files are back where they were.")
 
     # =========================================================================
     # Staging commit / revert
     # =========================================================================
 
     def _confirm_and_commit(self) -> None:
-        confirmed = messagebox.askyesno(
+        confirmed = _askyesno(
             title="Commit Staging",
             message=(
                 "Move all staged files to their final category folders?\n\n"
@@ -1391,12 +1780,15 @@ class SimpleOrganizerApp(tk.Tk):
         if errors:
             self._log(f"Commit finished with {len(errors)} error(s). See log.")
             self._status(f"Commit done -- {len(errors)} error(s).")
+            self._notify("Commit finished with errors",
+                         f"{len(errors)} file(s) could not be moved. See the log.", "warning")
         else:
             self._log("Staging committed -- all files moved to final destinations.")
             self._status("Commit complete.")
+            self._notify("Staging committed", "Staged files are in their final folders.")
 
     def _confirm_and_revert(self) -> None:
-        confirmed = messagebox.askyesno(
+        confirmed = _askyesno(
             title="Revert Staging",
             message=(
                 "Move all staged files back to their original locations?\n\n"
@@ -1433,9 +1825,12 @@ class SimpleOrganizerApp(tk.Tk):
         if errors:
             self._log(f"Revert finished with {len(errors)} error(s). See log.")
             self._status(f"Revert done -- {len(errors)} error(s).")
+            self._notify("Revert finished with errors",
+                         f"{len(errors)} file(s) could not be restored. See the log.", "warning")
         else:
             self._log("Staging reverted -- all files returned to original locations.")
             self._status("Revert complete.")
+            self._notify("Staging reverted", "Staged files are back where they were.")
 
     # =========================================================================
     # Thread-safe queue polling
@@ -1470,7 +1865,7 @@ class SimpleOrganizerApp(tk.Tk):
                     self._set_busy(False)
                     self._status("Error -- see log.")
                     self._log(f"[ERROR]  {event['value']}")
-                    messagebox.showerror("Error", event["value"], parent=self)
+                    _showerror("Error", event["value"], parent=self)
         except queue.Empty:
             pass
         finally:
@@ -1491,6 +1886,8 @@ class SimpleOrganizerApp(tk.Tk):
         ):
             w.configure(state=state)
         self.configure(cursor="watch" if busy else "")
+        self._state_var.set("WORKING" if busy else "READY")
+        self._state_dot.configure(style="Busy.TLabel" if busy else "Idle.TLabel")
         if not busy:
             self._refresh_persistent_buttons()
 
@@ -1499,8 +1896,10 @@ class SimpleOrganizerApp(tk.Tk):
         self._pct_var.set(f"{int(value)}%")
 
     def _log(self, message: str) -> None:
+        prefix = message.lstrip().split("]", 1)[0] + "]"
         self._log_box.configure(state="normal")
-        self._log_box.insert("end", message + "\n")
+        self._log_box.insert("end", time.strftime("%H:%M:%S  "), "time")
+        self._log_box.insert("end", message + "\n", _LOG_TAGS.get(prefix, ""))
         self._log_box.see("end")
         self._log_box.configure(state="disabled")
 
@@ -1511,12 +1910,17 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _clear_preview(self) -> None:
         self._preview_tree.delete(*self._preview_tree.get_children())
+        self._set_tab_count(self._preview_tab_idx, 0)
+        self._summary_var.set("")
+        self._sync_empty(self._preview_tree, self._preview_empty)
 
     def _clear_duplicates(self) -> None:
         self._dup_tree.delete(*self._dup_tree.get_children())
         self._dup_groups = {}
         self._dup_sel_var.set("")
         self._trash_btn.configure(state="disabled")
+        self._set_tab_count(self._dup_tab_idx, 0)
+        self._sync_empty(self._dup_tree, self._dup_empty)
 
     def _status(self, message: str) -> None:
         self._status_var.set(message)
@@ -1524,6 +1928,14 @@ class SimpleOrganizerApp(tk.Tk):
     # =========================================================================
     # Duplicate trash
     # =========================================================================
+
+    def _on_dup_click(self, event: Any) -> str | None:
+        """Clicking anywhere on a group row opens or closes it."""
+        row = self._dup_tree.identify_row(event.y)
+        if not row or "group" not in self._dup_tree.item(row, "tags"):
+            return None
+        self._dup_tree.item(row, open=not self._dup_tree.item(row, "open"))
+        return "break"
 
     def _on_dup_select(self, _event: Any = None) -> None:
         """Update selection label and Trash button state when selection changes."""
@@ -1562,7 +1974,7 @@ class SimpleOrganizerApp(tk.Tk):
         if not file_iids:
             return
         if not self._selection_is_valid(file_iids):
-            messagebox.showwarning(
+            _showwarning(
                 "Invalid selection",
                 "At least one file per duplicate group must remain.\n"
                 "Deselect one file from each fully-selected group.",
@@ -1584,7 +1996,7 @@ class SimpleOrganizerApp(tk.Tk):
         if len(paths) > 10:
             preview += f"\n  … and {len(paths) - 10} more"
 
-        confirmed = messagebox.askyesno(
+        confirmed = _askyesno(
             title="Move to Trash",
             message=(
                 f"Move {len(paths)} file(s) to the system Trash?\n\n"
@@ -1626,9 +2038,12 @@ class SimpleOrganizerApp(tk.Tk):
         if errors:
             self._log(f"Trash finished with {len(errors)} error(s). See log.")
             self._status(f"Trash done — {len(errors)} error(s).")
+            self._notify("Some files were not trashed",
+                         f"{len(errors)} file(s) failed. See the log.", "warning")
         else:
             self._log(f"{count} file(s) moved to Trash successfully.")
             self._status(f"Done — {count} file(s) moved to Trash.")
+            self._notify("Moved to Trash", f"{count} duplicate file(s) can be restored from the Trash.")
 
     # =========================================================================
     # Context menus
@@ -1638,7 +2053,7 @@ class SimpleOrganizerApp(tk.Tk):
         """Open a folder in the system file manager. Cross-platform."""
         folder = Path(path_str)
         if not folder.exists():
-            messagebox.showwarning("Not found",
+            _showwarning("Not found",
                                    f"Folder does not exist:\n{folder}", parent=self)
             return
         try:
@@ -1647,7 +2062,7 @@ class SimpleOrganizerApp(tk.Tk):
             else:
                 subprocess.Popen(["xdg-open", str(folder)])
         except Exception as exc:
-            messagebox.showerror("Error", f"Could not open folder:\n{exc}", parent=self)
+            _showerror("Error", f"Could not open folder:\n{exc}", parent=self)
 
     def _copy_to_clipboard(self, text: str) -> None:
         """Copy text to the system clipboard."""
@@ -1670,7 +2085,7 @@ class SimpleOrganizerApp(tk.Tk):
         source_path  = Path(tags[0]) if tags else None
         dest_folder  = vals[2] if len(vals) > 2 else ""
 
-        menu = tk.Menu(self, tearoff=0)
+        menu = self._menu()
         has_open  = False
         has_copy  = False
 
@@ -1730,7 +2145,7 @@ class SimpleOrganizerApp(tk.Tk):
         folder_path = vals[2] if len(vals) > 2 else ""
         full_path   = str(Path(folder_path) / filename) if filename and folder_path else ""
 
-        menu = tk.Menu(self, tearoff=0)
+        menu = self._menu()
 
         if folder_path:
             menu.add_command(
