@@ -400,6 +400,7 @@ def apply_ttk_theme(style: ttk.Style, t: dict[str, str]) -> None:
         (f"{key}.caret",       {"side": "left", "sticky": ""}),
         ("Treeitem.image",     {"side": "left", "sticky": ""}),
         ("Treeitem.text",      {"side": "left", "sticky": ""})]})])
+    style.configure("Treeview.Item", padding=(8, 0, 0, 0))
     style.configure("Treeview", background=surface, fieldbackground=surface, foreground=fg,
                     font=FONTS["ui"], rowheight=28, indent=16)
     style.map("Treeview",
