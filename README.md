@@ -5,7 +5,7 @@
 > and now a built-in duplicate deleter.
 > No data loss. No internet. No background services.
 
-**GitHub:** https://github.com/SchnekayOpen/Simple-Organizer
+**GitHub:** https://github.com/FreakySneaky787/Simple-Organizer
 **Codeberg:** https://codeberg.org/Simple-Project/Simple-Organizer
 
 ---
