@@ -12,7 +12,7 @@
 
 ## Table of Contents
 
-- [What's New in v3.3.1](#whats-new-in-v331)
+- [What's New in v3.4.0](#whats-new-in-v340)
 - [Downloads](#downloads)
 - [Features](#features)
 - [Safety Guarantees](#safety-guarantees)
@@ -29,70 +29,50 @@
 
 ---
 
-## What's New in v3.3.1
+## What's New in v3.4.0
 
-### Duplicate Deleter
+### UI Refresh
 
-The biggest new feature since the rules engine. The Duplicates tab now lets
-you act on duplicates — not just view them.
+The interface has been rebuilt from the ground up. Organizing, rules,
+undo, and scheduling logic are all unchanged from v3.3.1 — this release
+only changes how the app looks and feels.
 
-After a scan, select any duplicate file rows using click, Ctrl+click, or
-Shift+click. Then click **Move Selected to Trash** to send them to the
-system Trash or Recycle Bin.
+- Folder bar on top, options in a sidebar, tabbed workspace, status bar
+- Dark and light themes with rounded controls, drawn at runtime — no
+  image files shipped
+- Native-looking title bar theming on Windows 10/11 (dark mode follows
+  the app theme)
+- Phosphor icons throughout (MIT-licensed, bundled as path data)
+- In-app dialogs replace native message boxes, plus a toast notification
+  when a long-running operation finishes
+- −/+ number steppers for numeric settings
+- Timestamped, colour-coded log
+- Click a rule's status dot in the Rules tab to toggle it on or off
+  without opening the edit dialog
+- Duplicate groups expand/collapse by clicking anywhere on the row
 
-**How it works:**
-- Multi-select is fully supported — click, Ctrl+click, Shift+click
-- A live label shows how many files are selected
-- The **Move to Trash** button is disabled until you make a valid selection
-- A confirmation dialog shows exactly which files will be moved before
-  anything happens
-- Every trashed file is logged in the Log tab
+No new dependencies were introduced — the new `theme.py` and `icons.py`
+modules use only the Python standard library.
 
-**Safety rules — always enforced:**
-- At least one file per duplicate group must remain — you can never
-  trash an entire group accidentally. The button stays disabled and shows
-  `"keep at least 1 per group"` if the selection is invalid.
-- Files go to the **system Trash / Recycle Bin** only — nothing is ever
-  permanently deleted
-- App files are excluded from duplicate results entirely
-
-**Cross-platform implementation — no external packages:**
-
-| Platform | Method |
-|----------|--------|
-| Windows | `ctypes` → `SHFileOperation` with `FOF_ALLOWUNDO` (native Recycle Bin) |
-| Linux | `gio trash` → `trash-put` → manual XDG Trash fallback |
-
-No `send2trash` or any other pip dependency required.
-
-### Bug Fixes
-
-**`save_rules()` silently swallowed write errors** — `rules.py` · Low
-`save_rules()` caught all exceptions with `pass`, making a failed rules
-write invisible. Fixed: now returns `bool` and the caller logs a warning
-in the Log tab if saving fails.
-
-**`_adjust_colour()` only lightened colours** — `main.py` · Low
-The hover colour helper always added to RGB channels, making colours
-lighter regardless of the theme. In light mode the hover was barely
-visible. Fixed: the function now supports negative amounts to darken,
-and the light theme hover correctly darkens the accent.
+> **Note:** On Linux, dialog and toast corners render square instead of
+> rounded — window transparency (used for rounded corners) is
+> Windows-only.
 
 ---
 
 ## Downloads
 
-### Latest — v3.3.1
+### Latest — v3.4.0
 
 | Platform | File |
 |----------|------|
-| Linux x86-64 | `simple_organizer_linux_v3.3.1.tar.gz` |
-| Linux x86-64 | `simple_organizer_linux_v3.3.1.sha256` |
-| Windows 10/11 | `simple_organizer_windows_v3.3.1.zip` |
-| Windows 10/11 | `simple_organizer_windows_v3.3.1.sha256` |
+| Linux x86-64 | `simple_organizer_linux_v3.4.0.tar.gz` |
+| Linux x86-64 | `simple_organizer_linux_v3.4.0.sha256` |
+| Windows 10/11 | `simple_organizer_windows_v3.4.0.zip` |
+| Windows 10/11 | `simple_organizer_windows_v3.4.0.sha256` |
 
-→ [GitHub Releases](../../releases/tag/v3.3.1)
-→ [Codeberg Releases](https://codeberg.org/SchnekayOpen/Simple-Organizer/releases/tag/v3.3.1)
+→ [GitHub Releases](../../releases/tag/v3.4.0)
+→ [Codeberg Releases](https://codeberg.org/SchnekayOpen/Simple-Organizer/releases/tag/v3.4.0)
 
 > **Note:** The `.sha256` file is a checksum of the **binary or exe**
 > directly — not of the tar/zip archive.
@@ -152,6 +132,8 @@ Code/Python/          Code/JavaScript/    Code/Web/
 | Older than (days) | `365` | Not modified in over a year |
 | Newer than (days) | `7` | Modified in the last week |
 
+Click a rule's status dot in the list to toggle it on or off.
+
 ### Staging Mode
 
 Files move to a temporary area first. Inspect, then **Commit** or **Revert**.
@@ -174,6 +156,7 @@ app closes. Never runs as a system service.
 Two-stage: size buckets then SHA-256. Files over 500 MB skipped. Select
 duplicates in the Duplicates tab and move them to Trash with one click.
 At least one file per group is always kept. Nothing is permanently deleted.
+Click anywhere on a group row to expand or collapse it.
 
 ### Context Menus
 
@@ -222,15 +205,15 @@ all scans, planning, and duplicate detection at three independent layers.
 ### Linux
 
 ```bash
-tar -xzf simple_organizer_linux_v3.3.1.tar.gz
-cd simple_organizer_linux_v3.3.1
+tar -xzf simple_organizer_linux_v3.4.0.tar.gz
+cd simple_organizer_linux_v3.4.0
 chmod +x simple_organizer
 ./simple_organizer
 ```
 
 ### Windows
 
-1. Download and extract `simple_organizer_windows_v3.3.1.zip`
+1. Download and extract `simple_organizer_windows_v3.4.0.zip`
 2. Double-click `simple_organizer.exe`
 3. If Windows Defender warns: right-click → **Properties** → **Unblock**
 
@@ -242,14 +225,14 @@ The `.sha256` file is a checksum of the **binary** — not the archive.
 
 ```bash
 # Linux — verify after extracting
-tar -xzf simple_organizer_linux_v3.3.1.tar.gz
-cd simple_organizer_linux_v3.3.1
-sha256sum -c ../simple_organizer_linux_v3.3.1.sha256
+tar -xzf simple_organizer_linux_v3.4.0.tar.gz
+cd simple_organizer_linux_v3.4.0
+sha256sum -c ../simple_organizer_linux_v3.4.0.sha256
 ```
 
 ```powershell
 # Windows
-Get-FileHash simple_organizer_windows_v3.3.1\simple_organizer.exe -Algorithm SHA256
+Get-FileHash simple_organizer_windows_v3.4.0\simple_organizer.exe -Algorithm SHA256
 ```
 
 ---
@@ -336,7 +319,7 @@ sudo dnf install python3-tkinter
 # Debian / Ubuntu
 sudo apt install python3-tk
 
-git clone https://github.com/SchnekayOpen/Simple-Organizer.git
+git clone https://github.com/FreakySneaky787/Simple-Organizer.git
 cd Simple-Organizer
 python3 main.py
 ```
@@ -370,6 +353,8 @@ py -m PyInstaller --onefile --windowed --name simple_organizer ^
 - Drag-and-drop requires the `tkdnd` Tcl extension (silently disabled if absent)
 - Network drives untested
 - macOS not supported
+- On Linux, dialog and toast windows have square corners (rounded corners
+  rely on Windows-only transparency)
 
 ---
 
