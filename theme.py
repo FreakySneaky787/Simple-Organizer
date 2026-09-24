@@ -254,24 +254,23 @@ def _create_elements(style: ttk.Style, key: str, t: dict[str, str]) -> None:
     element("trough", pill(16, 6, border), [], border=(3, 0, 3, 0), base=(16, 6))
     element("pbar", pill(16, 6, accent), [], border=(3, 0, 3, 0), base=(6, 6))
 
-    def caret(name: str, colour: str, gap: int) -> tk.PhotoImage:
-        img = icon(root, name, 12, colour, gap)
+    def caret(name: str, size: int, colour: str, gap: int) -> tk.PhotoImage:
+        img = icon(root, name, size, colour, gap)
         images.append(img)
         return img
 
-    element("chevron", caret("caret-down", t["fg_dim"], 10), [
-        ("disabled", caret("caret-down", t["fg_muted"], 10)),
-        ("active",   caret("caret-down", t["fg"], 10)),
+    element("chevron", caret("caret-down", 12, t["fg_dim"], 10), [
+        ("disabled", caret("caret-down", 12, t["fg_muted"], 10)),
+        ("active",   caret("caret-down", 12, t["fg"], 10)),
     ], border=0)
 
     # Tree rows: user1 is "open", user2 is "leaf" (no children, no caret).
-    blank = rgba_image(root, 18, 12, [b"\x00" * 18 * 4] * 12)
+    blank = rgba_image(root, 22, 16, [b"\x00" * 22 * 4] * 16)
     images.append(blank)
-    element("caret", caret("caret-right", t["fg_muted"], 6), [
+    element("caret", caret("caret-right", 16, t["fg_dim"], 6), [
         ("user2", blank),
-        ("user1", caret("caret-down", t["fg_muted"], 6)),
+        ("user1", caret("caret-down", 16, t["fg_dim"], 6)),
     ], border=0)
-
 
 # ---------------------------------------------------------------------------
 # Styles
