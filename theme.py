@@ -241,9 +241,10 @@ def _create_elements(style: ttk.Style, key: str, t: dict[str, str]) -> None:
         images.append(img)
         return img
 
-    element("vthumb", thumb(10, 24, strong), [("active", thumb(10, 24, t["fg_muted"]))],
+    # ttk finds the scrollbar thumb by the "thumb" suffix, so keep it last in the name.
+    element("Vertical.thumb", thumb(10, 24, strong), [("active", thumb(10, 24, t["fg_muted"]))],
             border=5, base=(10, 24))
-    element("hthumb", thumb(24, 10, strong), [("active", thumb(24, 10, t["fg_muted"]))],
+    element("Horizontal.thumb", thumb(24, 10, strong), [("active", thumb(24, 10, t["fg_muted"]))],
             border=5, base=(24, 10))
 
     def pill(w: int, h: int, colour: str) -> tk.PhotoImage:
@@ -388,10 +389,10 @@ def apply_ttk_theme(style: ttk.Style, t: dict[str, str]) -> None:
         (f"{key}.pbar", {"side": "left", "sticky": "ns"})]})])
     style.configure("Horizontal.TProgressbar", background=surface, thickness=6)
 
-    for orient, sticky, thumb in (("Vertical", "ns", "vthumb"), ("Horizontal", "ew", "hthumb")):
+    for orient, sticky in (("Vertical", "ns"), ("Horizontal", "ew")):
         name = f"{orient}.TScrollbar"
         style.layout(name, [(f"{orient}.Scrollbar.trough", {"sticky": sticky, "children": [
-            (f"{key}.{thumb}", {"expand": "1", "sticky": "nswe"})]})])
+            (f"{key}.{orient}.thumb", {"expand": "1", "sticky": "nswe"})]})])
         style.configure(name, troughcolor=surface, background=surface, bordercolor=surface,
                         lightcolor=surface, darkcolor=surface)
 
