@@ -6,11 +6,12 @@ Copyright (c) 2023 Phosphor Icons. https://phosphoricons.com
 Each path uses a 256x256 view box.
 """
 
+import base64
 import math
 import re
+import struct
 import tkinter as tk
-
-from theme import rgba_image
+import zlib
 
 PATHS: dict[str, str] = {
     "arrow-counter-clockwise": (
@@ -32,6 +33,14 @@ PATHS: dict[str, str] = {
         "M205.66,117.66a8,8,0,0,1-11.32,0L136,59.31V216a8,8,0,0,1-16,0V59.31L"
         "61.66,117.66a8,8,0,0,1-11.32-11.32l72-72a8,8,0,0,1,11.32,0l72,72A"
         "8,8,0,0,1,205.66,117.66Z"
+    ),
+    "caret-down": (
+        "M213.66,101.66l-80,80a8,8,0,0,1-11.32,0l-80-80A8,8,0,0,1,53.66,90.34L128,164.69l"
+        "74.34-74.35a8,8,0,0,1,11.32,11.32Z"
+    ),
+    "caret-right": (
+        "M181.66,133.66l-80,80a8,8,0,0,1-11.32-11.32L164.69,128,90.34,53.66a"
+        "8,8,0,0,1,11.32-11.32l80,80A8,8,0,0,1,181.66,133.66Z"
     ),
     "check": (
         "M229.66,77.66l-128,128a8,8,0,0,1-11.32,0l-56-56a8,8,0,0,1,11.32-11.32L"
@@ -181,6 +190,22 @@ PATHS: dict[str, str] = {
         "66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"
     ),
 }
+
+
+def _png(width: int, height: int, rows: list[bytes]) -> bytes:
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+    raw = b"".join(b"\x00" + row for row in rows)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b""))
+
+
+def rgba_image(root: tk.Misc, width: int, height: int, rows: list[bytes]) -> tk.PhotoImage:
+    """Build a PhotoImage from rows of RGBA bytes (keeps real alpha, unlike put())."""
+    return tk.PhotoImage(master=root, data=base64.b64encode(_png(width, height, rows)))
 
 
 _TOKEN = re.compile(r"[MmLlHhVvCcSsQqTtAaZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")

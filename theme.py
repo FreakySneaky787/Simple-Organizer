@@ -6,14 +6,13 @@ used as ttk image elements, so no image files or extra packages are needed.
 Palettes live in utils.py (LIGHT_THEME / DARK_THEME).
 """
 
-import base64
-import struct
 import sys
 import tkinter as tk
-import zlib
 from tkinter import font as tkfont
 from tkinter import ttk
 from typing import Any, Callable
+
+from icons import icon, rgba_image
 
 _UI_FAMILIES   = ("Segoe UI", "Cantarell", "Ubuntu", "Noto Sans", "DejaVu Sans")
 _MONO_FAMILIES = ("Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono",
@@ -115,17 +114,6 @@ def _stroke(points: list[tuple[float, float]], width: float) -> Shape:
     return hit
 
 
-def _png(width: int, height: int, rows: list[bytes]) -> bytes:
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return (struct.pack(">I", len(data)) + tag + data
-                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
-    raw = b"".join(b"\x00" + row for row in rows)
-    return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(raw))
-            + chunk(b"IEND", b""))
-
-
 def _render(root: tk.Misc, width: int, height: int, layers: list[tuple[Shape, str]],
             samples: int = 3, grow: tuple[int, int] = (0, 0)) -> tk.PhotoImage:
     """Composite shapes back to front with supersampled coverage.
@@ -163,11 +151,6 @@ def _render(root: tk.Misc, width: int, height: int, layers: list[tuple[Shape, st
         mid = height // 2
         rows = rows[:mid] + [rows[mid]] * extra_h + rows[mid:]
     return rgba_image(root, width + extra_w, height + extra_h, rows)
-
-
-def rgba_image(root: tk.Misc, width: int, height: int, rows: list[bytes]) -> tk.PhotoImage:
-    """Build a PhotoImage from rows of RGBA bytes (keeps real alpha, unlike put())."""
-    return tk.PhotoImage(master=root, data=base64.b64encode(_png(width, height, rows)))
 
 
 def _box(root: tk.Misc, size: int, radius: int, fill: str, edge: str,
@@ -271,14 +254,22 @@ def _create_elements(style: ttk.Style, key: str, t: dict[str, str]) -> None:
     element("trough", pill(16, 6, border), [], border=(3, 0, 3, 0), base=(16, 6))
     element("pbar", pill(16, 6, accent), [], border=(3, 0, 3, 0), base=(6, 6))
 
-    def chevron(colour: str) -> tk.PhotoImage:
-        img = _render(root, 22, 16, [(_stroke([(7, 6.5), (11, 10), (15, 6.5)], 1.5), colour)])
+    def caret(name: str, colour: str, gap: int) -> tk.PhotoImage:
+        img = icon(root, name, 12, colour, gap)
         images.append(img)
         return img
 
-    element("chevron", chevron(t["fg_dim"]), [
-        ("disabled", chevron(t["fg_muted"])),
-        ("active",   chevron(t["fg"])),
+    element("chevron", caret("caret-down", t["fg_dim"], 10), [
+        ("disabled", caret("caret-down", t["fg_muted"], 10)),
+        ("active",   caret("caret-down", t["fg"], 10)),
+    ], border=0)
+
+    # Tree rows: user1 is "open", user2 is "leaf" (no children, no caret).
+    blank = rgba_image(root, 18, 12, [b"\x00" * 18 * 4] * 12)
+    images.append(blank)
+    element("caret", caret("caret-right", t["fg_muted"], 6), [
+        ("user2", blank),
+        ("user1", caret("caret-down", t["fg_muted"], 6)),
     ], border=0)
 
 
@@ -407,7 +398,7 @@ def apply_ttk_theme(style: ttk.Style, t: dict[str, str]) -> None:
 
     style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
     style.layout("Treeview.Item", [("Treeitem.padding", {"sticky": "nswe", "children": [
-        ("Treeitem.indicator", {"side": "left", "sticky": ""}),
+        (f"{key}.caret",       {"side": "left", "sticky": ""}),
         ("Treeitem.image",     {"side": "left", "sticky": ""}),
         ("Treeitem.text",      {"side": "left", "sticky": ""})]})])
     style.configure("Treeview", background=surface, fieldbackground=surface, foreground=fg,
