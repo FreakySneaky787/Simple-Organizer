@@ -27,7 +27,7 @@ from organizer import (
     undo_specific_run,
 )
 from utils import DARK_THEME, LIGHT_THEME, safe_expanduser
-from theme import FONTS, apply_ttk_theme, load_fonts, set_titlebar_theme
+from theme import FONTS, apply_ttk_theme, float_key, load_fonts, set_titlebar_theme
 from icons import badge, icon
 from config import load_settings, save_settings
 from rules import Rule, CONDITION_TYPES, CONDITION_LABELS, load_rules, save_rules
@@ -123,16 +123,23 @@ class _Stepper(ttk.Frame):
         self._var, self._low, self._high, self._step = variable, low, high, step
         self._command = command
 
-        self._minus = ttk.Button(self, style="Step.TButton", command=lambda: self._nudge(-1))
+        app: SimpleOrganizerApp = self._root()  # type: ignore[assignment]
+        side = app._px(26)
+
+        def square_button(glyph: str, direction: int) -> ttk.Button:
+            holder = ttk.Frame(self, style="Panel.TFrame", width=side, height=side)
+            holder.pack_propagate(False)
+            holder.pack(side="left")
+            button = ttk.Button(holder, style="Step.TButton",
+                                command=lambda: self._nudge(direction))
+            button.pack(fill="both", expand=True)
+            return app._with_icon(button, glyph)
+
+        self._minus = square_button("minus", -1)
         self._entry = ttk.Entry(self, textvariable=variable, width=width,
                                 justify="center", style="Step.TEntry")
-        self._plus  = ttk.Button(self, style="Step.TButton", command=lambda: self._nudge(1))
-        app: SimpleOrganizerApp = self._root()  # type: ignore[assignment]
-        app._with_icon(self._minus, "minus")
-        app._with_icon(self._plus, "plus")
-        self._minus.pack(side="left", fill="y")
         self._entry.pack(side="left", fill="y", padx=4)
-        self._plus.pack(side="left", fill="y")
+        self._plus = square_button("plus", 1)
 
         self._entry.bind("<Up>",         lambda _e: self._nudge(1))
         self._entry.bind("<Down>",       lambda _e: self._nudge(-1))
@@ -171,15 +178,9 @@ class _Stepper(ttk.Frame):
 # In-app dialogs
 # ---------------------------------------------------------------------------
 
-def _chroma_key(window: tk.Toplevel, behind: str) -> None:
-    """Make the square corners around a rounded card see-through.
-
-    Windows keys out one exact colour. Using a near twin of what sits behind the
-    card means the anti-aliased edge pixels blend into that colour too, instead of
-    leaving a dark fringe. Other platforms just get the twin as a solid background.
-    """
-    last = int(behind[5:7], 16)
-    key = f"{behind[:5]}{last - 1 if last else 1:02x}"
+def _chroma_key(window: tk.Toplevel, theme: dict[str, str]) -> None:
+    """Make the square corners around a Float.TFrame card see-through (Windows only)."""
+    key = float_key(theme)
     window.configure(bg=key)
     if sys.platform == "win32":
         window.attributes("-transparentcolor", key)
@@ -204,9 +205,9 @@ class _Overlay(tk.Toplevel):
         super().__init__(app)
         self.overrideredirect(True)
         _set_alpha(self, 0.0)
-        _chroma_key(self, app._theme["surface"])
+        _chroma_key(self, app._theme)
 
-        card = ttk.Frame(self, style="Card.TFrame", padding=3)
+        card = ttk.Frame(self, style="Float.TFrame", padding=3)
         card.pack(fill="both", expand=True)
 
         head = ttk.Frame(card, style="Panel.TFrame", padding=(18, 10, 10, 10))
@@ -478,11 +479,11 @@ class _Toast(tk.Toplevel):
         self._app = app
         self.overrideredirect(True)
         _set_alpha(self, 0.0)
-        _chroma_key(self, app._theme["bg"])
+        _chroma_key(self, app._theme)
 
         t = app._theme
         glyph, colour = _MessageDialog.KINDS[kind]
-        card = ttk.Frame(self, style="Card.TFrame", padding=(14, 10, 8, 10))
+        card = ttk.Frame(self, style="Float.TFrame", padding=(14, 10, 8, 10))
         card.pack(fill="both", expand=True)
         card.columnconfigure(1, weight=1)
         ttk.Label(card, style="Card.TLabel",
@@ -943,9 +944,6 @@ class SimpleOrganizerApp(tk.Tk):
         self._with_icon(ttk.Button(bar, text="Edit", style="Card.TButton",
                                    command=self._rule_edit), "pencil-simple").pack(
             side="left", padx=(0, 8))
-        self._with_icon(ttk.Button(bar, text="Enable / Disable", style="Card.TButton",
-                                   command=self._rule_toggle), "toggle-right").pack(
-            side="left", padx=(0, 8))
         up = self._with_icon(ttk.Button(bar, style="Card.TButton",
                                         command=lambda: self._rule_move(-1)), "arrow-up")
         up.pack(side="left", padx=(0, 4))
@@ -972,7 +970,9 @@ class SimpleOrganizerApp(tk.Tk):
         self._rules_tree.column("condition", width=140, anchor="w",      stretch=False)
         self._rules_tree.column("value",     width=120, anchor="w",      stretch=False)
         self._rules_tree.column("target",    width=160, anchor="w",      stretch=True)
-        self._rules_tree.bind("<Double-1>", lambda _e: self._rule_edit())
+        self._rules_tree.bind("<Button-1>", self._on_rules_click)
+        self._rules_tree.bind("<Double-1>", self._on_rules_double_click)
+        self._rules_tree.bind("<space>",    lambda _e: self._toggle_selected_rule())
 
         self._rules_empty = self._with_icon(ttk.Label(
             tab, text="No rules yet. Rules send files to a folder by extension, name, size or age.",
@@ -982,7 +982,8 @@ class SimpleOrganizerApp(tk.Tk):
             row=4, column=0, columnspan=2, sticky="ew")
         ttk.Label(
             tab,
-            text="Rules run before extension-based categorisation. First match wins.",
+            text="Rules run before extension-based categorisation. First match wins. "
+                 "Click the dot to turn a rule on or off.",
             style="CardHint.TLabel", padding=(12, 10),
         ).grid(row=5, column=0, columnspan=2, sticky="w")
 
@@ -1341,6 +1342,26 @@ class SimpleOrganizerApp(tk.Tk):
             rules[idx] = dlg.result
             save_rules(rules)
             self._refresh_rules_tree()
+
+    def _on_rules_click(self, event: Any) -> str | None:
+        row = self._rules_tree.identify_row(event.y)
+        if not row or self._rules_tree.identify_column(event.x) != "#1":
+            return None
+        self._rules_tree.selection_set(row)
+        self._toggle_selected_rule()
+        return "break"
+
+    def _on_rules_double_click(self, event: Any) -> None:
+        if self._rules_tree.identify_column(event.x) != "#1":
+            self._rule_edit()
+
+    def _toggle_selected_rule(self) -> None:
+        idx = self._selected_rule_index()
+        self._rule_toggle()
+        children = self._rules_tree.get_children()
+        if idx is not None and idx < len(children):
+            self._rules_tree.selection_set(children[idx])
+            self._rules_tree.focus(children[idx])
 
     def _rule_toggle(self) -> None:
         idx = self._selected_rule_index()

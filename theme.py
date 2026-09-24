@@ -52,6 +52,16 @@ def load_fonts(root: tk.Misc) -> None:
     })
 
 
+def float_key(t: dict[str, str]) -> str:
+    """Colour keyed out around floating cards (dialogs, toasts) on Windows.
+
+    It is a near twin of the surface colour, so the anti-aliased edge pixels of the
+    rounded corners blend towards the card instead of leaving a dark fringe.
+    """
+    last = int(t["surface"][5:7], 16)
+    return f"{t['surface'][:5]}{last - 1 if last else 1:02x}"
+
+
 def set_titlebar_theme(window: tk.Misc, dark: bool) -> None:
     """Match the native Windows 10/11 title bar to the app theme. No-op elsewhere."""
     if sys.platform != "win32":
@@ -293,8 +303,10 @@ def apply_ttk_theme(style: ttk.Style, t: dict[str, str]) -> None:
                     borderwidth=0, relief="flat")
 
     style.layout("Card.TFrame", [(f"{key}.card", {"sticky": "nswe"})])
+    style.layout("Float.TFrame", [(f"{key}.card", {"sticky": "nswe"})])
     style.configure("TFrame",               background=bg)
     style.configure("Card.TFrame",          background=bg)
+    style.configure("Float.TFrame",         background=float_key(t))
     style.configure("Panel.TFrame",         background=surface)
     style.configure("Bar.TFrame",           background=surface)
     style.configure("Rule.TFrame",          background=border)
@@ -352,7 +364,7 @@ def apply_ttk_theme(style: ttk.Style, t: dict[str, str]) -> None:
             ("Button.label", {"sticky": "nswe"})]})]})])
     style.configure("Ghost.TButton", padding=(8, 4))
     style.configure("Card.Ghost.TButton", padding=(6, 4))
-    style.configure("Step.TButton",  padding=(2, 1), background=surface)
+    style.configure("Step.TButton",  padding=0, background=surface)
 
     style.layout("TCheckbutton", [("Checkbutton.padding", {"sticky": "nswe", "children": [
         (f"{key}.check",      {"side": "left", "sticky": ""}),
