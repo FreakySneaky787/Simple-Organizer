@@ -29,15 +29,17 @@ from organizer import (
 from utils import DARK_THEME, LIGHT_THEME, safe_expanduser
 from theme import FONTS, apply_ttk_theme, float_key, load_fonts, set_titlebar_theme
 from icons import badge, icon
-from config import load_settings, save_settings
-from rules import Rule, CONDITION_TYPES, CONDITION_LABELS, load_rules, save_rules
+from config import DEFAULT_SETTINGS, load_settings, save_settings
+from rules import (
+    Rule, CONDITION_TYPES, CONDITION_LABELS, is_safe_target_folder, load_rules, save_rules,
+)
 from scheduler import OrganizerScheduler
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.3.1"
+APP_VERSION  = "3.4.1"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -393,6 +395,16 @@ class _RuleDialog(_Overlay):
                          "Name, Value, and Target Folder are required.", parent=self)
             return
 
+        if not is_safe_target_folder(folder):
+            _showwarning(
+                "Invalid target folder",
+                f'"{folder}" is not allowed.\n'
+                "Enter a subfolder name inside the scanned folder "
+                "(no absolute paths, drive letters or '..').",
+                parent=self,
+            )
+            return
+
         numeric_types = {"min_size_mb", "max_size_mb", "older_than_days", "newer_than_days"}
         if ctype in numeric_types:
             try:
@@ -626,9 +638,13 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _on_close(self) -> None:
         """Save settings, stop background scheduler, then destroy the window."""
-        self._save_settings()
-        self._scheduler.stop()
-        self.destroy()
+        try:
+            self._save_settings()
+        except Exception:  # noqa: BLE001 — closing must never be blocked
+            pass
+        finally:
+            self._scheduler.stop()
+            self.destroy()
 
     # =========================================================================
     # UI construction
@@ -1275,7 +1291,7 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _apply_schedule_settings(self) -> None:
         self._scheduler.configure(
-            interval_minutes=self._schedule_interval.get(),
+            interval_minutes=self._num(self._schedule_interval, "schedule_interval_minutes"),
             enabled=self._schedule_enabled.get(),
         )
         self._update_schedule_status()
@@ -1286,7 +1302,7 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _update_schedule_status(self) -> None:
         if self._schedule_enabled.get():
-            mins = self._schedule_interval.get()
+            mins = self._num(self._schedule_interval, "schedule_interval_minutes")
             self._schedule_status_var.set(f"Active, runs every {mins} min")
         else:
             self._schedule_status_var.set("Off")
@@ -1300,7 +1316,13 @@ class SimpleOrganizerApp(tk.Tk):
             return
         self._log(f"[SCHEDULE]  Auto-organize triggered for: {self._folder}")
         self._auto_mode = True
-        self._start_scan()
+        try:
+            self._start_scan()
+        except Exception as exc:  # noqa: BLE001
+            # Never leave auto-mode on: the next manual scan would skip confirmation.
+            self._auto_mode = False
+            self._set_busy(False)
+            self._log(f"[ERROR]  Scheduled scan failed: {exc}")
 
     # =========================================================================
     # Rules UI
@@ -1316,6 +1338,12 @@ class SimpleOrganizerApp(tk.Tk):
             ), tags=() if rule.enabled else ("off",))
         self._sync_empty(self._rules_tree, self._rules_empty)
 
+    def _persist_rules(self, rules: list[Rule]) -> None:
+        if not save_rules(rules):
+            self._log("[WARN]  Rules could not be saved — check disk space and permissions.")
+            self._notify("Rules not saved",
+                         "Your rule changes could not be written to disk.", "warning")
+
     def _selected_rule_index(self) -> int | None:
         sel = self._rules_tree.selection()
         if not sel:
@@ -1328,7 +1356,7 @@ class SimpleOrganizerApp(tk.Tk):
         if dlg.result:
             rules = load_rules()
             rules.append(dlg.result)
-            save_rules(rules)
+            self._persist_rules(rules)
             self._refresh_rules_tree()
 
     def _rule_edit(self) -> None:
@@ -1341,7 +1369,7 @@ class SimpleOrganizerApp(tk.Tk):
         self.wait_window(dlg)
         if dlg.result:
             rules[idx] = dlg.result
-            save_rules(rules)
+            self._persist_rules(rules)
             self._refresh_rules_tree()
 
     def _on_rules_click(self, event: Any) -> str | None:
@@ -1370,7 +1398,7 @@ class SimpleOrganizerApp(tk.Tk):
             return
         rules = load_rules()
         rules[idx].enabled = not rules[idx].enabled
-        save_rules(rules)
+        self._persist_rules(rules)
         self._refresh_rules_tree()
 
     def _rule_delete(self) -> None:
@@ -1382,7 +1410,7 @@ class SimpleOrganizerApp(tk.Tk):
                                    f"Delete rule '{rules[idx].name}'?", parent=self):
             return
         del rules[idx]
-        save_rules(rules)
+        self._persist_rules(rules)
         self._refresh_rules_tree()
 
     def _rule_move(self, direction: int) -> None:
@@ -1394,7 +1422,7 @@ class SimpleOrganizerApp(tk.Tk):
         if new_idx < 0 or new_idx >= len(rules):
             return
         rules[idx], rules[new_idx] = rules[new_idx], rules[idx]
-        save_rules(rules)
+        self._persist_rules(rules)
         self._refresh_rules_tree()
         children = self._rules_tree.get_children()
         if children:
@@ -1433,6 +1461,16 @@ class SimpleOrganizerApp(tk.Tk):
     # Settings persistence
     # =========================================================================
 
+    def _num(self, var: tk.IntVar | tk.DoubleVar, key: str) -> Any:
+        """Read a numeric setting; an empty or invalid field falls back to the last
+        saved value (or the default) instead of raising TclError."""
+        try:
+            return var.get()
+        except (tk.TclError, ValueError):
+            fallback = self._settings.get(key, DEFAULT_SETTINGS[key])
+            var.set(fallback)
+            return fallback
+
     def _save_settings(self) -> None:
         self._settings.update({
             "last_folder":               str(self._folder),
@@ -1441,13 +1479,13 @@ class SimpleOrganizerApp(tk.Tk):
             "window_width":              self.winfo_width(),
             "window_height":             self.winfo_height(),
             "schedule_enabled":          self._schedule_enabled.get(),
-            "schedule_interval_minutes": self._schedule_interval.get(),
+            "schedule_interval_minutes": self._num(self._schedule_interval, "schedule_interval_minutes"),
             "use_subcategories":         self._use_subcats.get(),
             "recursive":                 self._recursive.get(),
             "include_hidden":            self._include_hidden.get(),
-            "max_depth":                 self._max_depth.get(),
-            "max_dirs":                  self._max_dirs.get(),
-            "scan_timeout":              self._scan_timeout.get(),
+            "max_depth":                 self._num(self._max_depth, "max_depth"),
+            "max_dirs":                  self._num(self._max_dirs, "max_dirs"),
+            "scan_timeout":              self._num(self._scan_timeout, "scan_timeout"),
         })
         if not save_settings(self._settings):
             self._log("[WARN]  Settings could not be saved — check disk space and permissions.")
@@ -1483,9 +1521,9 @@ class SimpleOrganizerApp(tk.Tk):
                 self._folder,
                 self._recursive.get(),
                 self._include_hidden.get(),
-                self._max_depth.get(),
-                self._max_dirs.get(),
-                self._scan_timeout.get(),
+                self._num(self._max_depth, "max_depth"),
+                self._num(self._max_dirs, "max_dirs"),
+                self._num(self._scan_timeout, "scan_timeout"),
                 self._use_subcats.get(),
             ),
             daemon=True,
@@ -1516,6 +1554,8 @@ class SimpleOrganizerApp(tk.Tk):
             self._event_queue.put({"type": "error", "value": str(exc)})
 
     def _handle_scan_done(self, result: ScanResult) -> None:
+        # Consume the auto-mode flag first so it can never leak into a manual scan.
+        auto_mode, self._auto_mode = self._auto_mode, False
         self._scan_result = result
         self._set_busy(False)
         self._set_progress(100.0)
@@ -1587,8 +1627,7 @@ class SimpleOrganizerApp(tk.Tk):
             if result.duplicate_groups:
                 self._notebook.select(self._dup_tab_idx)
 
-        if self._auto_mode:
-            self._auto_mode = False
+        if auto_mode:
             if actionable:
                 self._log("[SCHEDULE]  Auto-organizing now...")
                 self._run_auto_organize(list(actionable))
@@ -1671,6 +1710,7 @@ class SimpleOrganizerApp(tk.Tk):
         self._organize_btn.configure(state="disabled")
         self._scan_result = None
         self._clear_preview()
+        self._clear_duplicates()   # listed paths are stale once files have moved
         self._refresh_persistent_buttons()
 
         if errors:
@@ -1862,6 +1902,7 @@ class SimpleOrganizerApp(tk.Tk):
                 elif etype == "schedule_fire":
                     self._run_scheduled_organize()
                 elif etype == "error":
+                    self._auto_mode = False
                     self._set_busy(False)
                     self._status("Error -- see log.")
                     self._log(f"[ERROR]  {event['value']}")
@@ -2023,10 +2064,10 @@ class SimpleOrganizerApp(tk.Tk):
         def log_msg(msg: str) -> None:
             self._event_queue.put({"type": "log", "value": msg})
         try:
-            errors = trash_files(paths, log_callback=log_msg,
-                                 progress_callback=progress)
+            errors, trashed = trash_files(paths, log_callback=log_msg,
+                                          progress_callback=progress)
             self._event_queue.put({"type": "trash_done", "errors": errors,
-                                   "count": len(paths)})
+                                   "count": trashed})
         except Exception as exc:  # noqa: BLE001
             self._event_queue.put({"type": "error", "value": str(exc)})
 
