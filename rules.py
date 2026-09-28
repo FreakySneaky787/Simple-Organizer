@@ -13,8 +13,8 @@ import fnmatch
 import json
 import sys
 import time
-from dataclasses import asdict, dataclass
-from pathlib import Path
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
 def _rules_path() -> Path:
@@ -54,28 +54,76 @@ class Rule:
 # Persistence
 # ---------------------------------------------------------------------------
 
+_RULE_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(Rule))
+
+
+def _rule_from_dict(raw: dict) -> Rule | None:
+    """Build a Rule from one JSON entry, or None if the entry is invalid.
+
+    Unknown keys are ignored; missing keys make the entry invalid.
+    """
+    if not all(k in raw for k in _RULE_FIELDS):
+        return None
+    try:
+        return Rule(
+            name=str(raw["name"]),
+            enabled=bool(raw["enabled"]),
+            condition_type=str(raw["condition_type"]),
+            condition_value=str(raw["condition_value"]),
+            target_folder=str(raw["target_folder"]),
+        )
+    except Exception:
+        return None
+
+
 def load_rules() -> list[Rule]:
-    """Load rules from disk. Returns empty list on any error."""
+    """Load rules from disk. Invalid entries are skipped one by one.
+
+    If the file cannot be parsed at all it is backed up to rules.json.bak
+    before returning [], so the next save does not silently destroy it.
+    """
     if not RULES_FILE.exists():
         return []
     try:
         data = json.loads(RULES_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, list):
-            return []
-        return [Rule(**r) for r in data if isinstance(r, dict)]
     except Exception:
+        try:
+            RULES_FILE.replace(RULES_FILE.with_suffix(".json.bak"))
+        except OSError:
+            pass
         return []
+    if not isinstance(data, list):
+        return []
+    rules = [_rule_from_dict(r) for r in data if isinstance(r, dict)]
+    return [r for r in rules if r is not None]
 
 
-def save_rules(rules: list[Rule]) -> None:
-    """Persist rules to disk. Silently ignores write errors."""
+def save_rules(rules: list[Rule]) -> bool:
+    """Persist rules to disk. Returns False on any write error."""
     try:
         RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
         RULES_FILE.write_text(
             json.dumps([asdict(r) for r in rules], indent=2), encoding="utf-8"
         )
+        return True
     except Exception:
-        pass
+        return False
+
+
+def is_safe_target_folder(target: str) -> bool:
+    """Return True if target is a relative sub-path with no '..' parts.
+
+    Rejects absolute paths, drive letters and UNC paths on every platform so a
+    rule can never move files outside the scanned folder.
+    """
+    target = target.strip()
+    if not target:
+        return False
+    win, posix = PureWindowsPath(target), PurePosixPath(target)
+    if win.anchor or win.drive or posix.is_absolute():
+        return False
+    parts = [p for p in win.parts if p not in ("", ".")]
+    return bool(parts) and ".." not in parts
 
 
 # ---------------------------------------------------------------------------
