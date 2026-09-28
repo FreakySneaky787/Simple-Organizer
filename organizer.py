@@ -23,7 +23,7 @@ from utils import (
     get_app_dir,
     resolve_conflict,
 )
-from rules import load_rules, apply_rules
+from rules import load_rules, apply_rules, is_safe_target_folder
 
 # ---------------------------------------------------------------------------
 # Paths  (cross-platform via get_data_dir())
@@ -41,6 +41,21 @@ MAX_HISTORY           = 20
 # scan_folder when use_subcategories=True so they don't accidentally block
 # legitimate user folders with the same name when sub-categories is OFF.
 _CATEGORY_NAMES: frozenset[str] = frozenset(CATEGORY_MAP.keys())
+
+
+def _is_safe_rule_target(root_resolved: Path, target: str) -> bool:
+    """Return True if target is a relative sub-path that stays inside root.
+
+    Second line of defence behind the rule dialog: also catches rules.json
+    edited by hand and symlinks pointing out of the scanned folder.
+    """
+    if not is_safe_target_folder(target):
+        return False
+    try:
+        resolved = (root_resolved / target).resolve()
+    except (OSError, RuntimeError):
+        return False
+    return resolved != root_resolved and root_resolved in resolved.parents
 
 
 def _ensure_data_dir() -> None:
@@ -313,6 +328,8 @@ def scan_folder(
         status_callback(f"Scanning: 0 / {result.total_files} files (0%)")
 
     active_rules = load_rules()
+    folder_resolved = folder.resolve()
+    unsafe_targets: set[str] = set()
 
     for idx, file_path in enumerate(all_files, start=1):
         pct = int(idx / result.total_files * 100)
@@ -330,6 +347,14 @@ def scan_folder(
                 continue
 
             rule_category = apply_rules(file_path, active_rules) if active_rules else None
+            if rule_category and not _is_safe_rule_target(folder_resolved, rule_category):
+                if rule_category not in unsafe_targets:
+                    unsafe_targets.add(rule_category)
+                    _log_warning(
+                        f"Rule target '{rule_category}' points outside the scanned "
+                        f"folder -- rule ignored."
+                    )
+                rule_category = None
             category      = rule_category if rule_category else get_category(file_path)
 
             if use_subcategories and not rule_category:
@@ -442,10 +467,9 @@ def organise_files(
     if staging:
         if move_log:
             # Only write manifest when at least one file was actually staged.
-            STAGING_MANIFEST_FILE.write_text(
-                json.dumps({"timestamp": timestamp, "entries": move_log}, indent=2),
-                encoding="utf-8",
-            )
+            # Merge with an existing manifest so files staged by an earlier run
+            # (e.g. scheduled runs) are not orphaned.
+            _append_staging_entries(timestamp, move_log, log_callback)
     else:
         if move_log:
             # Only write history when at least one file was actually moved.
@@ -453,7 +477,6 @@ def organise_files(
                 "timestamp": timestamp,
                 "moves": [{"src": m["src"], "dst": m["dst"]} for m in move_log],
             }
-            LAST_RUN_FILE.write_text(json.dumps(run_data, indent=2), encoding="utf-8")
             _write_history_run(run_data, log_callback)
 
     return errors
@@ -463,15 +486,19 @@ def organise_files(
 # Undo history
 # ---------------------------------------------------------------------------
 
+# The newest history/run_*.json is "the last run" -- there is no separate
+# last_run.json any more, so "Undo last" and History can never disagree.
+
 def _write_history_run(
     run_data: dict,
     log_callback: Callable[[str], None] | None = None,
+    when: datetime | None = None,
 ) -> None:
     """Write a timestamped history file and trim oldest beyond MAX_HISTORY."""
     try:
         HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-        ts   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
-        path = HISTORY_DIR / f"run_{ts}.json"
+        ts   = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S_%f")
+        path = resolve_conflict(HISTORY_DIR / f"run_{ts}.json")
         path.write_text(json.dumps(run_data, indent=2), encoding="utf-8")
         runs = sorted(HISTORY_DIR.glob("run_*.json"))
         for old in runs[:-MAX_HISTORY]:
@@ -485,8 +512,63 @@ def _write_history_run(
             log_callback(f"[WARN]  Failed to write history: {exc}")
 
 
+def _migrate_legacy_last_run() -> None:
+    """Fold a last_run.json written by v3.4.0 or older into history, then remove it.
+
+    Older versions wrote every run to both files, so usually the run is already
+    in history and the legacy file can simply be dropped. Also removes stale
+    undone_*.json files that older versions left in the data directory.
+    """
+    for stale in DATA_DIR.glob("undone_*.json"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    if not LAST_RUN_FILE.exists():
+        return
+    try:
+        data = json.loads(LAST_RUN_FILE.read_text(encoding="utf-8"))
+        ts   = data.get("timestamp", "")
+        known = False
+        # Also check undone_* so a run already undone via History is not revived.
+        for f in [*HISTORY_DIR.glob("run_*.json"), *HISTORY_DIR.glob("undone_*.json")]:
+            try:
+                if json.loads(f.read_text(encoding="utf-8")).get("timestamp") == ts:
+                    known = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if not known and data.get("moves"):
+            try:
+                when = datetime.fromisoformat(ts)
+            except (TypeError, ValueError):
+                when = None
+            _write_history_run(data, when=when)
+        LAST_RUN_FILE.unlink()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _trim_undone_history() -> None:
+    """Keep only the newest MAX_HISTORY undone_*.json files."""
+    for old in sorted(HISTORY_DIR.glob("undone_*.json"))[:-MAX_HISTORY]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def _newest_run_file() -> Path | None:
+    _migrate_legacy_last_run()
+    if not HISTORY_DIR.exists():
+        return None
+    runs = sorted(HISTORY_DIR.glob("run_*.json"))
+    return runs[-1] if runs else None
+
+
 def list_undo_history() -> list[dict]:
     """Return metadata for all undoable runs, newest first."""
+    _migrate_legacy_last_run()
     if not HISTORY_DIR.exists():
         return []
     runs   = sorted(HISTORY_DIR.glob("run_*.json"), reverse=True)
@@ -576,6 +658,7 @@ def _undo_run_file(
     except Exception as exc:  # noqa: BLE001
         if log_callback:
             log_callback(f"[WARN]  Could not rename {run_file.name}: {exc}")
+    _trim_undone_history()
 
     return errors
 
@@ -584,12 +667,13 @@ def undo_last_run(
     progress_callback: Callable[[int, int], None] | None = None,
     log_callback:      Callable[[str], None]       | None = None,
 ) -> list[str]:
-    """Reverse every move in last_run.json. Files are NEVER deleted."""
-    if not LAST_RUN_FILE.exists():
+    """Reverse every move of the newest history run. Files are NEVER deleted."""
+    run_file = _newest_run_file()
+    if run_file is None:
         if log_callback:
             log_callback("[WARN]  No last run record found.")
-        return ["No last_run.json found -- nothing to undo."]
-    return _undo_run_file(LAST_RUN_FILE, progress_callback, log_callback)
+        return ["No run history found -- nothing to undo."]
+    return _undo_run_file(run_file, progress_callback, log_callback)
 
 
 def undo_specific_run(
@@ -606,6 +690,58 @@ def undo_specific_run(
 # ---------------------------------------------------------------------------
 # Staging commit / revert
 # ---------------------------------------------------------------------------
+
+def _write_staging_manifest(timestamp: str, entries: list[dict]) -> None:
+    STAGING_MANIFEST_FILE.write_text(
+        json.dumps({"timestamp": timestamp, "entries": entries}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _append_staging_entries(
+    timestamp:    str,
+    new_entries:  list[dict],
+    log_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Add new_entries to the staging manifest, keeping any existing entries."""
+    entries: list[dict] = []
+    if STAGING_MANIFEST_FILE.exists():
+        try:
+            data      = json.loads(STAGING_MANIFEST_FILE.read_text(encoding="utf-8"))
+            entries   = list(data.get("entries", []))
+            timestamp = data.get("timestamp", timestamp)
+        except Exception as exc:  # noqa: BLE001
+            # Keep the unreadable manifest instead of overwriting it.
+            backup = STAGING_MANIFEST_FILE.with_name(
+                f"staging_manifest_corrupt_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}.json")
+            try:
+                STAGING_MANIFEST_FILE.replace(backup)
+            except OSError:
+                pass
+            if log_callback:
+                log_callback(f"[WARN]  Staging manifest was unreadable ({exc}); "
+                             f"backed up to {backup.name}.")
+    _write_staging_manifest(timestamp, entries + new_entries)
+
+
+def _finish_staging(
+    timestamp:    str,
+    failed:       list[dict],
+    log_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Delete the manifest if everything succeeded, else keep only failed entries."""
+    try:
+        if failed:
+            _write_staging_manifest(timestamp, failed)
+            if log_callback:
+                log_callback(f"[WARN]  {len(failed)} file(s) are still staged -- "
+                             "fix the problem and try again.")
+        else:
+            STAGING_MANIFEST_FILE.unlink(missing_ok=True)
+        _remove_empty_staging_dirs()
+    except Exception as exc:  # noqa: BLE001
+        if log_callback:
+            log_callback(f"[WARN]  Could not clean staging area: {exc}")
 
 def commit_staging(
     progress_callback: Callable[[int, int], None] | None = None,
@@ -632,6 +768,7 @@ def commit_staging(
     total     = len(entries)
     timestamp = datetime.now(timezone.utc).isoformat()
     move_log: list[dict[str, str]] = []
+    failed:   list[dict]           = []
 
     for idx, entry in enumerate(entries, start=1):
         if progress_callback:
@@ -655,35 +792,24 @@ def commit_staging(
                 msg += f"  (renamed -> {safe_final.name})"
             if log_callback:
                 log_callback(msg)
+            continue
         except PermissionError as exc:
             err = f"[ERROR]  Permission denied committing {staged_path.name}: {exc}"
-            errors.append(err)
-            if log_callback:
-                log_callback(err)
         except shutil.Error as exc:
             err = f"[ERROR]  shutil error committing {staged_path.name}: {exc}"
-            errors.append(err)
-            if log_callback:
-                log_callback(err)
         except Exception as exc:  # noqa: BLE001
             err = f"[ERROR]  Unexpected error committing {staged_path.name}: {exc}"
-            errors.append(err)
-            if log_callback:
-                log_callback(err)
+        errors.append(err)
+        failed.append(entry)
+        if log_callback:
+            log_callback(err)
 
     run_data = {"timestamp": timestamp, "moves": move_log}
     if move_log:
         # Only write history when at least one file was actually moved.
-        LAST_RUN_FILE.write_text(json.dumps(run_data, indent=2), encoding="utf-8")
         _write_history_run(run_data, log_callback)
 
-    try:
-        STAGING_MANIFEST_FILE.unlink(missing_ok=True)
-        _remove_empty_staging_dirs()
-    except Exception as exc:  # noqa: BLE001
-        if log_callback:
-            log_callback(f"[WARN]  Could not clean staging area: {exc}")
-
+    _finish_staging(data.get("timestamp", timestamp), failed, log_callback)
     return errors
 
 
@@ -709,6 +835,7 @@ def revert_staging(
         return [err]
 
     total = len(entries)
+    failed: list[dict] = []
 
     for idx, entry in enumerate(entries, start=1):
         if progress_callback:
@@ -731,46 +858,35 @@ def revert_staging(
                 msg += f"  (renamed -> {safe_src.name})"
             if log_callback:
                 log_callback(msg)
+            continue
         except PermissionError as exc:
             err = f"[ERROR]  Permission denied reverting {staged_path.name}: {exc}"
-            errors.append(err)
-            if log_callback:
-                log_callback(err)
         except shutil.Error as exc:
             err = f"[ERROR]  shutil error reverting {staged_path.name}: {exc}"
-            errors.append(err)
-            if log_callback:
-                log_callback(err)
         except Exception as exc:  # noqa: BLE001
             err = f"[ERROR]  Unexpected error reverting {staged_path.name}: {exc}"
-            errors.append(err)
-            if log_callback:
-                log_callback(err)
-
-    try:
-        STAGING_MANIFEST_FILE.unlink(missing_ok=True)
-        _remove_empty_staging_dirs()
-    except Exception as exc:  # noqa: BLE001
+        errors.append(err)
+        failed.append(entry)
         if log_callback:
-            log_callback(f"[WARN]  Could not clean staging area: {exc}")
+            log_callback(err)
 
+    # entries were processed newest-first; store the remainder in original order.
+    timestamp = data.get("timestamp", datetime.now(timezone.utc).isoformat())
+    _finish_staging(timestamp, list(reversed(failed)), log_callback)
     return errors
 
 
 def _remove_empty_staging_dirs() -> None:
-    """Remove empty subdirectories under STAGING_DIR. Never removes files."""
+    """Remove empty directories under STAGING_DIR, bottom-up. Never removes files."""
     if not STAGING_DIR.exists():
         return
-    for sub in list(STAGING_DIR.iterdir()):
-        if sub.is_dir():
-            try:
-                sub.rmdir()
-            except OSError:
-                pass
-    try:
-        STAGING_DIR.rmdir()
-    except OSError:
-        pass
+    # topdown=False visits children before parents, so nested empty folders
+    # (e.g. staging/Images/Photos/) are removed before their parent is tried.
+    for dirpath, _dirnames, _filenames in os.walk(STAGING_DIR, topdown=False):
+        try:
+            os.rmdir(dirpath)   # fails harmlessly if the folder is not empty
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -801,20 +917,36 @@ def _trash_file_platform(path: Path) -> None:
                 ("lpszProgressTitle",     ctypes.c_wchar_p),
             ]
 
-        FO_DELETE     = 0x0003
-        FOF_ALLOWUNDO = 0x0040
-        FOF_NOCONFIRMATION = 0x0010
-        FOF_SILENT    = 0x0004
+        FO_DELETE           = 0x0003
+        FOF_ALLOWUNDO       = 0x0040
+        FOF_NOCONFIRMATION  = 0x0010
+        FOF_SILENT          = 0x0004
+        FOF_WANTNUKEWARNING = 0x4000
+        DRIVE_REMOTE        = 4
+
+        resolved = path.resolve()
+
+        # Network shares / mapped drives have no Recycle Bin: Windows would
+        # delete permanently. Refuse instead of breaking the "never delete" promise.
+        root = resolved.anchor
+        if root.startswith("\\\\") or \
+                ctypes.windll.kernel32.GetDriveTypeW(root) == DRIVE_REMOTE:  # type: ignore[attr-defined]
+            raise OSError("network drive has no Recycle Bin -- file left in place")
 
         # pFrom must be double-null-terminated
-        src = str(path.resolve()) + "\0\0"
+        src = str(resolved) + "\0\0"
         op  = SHFILEOPSTRUCTW()
         op.wFunc  = FO_DELETE
         op.pFrom  = src
-        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
+        # FOF_WANTNUKEWARNING overrides FOF_NOCONFIRMATION when the file would be
+        # destroyed instead of recycled (e.g. USB sticks without a Recycle Bin),
+        # so the user gets a chance to cancel.
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_WANTNUKEWARNING
         result = SHFileOperationW(ctypes.byref(op))
         if result != 0:
             raise OSError(f"SHFileOperation failed with code {result}")
+        if op.fAnyOperationsAborted:
+            raise OSError("operation was cancelled -- file left in place")
 
     else:
         # Linux / macOS: try gio trash first (GNOME), then trash-put (trash-cli),
@@ -862,14 +994,15 @@ def trash_files(
     paths:         list[Path],
     log_callback:  Callable[[str], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
-) -> list[str]:
+) -> tuple[list[str], int]:
     """Move a list of files to the system Trash/Recycle Bin.
 
     Files are NEVER permanently deleted.
-    Returns a list of error strings for any files that could not be trashed.
+    Returns (errors, trashed_count); files skipped as "not found" count as neither.
     """
     errors: list[str] = []
     total   = len(paths)
+    trashed = 0
 
     for idx, path in enumerate(paths, start=1):
         if progress_callback:
@@ -883,6 +1016,7 @@ def trash_files(
 
         try:
             _trash_file_platform(path)
+            trashed += 1
             if log_callback:
                 log_callback(f"[TRASHED]  {path.name}  ({path.parent})")
         except Exception as exc:  # noqa: BLE001
@@ -891,10 +1025,11 @@ def trash_files(
             if log_callback:
                 log_callback(err)
 
-    return errors
+    return errors, trashed
+
 
 def has_last_run() -> bool:
-    return LAST_RUN_FILE.exists()
+    return _newest_run_file() is not None
 
 
 def has_staging() -> bool:
