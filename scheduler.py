@@ -7,6 +7,9 @@ Thread-safe start/stop/reconfigure.
 Fixes applied:
   S1 — exceptions in _fire() are now logged via log_callback instead of silently swallowed.
   S2 — timer drift corrected by computing delay relative to the intended next fire time.
+  S3 — every timer carries a generation number; a timer from before a configure()/stop()
+       can no longer re-arm itself, so there is never more than one live timer.
+  S4 — slots missed while the computer slept are skipped instead of fired back to back.
 """
 
 import threading
@@ -29,6 +32,7 @@ class OrganizerScheduler:
         self._timer: threading.Timer | None = None
         self._lock         = threading.Lock()
         self._next_fire: float = 0.0   # S2: absolute monotonic time of next intended fire
+        self._generation   = 0         # S3: bumped on every configure()/stop()
 
     @property
     def enabled(self) -> bool:
@@ -41,7 +45,7 @@ class OrganizerScheduler:
     def configure(self, interval_minutes: int, enabled: bool) -> None:
         """Update interval and enabled state. Restarts timer if running."""
         with self._lock:
-            self._interval = max(1, interval_minutes)
+            self._interval = max(1, int(interval_minutes))
             self._enabled  = enabled
             self._cancel()
             if enabled:
@@ -56,33 +60,40 @@ class OrganizerScheduler:
     # ------------------------------------------------------------------
 
     def _cancel(self) -> None:
+        """Cancel the live timer and invalidate any timer that is already firing."""
+        self._generation += 1
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
 
+    def _start_timer(self, delay: float) -> None:
+        self._timer = threading.Timer(delay, self._fire, args=(self._generation,))
+        self._timer.daemon = True
+        self._timer.start()
+
     def _arm_from_now(self) -> None:
         """Schedule next fire exactly interval_minutes from now."""
         self._next_fire = time.monotonic() + self._interval * 60
-        delay           = self._interval * 60
-        self._timer     = threading.Timer(delay, self._fire)
-        self._timer.daemon = True
-        self._timer.start()
+        self._start_timer(self._interval * 60)
 
     def _arm_drift_corrected(self) -> None:
         """S2: Schedule next fire relative to intended time, not actual fire time.
 
-        This prevents drift accumulating over many iterations.
+        This prevents drift accumulating over many iterations. S4: if one or
+        more slots already lie in the past (e.g. after standby), jump to the
+        next future slot instead of firing once per missed slot.
         """
-        now             = time.monotonic()
-        self._next_fire += self._interval * 60
-        delay           = max(0.0, self._next_fire - now)
-        self._timer     = threading.Timer(delay, self._fire)
-        self._timer.daemon = True
-        self._timer.start()
+        now      = time.monotonic()
+        interval = self._interval * 60
+        self._next_fire += interval
+        if self._next_fire <= now:
+            missed = int((now - self._next_fire) // interval) + 1
+            self._next_fire += missed * interval
+        self._start_timer(max(0.0, self._next_fire - now))
 
-    def _fire(self) -> None:
+    def _fire(self, generation: int) -> None:
         with self._lock:
-            if not self._enabled:
+            if not self._enabled or generation != self._generation:
                 return
         try:
             self._callback()
@@ -93,5 +104,7 @@ class OrganizerScheduler:
                 except Exception:
                     pass
         with self._lock:
-            if self._enabled:
+            # S3: configure()/stop() during the callback already armed (or
+            # cancelled) a timer of a newer generation -- do not add a second one.
+            if self._enabled and generation == self._generation:
                 self._arm_drift_corrected()

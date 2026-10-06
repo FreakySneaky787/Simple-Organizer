@@ -1,5 +1,6 @@
 # main.py
 
+import math
 import os
 import queue
 import subprocess
@@ -9,7 +10,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, ttk
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from organizer import (
     FilePlan,
@@ -26,12 +27,13 @@ from organizer import (
     undo_last_run,
     undo_specific_run,
 )
-from utils import DARK_THEME, LIGHT_THEME, safe_expanduser
+from utils import DARK_THEME, LIGHT_THEME, risky_folder_reason, safe_expanduser
 from theme import FONTS, apply_ttk_theme, float_key, load_fonts, set_titlebar_theme
 from icons import badge, icon
 from config import DEFAULT_SETTINGS, load_settings, save_settings
 from rules import (
-    Rule, CONDITION_TYPES, CONDITION_LABELS, is_safe_target_folder, load_rules, save_rules,
+    Rule, CONDITION_TYPES, CONDITION_LABELS, RulesReadError,
+    is_safe_target_folder, load_rules, save_rules,
 )
 from scheduler import OrganizerScheduler
 
@@ -39,7 +41,7 @@ from scheduler import OrganizerScheduler
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.4.1"
+APP_VERSION  = "3.4.2"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -57,7 +59,19 @@ _LOG_TAGS = {
     "[REVERTED]":  "ok",
     "[TRASHED]":   "ok",
     "[SCHEDULE]":  "info",
+    "[SCHEDULE ERROR]": "error",
 }
+
+# Allowed range for every numeric setting: (low, high, step of the − / + buttons).
+_LIMITS: dict[str, tuple[float, float, float]] = {
+    "max_depth":                 (1,   50,      1),
+    "max_dirs":                  (100, 500_000, 1000),
+    "scan_timeout":              (5,   300,     5),
+    "schedule_interval_minutes": (1,   1440,    15),
+}
+
+# Longest time _poll_queue may spend on queued events before letting Tk redraw.
+_POLL_BUDGET_S = 0.03
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +138,10 @@ class _Stepper(ttk.Frame):
         super().__init__(parent, style="Panel.TFrame")
         self._var, self._low, self._high, self._step = variable, low, high, step
         self._command = command
+        try:
+            self._value: float = self._clamp(variable.get())
+        except (tk.TclError, ValueError):
+            self._value = low
 
         app: SimpleOrganizerApp = self._root()  # type: ignore[assignment]
         side = app._px(26)
@@ -145,23 +163,48 @@ class _Stepper(ttk.Frame):
 
         self._entry.bind("<Up>",         lambda _e: self._nudge(1))
         self._entry.bind("<Down>",       lambda _e: self._nudge(-1))
-        self._entry.bind("<MouseWheel>", lambda e: self._nudge(1 if e.delta > 0 else -1))
-        self._entry.bind("<Button-4>",   lambda _e: self._nudge(1))
-        self._entry.bind("<Button-5>",   lambda _e: self._nudge(-1))
+        self._entry.bind("<MouseWheel>", lambda e: self._wheel(1 if e.delta > 0 else -1))
+        self._entry.bind("<Button-4>",   lambda _e: self._wheel(1))
+        self._entry.bind("<Button-5>",   lambda _e: self._wheel(-1))
         self._entry.bind("<Return>",     lambda _e: self._nudge(0))
         self._entry.bind("<FocusOut>",   lambda _e: self._nudge(0))
 
+    def _clamp(self, value: float) -> float:
+        value = min(self._high, max(self._low, value))
+        return int(round(value)) if isinstance(self._var, tk.IntVar) else value
+
+    def _wheel(self, direction: int) -> str | None:
+        # Only a focused field reacts, so scrolling past it never changes a value.
+        if self.focus_get() is not self._entry:
+            return None
+        return self._nudge(direction)
+
     def _nudge(self, direction: int) -> str:
+        """Step up/down (direction ±1) or just validate the typed value (0).
+
+        Steps snap to multiples of the step size (1 -> 15 -> 30 ...). An empty
+        or invalid field falls back to the last valid value. The command only
+        runs when the value really changed, so leaving the field does not, for
+        example, restart the auto-organise timer.
+        """
         if str(self._entry.cget("state")) == "disabled":
             return "break"
         try:
-            value = self._var.get()
-        except tk.TclError:
-            value = self._low
-        value = min(self._high, max(self._low, value + direction * self._step))
-        self._var.set(int(value) if isinstance(self._var, tk.IntVar) else value)
-        if self._command:
-            self._command()
+            value = float(self._var.get())
+            if not math.isfinite(value):
+                raise ValueError
+        except (tk.TclError, ValueError):
+            value = self._value
+        if direction > 0:
+            value = (math.floor(value / self._step + 1e-9) + 1) * self._step
+        elif direction < 0:
+            value = (math.ceil(value / self._step - 1e-9) - 1) * self._step
+        value = self._clamp(value)
+        self._var.set(value)
+        if value != self._value:
+            self._value = value
+            if self._command:
+                self._command()
         return "break"
 
     def configure(self, cnf: Any = None, **kw: Any) -> Any:
@@ -241,9 +284,18 @@ class _Overlay(tk.Toplevel):
     def show(self, focus: tk.Widget | None = None) -> None:
         self._app._overlays.append(self)
         self.follow()
-        self.grab_set()
+        self._grab()
         (focus or self).focus_force()
         self._fade(1)
+
+    def _grab(self, tries: int = 25) -> None:
+        """Make the dialog modal. On X11 a window that is not mapped yet refuses
+        the grab ("window not viewable"), so retry briefly instead of crashing."""
+        try:
+            self.grab_set()
+        except tk.TclError:
+            if tries and self.winfo_exists():
+                self.after(20, self._grab, tries - 1)
 
     def follow(self) -> None:
         """Centre the card on the main window."""
@@ -399,8 +451,9 @@ class _RuleDialog(_Overlay):
             _showwarning(
                 "Invalid target folder",
                 f'"{folder}" is not allowed.\n'
-                "Enter a subfolder name inside the scanned folder "
-                "(no absolute paths, drive letters or '..').",
+                "Enter a subfolder name inside the scanned folder: no absolute "
+                "paths, drive letters or '..', none of the characters < > : \" | ? *, "
+                "no names like CON or NUL, and no trailing dot or space.",
                 parent=self,
             )
             return
@@ -409,8 +462,8 @@ class _RuleDialog(_Overlay):
         if ctype in numeric_types:
             try:
                 parsed = float(value)
-                if parsed < 0:
-                    raise ValueError("negative")
+                if parsed < 0 or not math.isfinite(parsed):
+                    raise ValueError("negative or not finite")
             except ValueError:
                 _showwarning(
                     "Invalid value",
@@ -557,18 +610,8 @@ class SimpleOrganizerApp(tk.Tk):
         super().__init__()
         load_fonts(self)
 
-        # Load window icon — works for both PyInstaller binary and source mode
-        try:
-            if getattr(sys, "frozen", False):
-                _base = Path(sys._MEIPASS)          # type: ignore[attr-defined]
-            else:
-                _base = Path(__file__).resolve().parent
-            self._icon = tk.PhotoImage(file=str(_base / "icon.png"))
-            self.iconphoto(True, self._icon)
-        except Exception:
-            self._icon = None  # silently skip if icon is missing
-
         self._settings: dict = load_settings()
+        self._load_window_icon()
 
         self.title(f"{APP_TITLE}  v{APP_VERSION}")
         self.minsize(MIN_W, MIN_H)
@@ -581,7 +624,7 @@ class SimpleOrganizerApp(tk.Tk):
         # ── State ─────────────────────────────────────────────────────────────
         _saved_folder = self._settings.get("last_folder", "")
         if _saved_folder and Path(_saved_folder).is_dir():
-            self._folder = Path(_saved_folder)
+            self._folder = safe_expanduser(_saved_folder)
         else:
             self._folder = safe_expanduser("~/Downloads")
 
@@ -590,6 +633,15 @@ class SimpleOrganizerApp(tk.Tk):
         self._auto_mode:      bool              = False
         self._busy_flag:      bool              = False
         self._dup_groups:     dict[str, list[str]] = {}  # group_node -> [file_iids]   # M5 fix — initialised here
+        # Paths behind the tree rows, kept in Python instead of in Treeview
+        # values/tags, which Tcl may reinterpret (numbers, braces, spaces).
+        self._preview_items:  dict[str, FilePlan] = {}   # preview iid -> plan
+        self._dup_paths:      dict[str, Path]     = {}   # duplicate file iid -> path
+        self._schedule_pending: bool = False   # a scheduled run is waiting for the app to be idle
+        self._close_requested:  bool = False   # window closed while a task was running
+        self._native_dialog:    bool = False   # the system folder picker is open
+        self._risky_ok:   set[str] = set()     # unusual folders the user confirmed this session
+        self._dnd_enabled:      bool = False
 
         self._recursive:      tk.BooleanVar = tk.BooleanVar(
             value=bool(self._settings.get("recursive", False)))
@@ -636,8 +688,44 @@ class SimpleOrganizerApp(tk.Tk):
         self.bind("<Configure>", self._on_configure)
         self._poll_queue()
 
+    def _load_window_icon(self) -> None:
+        """Use icon.png when it ships with the app, otherwise draw one."""
+        try:
+            if getattr(sys, "frozen", False):
+                _base = Path(sys._MEIPASS)          # type: ignore[attr-defined]
+            else:
+                _base = Path(__file__).resolve().parent
+            self._icon = tk.PhotoImage(file=str(_base / "icon.png"))
+        except Exception:
+            try:
+                t = DARK_THEME if self._settings.get("dark_mode") else LIGHT_THEME
+                self._icon = badge(self, "folders", 64, 36, t["accent"], t["accent_fg"])
+            except Exception:
+                self._icon = None
+        if self._icon is not None:
+            try:
+                self.iconphoto(True, self._icon)
+            except tk.TclError:
+                pass
+
     def _on_close(self) -> None:
-        """Save settings, stop background scheduler, then destroy the window."""
+        """Save settings, stop background scheduler, then destroy the window.
+
+        While a task is moving files the window stays open and closes as soon
+        as the task has finished: killing the worker thread mid-run would leave
+        moved files without an undo record.
+        """
+        if self._overlays:
+            self._overlays[-1].lift()
+            self._overlays[-1].focus_force()
+            return
+        if self._busy_flag:
+            if not self._close_requested:
+                self._close_requested = True
+                self._status("Closing as soon as the current task has finished...")
+                self._log("[WARN]  Close requested -- waiting for the current task to "
+                          "finish so no file is left without an undo record.")
+            return
         try:
             self._save_settings()
         except Exception:  # noqa: BLE001 — closing must never be blocked
@@ -679,7 +767,8 @@ class SimpleOrganizerApp(tk.Tk):
         self._folder_entry = ttk.Entry(
             header, textvariable=self._folder_var, state="readonly", font=FONTS["mono"])
         self._folder_entry.grid(row=0, column=2, sticky="ew", ipady=1)
-        _Tooltip(self._folder_entry, "Folder to organise. You can also drop a folder here.")
+        # The drop hint is only added once drag-and-drop is known to work.
+        self._folder_tip = _Tooltip(self._folder_entry, "Folder to organise.")
 
         self._browse_btn = self._with_icon(
             ttk.Button(header, text="Browse…", command=self._browse_folder), "folder-open")
@@ -725,11 +814,11 @@ class SimpleOrganizerApp(tk.Tk):
         limits.pack(fill="x", pady=(10, 0))
         limits.columnconfigure(0, weight=1)
         self._max_depth_spin = self._limit_row(
-            limits, 0, "Max depth", self._max_depth, 1, 50, 1)
+            limits, 0, "Max depth", self._max_depth, *_LIMITS["max_depth"])
         self._max_dirs_spin = self._limit_row(
-            limits, 1, "Max folders", self._max_dirs, 100, 500_000, 1000)
+            limits, 1, "Max folders", self._max_dirs, *_LIMITS["max_dirs"])
         self._timeout_spin = self._limit_row(
-            limits, 2, "Timeout (s)", self._scan_timeout, 5, 300, 5)
+            limits, 2, "Timeout (s)", self._scan_timeout, *_LIMITS["scan_timeout"])
 
         staging = self._card(side, "Staging")
 
@@ -772,7 +861,7 @@ class SimpleOrganizerApp(tk.Tk):
         every.pack(fill="x", pady=(8, 0))
         ttk.Label(every, text="Every", style="CardDim.TLabel").pack(side="left")
         self._sched_spin = _Stepper(
-            every, self._schedule_interval, 1, 1440, 15, width=5,
+            every, self._schedule_interval, *_LIMITS["schedule_interval_minutes"], width=5,
             command=self._on_schedule_toggle)
         self._sched_spin.pack(side="left", padx=8)
         ttk.Label(every, text="minutes", style="CardDim.TLabel").pack(side="left")
@@ -1089,13 +1178,13 @@ class SimpleOrganizerApp(tk.Tk):
     def _sync_tabs(self) -> None:
         current = self._notebook.index("current")
         t = self._theme
-        for i, (label, badge, line, glyph) in enumerate(self._tabs):
+        for i, (label, count_label, line, glyph) in enumerate(self._tabs):
             active = i == current
             label.configure(style="TabActive.TLabel" if active else "Tab.TLabel",
                             image=icon(self, glyph, self._px(14),
                                        t["accent"] if active else t["fg_muted"],
                                        gap=self._px(6)))
-            badge.configure(style="BadgeActive.TLabel" if active else "Badge.TLabel")
+            count_label.configure(style="BadgeActive.TLabel" if active else "Badge.TLabel")
             line.configure(style="TabLineActive.TFrame" if active else "TabLine.TFrame")
 
     # =========================================================================
@@ -1192,66 +1281,76 @@ class SimpleOrganizerApp(tk.Tk):
     # =========================================================================
 
     def _bind_shortcuts(self) -> None:
-        self.bind_all("<Control-r>", lambda e: self._start_scan())
-        self.bind_all("<Control-o>", lambda e: self._confirm_and_organize())
-        self.bind_all("<Control-z>", lambda e: self._confirm_and_undo())
-        self.bind_all("<Control-q>", lambda e: self._on_close())
+        def shortcut(action: Callable[[], Any]) -> Callable[[Any], str]:
+            # Shortcuts obey the same rules as the buttons: nothing starts while a
+            # task is running or a dialog is open.
+            def handler(_event: Any) -> str:
+                if not self._busy_flag and not self._modal_open():
+                    action()
+                return "break"
+            return handler
+
+        self.bind_all("<Control-r>", shortcut(self._start_scan))
+        self.bind_all("<Control-o>", shortcut(self._confirm_and_organize))
+        self.bind_all("<Control-z>", shortcut(self._confirm_and_undo))
+        self.bind_all("<Control-q>", lambda _e: (self._on_close(), "break")[1])
+
+    def _modal_open(self) -> bool:
+        return bool(self._overlays) or self._native_dialog
 
     def _try_register_dnd(self) -> None:
-        try:
-            self.tk.call("package", "require", "tkdnd")
-            self._folder_entry.drop_target_register("DND_Files")  # type: ignore
-            self._folder_entry.dnd_bind("<<Drop>>", self._on_dnd_drop)  # type: ignore
-        except Exception:
-            pass
+        """Enable dropping a folder on the path field when tkdnd is available.
 
-    def _on_dnd_drop(self, event: Any) -> None:
-        """Handle drag-and-drop. tkdnd may return one path or multiple.
-
-        Single path with spaces : wrapped in {braces}
-        Multiple paths          : space-separated, each optionally in {braces}
-        We use the first valid directory found.
+        tkdnd is not part of Python. It is found either through the tkinterdnd2
+        package (pip install tkinterdnd2), which bundles it, or as a Tcl package
+        installed on the system. Without it the feature stays off and the
+        tooltip does not mention it.
         """
-        raw: str = event.data.strip()  # type: ignore
+        try:
+            try:
+                from tkinterdnd2 import TkinterDnD  # type: ignore[import-not-found]
+                TkinterDnD._require(self)
+            except Exception:  # noqa: BLE001
+                self.tk.call("package", "require", "tkdnd")
+            widget = self._folder_entry._w
+            self.tk.call("tkdnd::drop_target", "register", widget, ("DND_Files",))
+            command = self.register(self._on_dnd_drop)
+            self.tk.call("bind", widget, "<<Drop>>", f"{command} %D")
+        except Exception:  # noqa: BLE001
+            return
+        self._dnd_enabled = True
+        self._folder_tip._text = "Folder to organise. You can also drop a folder here."
 
-        # Parse all tokens — each may be bare or {brace-wrapped}
-        tokens: list[str] = []
-        i = 0
-        while i < len(raw):
-            if raw[i] == "{":
-                end = raw.find("}", i)
-                if end == -1:
-                    tokens.append(raw[i + 1:])
-                    break
-                tokens.append(raw[i + 1:end])
-                i = end + 1
-            elif raw[i] == " ":
-                i += 1
-            else:
-                end = raw.find(" ", i)
-                if end == -1:
-                    tokens.append(raw[i:])
-                    break
-                tokens.append(raw[i:end])
-                i = end
-
+    def _on_dnd_drop(self, data: str) -> str:
+        """Handle a drop from tkdnd. data is a Tcl list of one or more paths;
+        the first folder (or the folder of the first file) is used."""
+        if self._busy_flag or self._modal_open():
+            return "refuse_drop"
+        try:
+            tokens = self.tk.splitlist(data)
+        except tk.TclError:
+            tokens = (data,)
         for token in tokens:
             if not token:
                 continue
             path = Path(token)
             if path.is_dir():
                 self._set_folder(path)
-                return
+                return "copy"
             if path.is_file():
                 self._set_folder(path.parent)
-                return
+                return "copy"
+        return "refuse_drop"
 
     def _set_folder(self, path: Path) -> None:
+        if self._busy_flag:
+            self._notify("Folder not changed",
+                         "Wait until the current task has finished.", "warning")
+            return
         self._folder = path.resolve()
         self._folder_var.set(str(self._folder))
         self._scan_result = None
-        self._organize_btn.configure(state="disabled")
-        self._clear_preview()
+        self._render_scan_result()   # clears Preview and Duplicates of the old folder
         self._log(f"Folder set: {self._folder}")
         self._save_settings()
 
@@ -1260,8 +1359,16 @@ class SimpleOrganizerApp(tk.Tk):
     # =========================================================================
 
     def _browse_folder(self) -> None:
+        if self._busy_flag or self._modal_open():
+            return
         initial = str(self._folder) if self._folder.exists() else str(Path.home())
-        chosen  = filedialog.askdirectory(title="Select folder to organise", initialdir=initial)
+        # Scheduled runs wait while the system dialog is open (see _run_scheduled_organize).
+        self._native_dialog = True
+        try:
+            chosen = filedialog.askdirectory(title="Select folder to organise",
+                                             initialdir=initial, parent=self)
+        finally:
+            self._native_dialog = False
         if chosen:
             self._set_folder(Path(chosen))
 
@@ -1277,6 +1384,13 @@ class SimpleOrganizerApp(tk.Tk):
         self._save_settings()
 
     def _refresh_persistent_buttons(self) -> None:
+        """Set every action button from the current state. While a task runs
+        all of them are disabled, so no second task can touch the same files."""
+        if self._busy_flag:
+            for w in (self._organize_btn, self._undo_btn, self._history_btn,
+                      self._commit_btn, self._revert_btn, self._trash_btn):
+                w.configure(state="disabled")
+            return
         undo_state    = "normal" if has_last_run()     else "disabled"
         staging_state = "normal" if has_staging()      else "disabled"
         history_state = "normal" if has_undo_history() else "disabled"
@@ -1284,6 +1398,14 @@ class SimpleOrganizerApp(tk.Tk):
         self._commit_btn.configure(state=staging_state)
         self._revert_btn.configure(state=staging_state)
         self._history_btn.configure(state=history_state)
+        self._organize_btn.configure(
+            state="normal" if self._actionable_plans() else "disabled")
+        self._on_dup_select()
+
+    def _actionable_plans(self) -> list[FilePlan]:
+        if not self._scan_result:
+            return []
+        return [p for p in self._scan_result.plans if not p.skipped]
 
     # =========================================================================
     # Schedule
@@ -1291,7 +1413,8 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _apply_schedule_settings(self) -> None:
         self._scheduler.configure(
-            interval_minutes=self._num(self._schedule_interval, "schedule_interval_minutes"),
+            interval_minutes=self._num(self._schedule_interval, "schedule_interval_minutes",
+                                       commit=True),
             enabled=self._schedule_enabled.get(),
         )
         self._update_schedule_status()
@@ -1310,14 +1433,37 @@ class SimpleOrganizerApp(tk.Tk):
     def _on_schedule_fire(self) -> None:
         self._event_queue.put({"type": "schedule_fire"})
 
-    def _run_scheduled_organize(self) -> None:
-        if self._busy_flag:
-            self._log("[SCHEDULE]  Skipped -- app is busy.")
+    def _run_scheduled_organize(self, retry: bool = False) -> None:
+        """Start a scheduled scan + organise.
+
+        While a task runs or any dialog is open the run waits (re-checked every
+        2 s) instead of starting underneath it: a scan in the background would
+        replace the results a confirmation dialog is about to act on.
+        """
+        if retry:
+            self._schedule_pending = False
+        elif self._schedule_pending:
+            return   # an earlier run is already waiting
+        if self._close_requested or not self._schedule_enabled.get():
             return
+        if self._busy_flag or self._modal_open():
+            if not retry:
+                self._log("[SCHEDULE]  Postponed -- waiting for the current task "
+                          "or dialog to finish.")
+            self._schedule_pending = True
+            self.after(2000, self._run_scheduled_organize, True)
+            return
+
+        reason = risky_folder_reason(self._folder)
+        if reason and str(self._folder) not in self._risky_ok:
+            self._log(f"[SCHEDULE]  Skipped -- {self._folder} {reason}. "
+                      "Scan it once by hand and confirm to allow automatic runs.")
+            return
+
         self._log(f"[SCHEDULE]  Auto-organize triggered for: {self._folder}")
         self._auto_mode = True
         try:
-            self._start_scan()
+            self._start_scan(confirmed=True)
         except Exception as exc:  # noqa: BLE001
             # Never leave auto-mode on: the next manual scan would skip confirmation.
             self._auto_mode = False
@@ -1328,9 +1474,24 @@ class SimpleOrganizerApp(tk.Tk):
     # Rules UI
     # =========================================================================
 
+    def _load_rules_checked(self) -> list[Rule] | None:
+        """load_rules() for the Rules tab. Returns None (after telling the user)
+        when rules.json exists but cannot be read right now -- editing would
+        then save an empty list over the user's rules."""
+        try:
+            return load_rules()
+        except RulesReadError as exc:
+            self._log(f"[WARN]  {exc}")
+            self._notify("Rules not available",
+                         "rules.json could not be read. Try again in a moment.", "warning")
+            return None
+
     def _refresh_rules_tree(self) -> None:
+        rules = self._load_rules_checked()
+        if rules is None:
+            return
         self._rules_tree.delete(*self._rules_tree.get_children())
-        for rule in load_rules():
+        for rule in rules:
             self._rules_tree.insert("", "end", values=(
                 "●" if rule.enabled else "○",
                 rule.name, rule.condition_type,
@@ -1354,7 +1515,9 @@ class SimpleOrganizerApp(tk.Tk):
         dlg = _RuleDialog(self)
         self.wait_window(dlg)
         if dlg.result:
-            rules = load_rules()
+            rules = self._load_rules_checked()
+            if rules is None:
+                return
             rules.append(dlg.result)
             self._persist_rules(rules)
             self._refresh_rules_tree()
@@ -1364,10 +1527,16 @@ class SimpleOrganizerApp(tk.Tk):
         if idx is None:
             _showinfo("No selection", "Select a rule to edit.", parent=self)
             return
-        rules = load_rules()
+        rules = self._load_rules_checked()
+        if rules is None or idx >= len(rules):
+            return
         dlg   = _RuleDialog(self, rules[idx])
         self.wait_window(dlg)
         if dlg.result:
+            # Re-read: the file may have changed while the dialog was open.
+            rules = self._load_rules_checked()
+            if rules is None or idx >= len(rules):
+                return
             rules[idx] = dlg.result
             self._persist_rules(rules)
             self._refresh_rules_tree()
@@ -1396,7 +1565,9 @@ class SimpleOrganizerApp(tk.Tk):
         idx = self._selected_rule_index()
         if idx is None:
             return
-        rules = load_rules()
+        rules = self._load_rules_checked()
+        if rules is None or idx >= len(rules):
+            return
         rules[idx].enabled = not rules[idx].enabled
         self._persist_rules(rules)
         self._refresh_rules_tree()
@@ -1405,9 +1576,14 @@ class SimpleOrganizerApp(tk.Tk):
         idx = self._selected_rule_index()
         if idx is None:
             return
-        rules = load_rules()
+        rules = self._load_rules_checked()
+        if rules is None or idx >= len(rules):
+            return
         if not _askyesno("Delete Rule",
                                    f"Delete rule '{rules[idx].name}'?", parent=self):
+            return
+        rules = self._load_rules_checked()
+        if rules is None or idx >= len(rules):
             return
         del rules[idx]
         self._persist_rules(rules)
@@ -1417,9 +1593,11 @@ class SimpleOrganizerApp(tk.Tk):
         idx = self._selected_rule_index()
         if idx is None:
             return
-        rules   = load_rules()
+        rules   = self._load_rules_checked()
+        if rules is None:
+            return
         new_idx = idx + direction
-        if new_idx < 0 or new_idx >= len(rules):
+        if idx >= len(rules) or new_idx < 0 or new_idx >= len(rules):
             return
         rules[idx], rules[new_idx] = rules[new_idx], rules[idx]
         self._persist_rules(rules)
@@ -1433,43 +1611,86 @@ class SimpleOrganizerApp(tk.Tk):
     # =========================================================================
 
     def _open_history_dialog(self) -> None:
+        if self._busy_flag or self._modal_open():
+            return
         _HistoryDialog(self)
 
     def _undo_specific(self, run_file: Path) -> None:
+        if self._busy_flag:
+            return
+        self._start_task(
+            f"Undoing {run_file.stem}...",
+            lambda progress, log: {
+                "type": "undo_done",
+                "errors": undo_specific_run(run_file, progress_callback=progress,
+                                            log_callback=log),
+            })
+
+    # =========================================================================
+    # Background tasks
+    # =========================================================================
+
+    def _start_task(
+        self,
+        status: str,
+        work: Callable[[Callable[[int, int], None], Callable[[str], None]], dict[str, Any]],
+        log_tab: bool = True,
+    ) -> None:
+        """Run work(progress, log) on a worker thread and queue its result event.
+
+        progress only queues an event when the whole percentage changes, so a
+        run over 100 000 files sends ~100 progress events instead of 100 000.
+        """
         self._set_busy(True)
         self._set_progress(0.0)
-        self._status(f"Undoing {run_file.stem}...")
-        self._notebook.select(self._log_tab_idx)
-        t = threading.Thread(target=self._undo_specific_worker,
-                             args=(run_file,), daemon=True)
-        t.start()
+        self._status(status)
+        if log_tab:
+            self._notebook.select(self._log_tab_idx)
 
-    def _undo_specific_worker(self, run_file: Path) -> None:
-        def progress(c: int, t: int) -> None:
-            self._event_queue.put({"type": "progress",
-                                   "value": (c / t * 100) if t else 0})
-        def log_msg(msg: str) -> None:
+        def progress(current: int, total: int) -> None:
+            pct = current * 100 // total if total else 0
+            if pct != last[0]:
+                last[0] = pct
+                self._event_queue.put({"type": "progress", "value": pct})
+        last = [-1]
+
+        def log(msg: str) -> None:
             self._event_queue.put({"type": "log", "value": msg})
-        try:
-            errors = undo_specific_run(run_file, progress_callback=progress,
-                                       log_callback=log_msg)
-            self._event_queue.put({"type": "undo_done", "errors": errors})
-        except Exception as exc:  # noqa: BLE001
-            self._event_queue.put({"type": "error", "value": str(exc)})
+
+        def run() -> None:
+            try:
+                event = work(progress, log)
+            except Exception as exc:  # noqa: BLE001
+                event = {"type": "error", "value": str(exc)}
+            self._event_queue.put(event)
+
+        threading.Thread(target=run, daemon=True).start()
 
     # =========================================================================
     # Settings persistence
     # =========================================================================
 
-    def _num(self, var: tk.IntVar | tk.DoubleVar, key: str) -> Any:
-        """Read a numeric setting; an empty or invalid field falls back to the last
-        saved value (or the default) instead of raising TclError."""
+    def _num(self, var: tk.IntVar | tk.DoubleVar, key: str, commit: bool = False) -> Any:
+        """Read a numeric setting, clamped to its allowed range.
+
+        An empty or invalid field falls back to the last saved value (or the
+        default). With commit=True the field is updated to the value actually
+        used; without it the field is left alone, so a settings save that
+        happens while the user is still typing does not rewrite the field.
+        """
+        default = DEFAULT_SETTINGS[key]
         try:
-            return var.get()
+            value = var.get()
+            if not math.isfinite(value):
+                raise ValueError
         except (tk.TclError, ValueError):
-            fallback = self._settings.get(key, DEFAULT_SETTINGS[key])
-            var.set(fallback)
-            return fallback
+            value = self._settings.get(key, default)
+        low, high, _step = _LIMITS[key]
+        value = min(high, max(low, value))
+        value = int(round(value)) if isinstance(default, int) else float(value)
+        if commit:
+            var.set(value)
+        return value
 
     def _save_settings(self) -> None:
         self._settings.update({
@@ -1505,53 +1726,54 @@ class SimpleOrganizerApp(tk.Tk):
     # Scanning
     # =========================================================================
 
-    def _start_scan(self) -> None:
+    def _start_scan(self, confirmed: bool = False) -> None:
+        if self._busy_flag:
+            return
+        folder = self._folder
+        reason = risky_folder_reason(folder)
+        if reason and str(folder) not in self._risky_ok and not confirmed:
+            if not _askyesno(
+                title="Unusual folder",
+                message=(
+                    f"{folder} {reason}.\n\n"
+                    "Organising it can move files that programs or the system rely on. "
+                    "Everything can be undone, but programs may misbehave until then.\n\n"
+                    "Scan this folder anyway?"
+                ),
+                parent=self,
+            ) or self._busy_flag:
+                return
+            self._risky_ok.add(str(folder))
+
         self._save_settings()   # persist current scan options before running
-        self._set_busy(True)
         self._clear_preview()
         self._clear_duplicates()
         self._scan_result = None
-        self._organize_btn.configure(state="disabled")
-        self._set_progress(0.0)
-        self._status("Scanning...")
 
-        t = threading.Thread(
-            target=self._scan_worker,
-            args=(
-                self._folder,
-                self._recursive.get(),
-                self._include_hidden.get(),
-                self._num(self._max_depth, "max_depth"),
-                self._num(self._max_dirs, "max_dirs"),
-                self._num(self._scan_timeout, "scan_timeout"),
-                self._use_subcats.get(),
-            ),
-            daemon=True,
-        )
-        t.start()
+        recursive      = self._recursive.get()
+        include_hidden = self._include_hidden.get()
+        max_depth      = self._num(self._max_depth, "max_depth", commit=True)
+        max_dirs       = self._num(self._max_dirs, "max_dirs", commit=True)
+        scan_timeout   = self._num(self._scan_timeout, "scan_timeout", commit=True)
+        use_subcats    = self._use_subcats.get()
 
-    def _scan_worker(
-        self,
-        folder: Path, recursive: bool, include_hidden: bool,
-        max_depth: int, max_dirs: int, scan_timeout: float,
-        use_subcategories: bool,
-    ) -> None:
-        def progress(c: int, t: int) -> None:
-            self._event_queue.put({"type": "progress",
-                                   "value": (c / t * 100) if t else 0})
         def status(msg: str) -> None:
             self._event_queue.put({"type": "status", "value": msg})
-        try:
-            result = scan_folder(
-                folder=folder, recursive=recursive,
-                include_hidden=include_hidden, max_depth=max_depth,
-                max_dirs=max_dirs, scan_timeout=scan_timeout,
-                use_subcategories=use_subcategories,
-                progress_callback=progress, status_callback=status,
-            )
-            self._event_queue.put({"type": "scan_done", "result": result})
-        except Exception as exc:  # noqa: BLE001
-            self._event_queue.put({"type": "error", "value": str(exc)})
+
+        self._start_task(
+            "Scanning...",
+            lambda progress, _log: {
+                "type": "scan_done",
+                "result": scan_folder(
+                    folder=folder, recursive=recursive,
+                    include_hidden=include_hidden, max_depth=max_depth,
+                    max_dirs=max_dirs, scan_timeout=scan_timeout,
+                    use_subcategories=use_subcats,
+                    progress_callback=progress, status_callback=status,
+                ),
+            },
+            log_tab=False,
+        )
 
     def _handle_scan_done(self, result: ScanResult) -> None:
         # Consume the auto-mode flag first so it can never leak into a manual scan.
@@ -1560,28 +1782,20 @@ class SimpleOrganizerApp(tk.Tk):
         self._set_busy(False)
         self._set_progress(100.0)
 
+        for note in result.notes:
+            self._log(note)
         for err in result.errors:
             self._log(f"[WARN]  {err}")
 
-        actionable = [p for p in result.plans if not p.skipped]
+        actionable = self._actionable_plans()
         skipped    = [p for p in result.plans if p.skipped]
 
         self._log(
             f"Scan complete -- {result.total_files} file(s) found, "
             f"{len(actionable)} to move, {len(skipped)} already placed."
         )
+        self._render_scan_result()
 
-        self._clear_preview()
-        for plan in actionable:
-            self._preview_tree.insert("", "end",
-                values=(plan.source.name, plan.category, str(plan.destination.parent)),
-                tags=(str(plan.source),)   # source path stored for context menu
-            )
-
-        self._set_tab_count(self._preview_tab_idx, len(actionable))
-        self._sync_empty(self._preview_tree, self._preview_empty)
-
-        self._clear_duplicates()
         dup_msg = ""
         if result.duplicate_groups:
             dup_count = sum(len(g) for g in result.duplicate_groups)
@@ -1593,33 +1807,10 @@ class SimpleOrganizerApp(tk.Tk):
                 f"Found {len(result.duplicate_groups)} duplicate group(s) "
                 f"({dup_count} file(s) total)."
             )
-            # _dup_groups: group_node_iid -> list of file iids in that group
-            self._dup_groups: dict[str, list[str]] = {}
-            for group_idx, group in enumerate(result.duplicate_groups, start=1):
-                node = self._dup_tree.insert("", "end", text=f"Group {group_idx}",
-                                             values=("", "", ""), open=True,
-                                             tags=("group",))
-                file_iids: list[str] = []
-                for dup in group:
-                    iid = self._dup_tree.insert(
-                        node, "end",
-                        values=(dup.name, _human_size(dup), str(dup.parent)),
-                        tags=("file", str(dup)),   # full path in tags
-                    )
-                    file_iids.append(iid)
-                self._dup_groups[node] = file_iids
-            self._set_tab_count(self._dup_tab_idx, len(result.duplicate_groups))
-            self._sync_empty(self._dup_tree, self._dup_empty)
         else:
             self._log("No duplicate files detected.")
 
-        summary = f"{len(actionable)} to move  ·  {len(skipped)} in place"
-        if result.duplicate_groups:
-            summary += f"  ·  {len(result.duplicate_groups)} duplicate groups"
-        self._summary_var.set(summary)
-
         if actionable:
-            self._organize_btn.configure(state="normal")
             self._status(f"Ready -- {len(actionable)} file(s) to organise.{dup_msg}")
             self._notebook.select(self._preview_tab_idx)
         else:
@@ -1627,41 +1818,85 @@ class SimpleOrganizerApp(tk.Tk):
             if result.duplicate_groups:
                 self._notebook.select(self._dup_tab_idx)
 
-        if auto_mode:
+        if auto_mode and not self._close_requested:
             if actionable:
                 self._log("[SCHEDULE]  Auto-organizing now...")
                 self._run_auto_organize(list(actionable))
 
+    def _render_scan_result(self) -> None:
+        """Fill the Preview and Duplicates tabs from self._scan_result."""
+        result = self._scan_result
+        self._clear_preview()
+        self._clear_duplicates()
+        if result is None:
+            self._refresh_persistent_buttons()
+            return
+
+        actionable = self._actionable_plans()
+        skipped    = len(result.plans) - len(actionable)
+        for plan in actionable:
+            iid = self._preview_tree.insert("", "end",
+                values=(plan.source.name, plan.category, str(plan.destination.parent)))
+            self._preview_items[iid] = plan
+        self._set_tab_count(self._preview_tab_idx, len(actionable))
+        self._sync_empty(self._preview_tree, self._preview_empty)
+
+        # _dup_groups: group_node_iid -> list of file iids in that group
+        for group_idx, group in enumerate(result.duplicate_groups, start=1):
+            node = self._dup_tree.insert("", "end", text=f"Group {group_idx}",
+                                         values=("", "", ""), open=True,
+                                         tags=("group",))
+            file_iids: list[str] = []
+            for dup in group:
+                iid = self._dup_tree.insert(
+                    node, "end",
+                    values=(dup.name, _human_size(dup), str(dup.parent)),
+                    tags=("file",),
+                )
+                self._dup_paths[iid] = dup
+                file_iids.append(iid)
+            self._dup_groups[node] = file_iids
+        self._set_tab_count(self._dup_tab_idx, len(result.duplicate_groups))
+        self._sync_empty(self._dup_tree, self._dup_empty)
+
+        summary = f"{len(actionable)} to move  ·  {skipped} in place"
+        if result.duplicate_groups:
+            summary += f"  ·  {len(result.duplicate_groups)} duplicate groups"
+        self._summary_var.set(summary)
+        self._refresh_persistent_buttons()
+
+    def _prune_scan_result(self) -> None:
+        """Drop files that no longer exist (e.g. just trashed) from the scan
+        result and redraw it, so Organize never works on stale paths."""
+        result = self._scan_result
+        if result is None:
+            return
+        result.plans = [p for p in result.plans if p.source.exists()]
+        result.total_bytes = sum(p.size for p in result.plans if not p.skipped)
+        groups = [[f for f in g if f.exists()] for g in result.duplicate_groups]
+        result.duplicate_groups = [g for g in groups if len(g) > 1]
+        self._render_scan_result()
+
     def _run_auto_organize(self, plans: list[FilePlan]) -> None:
-        staging = self._use_staging.get()
-        self._set_busy(True)
-        self._set_progress(0.0)
-        self._status("Auto-organizing...")
-        self._notebook.select(self._log_tab_idx)
-        t = threading.Thread(target=self._organize_worker,
-                             args=(plans, staging), daemon=True)
-        t.start()
+        self._start_organize(plans, self._use_staging.get(), "Auto-organizing...")
 
     # =========================================================================
     # Organise
     # =========================================================================
 
     def _confirm_and_organize(self) -> None:
-        if not self._scan_result:
+        if self._busy_flag:
+            return
+        result = self._scan_result
+        if not result:
             return
 
-        actionable = [p for p in self._scan_result.plans if not p.skipped]
+        actionable = self._actionable_plans()
         if not actionable:
             _showinfo("Nothing to do", "All files are already organised.", parent=self)
             return
 
-        total_bytes = 0
-        for p in actionable:
-            try:
-                total_bytes += p.source.stat().st_size
-            except OSError:
-                pass
-        size_str = _fmt_size(total_bytes)
+        size_str = _fmt_size(result.total_bytes)   # summed by the scan thread
 
         staging = self._use_staging.get()
         dest_label = (
@@ -1680,38 +1915,31 @@ class SimpleOrganizerApp(tk.Tk):
         )
         if not confirmed:
             return
+        # The dialog runs a nested event loop: make sure nothing else started
+        # or replaced the scan result while it was open.
+        if self._busy_flag or self._scan_result is not result:
+            self._notify("Not organised",
+                         "The scan changed while the dialog was open. Please check "
+                         "the preview and try again.", "warning")
+            return
 
-        self._set_busy(True)
-        self._set_progress(0.0)
-        self._status("Organising...")
-        self._notebook.select(self._log_tab_idx)
+        self._start_organize(actionable, staging, "Organising...")
 
-        t = threading.Thread(target=self._organize_worker,
-                             args=(list(actionable), staging), daemon=True)
-        t.start()
-
-    def _organize_worker(self, plans: list[FilePlan], staging: bool) -> None:
-        def progress(c: int, t: int) -> None:
-            self._event_queue.put({"type": "progress",
-                                   "value": (c / t * 100) if t else 0})
-        def log_msg(msg: str) -> None:
-            self._event_queue.put({"type": "log", "value": msg})
-        try:
-            errors = organise_files(plans=plans, progress_callback=progress,
-                                    log_callback=log_msg, staging=staging)
-            self._event_queue.put({"type": "organize_done", "errors": errors,
-                                   "staging": staging})
-        except Exception as exc:  # noqa: BLE001
-            self._event_queue.put({"type": "error", "value": str(exc)})
+    def _start_organize(self, plans: list[FilePlan], staging: bool, status: str) -> None:
+        self._start_task(
+            status,
+            lambda progress, log: {
+                "type": "organize_done",
+                "errors": organise_files(plans=list(plans), progress_callback=progress,
+                                         log_callback=log, staging=staging),
+                "staging": staging,
+            })
 
     def _handle_organize_done(self, errors: list[str], staging: bool) -> None:
+        self._scan_result = None   # listed paths are stale once files have moved
         self._set_busy(False)
         self._set_progress(100.0)
-        self._organize_btn.configure(state="disabled")
-        self._scan_result = None
-        self._clear_preview()
-        self._clear_duplicates()   # listed paths are stale once files have moved
-        self._refresh_persistent_buttons()
+        self._render_scan_result()
 
         if errors:
             self._log(f"Finished with {len(errors)} error(s). See log.")
@@ -1732,6 +1960,11 @@ class SimpleOrganizerApp(tk.Tk):
     # =========================================================================
 
     def _confirm_and_undo(self) -> None:
+        if self._busy_flag:
+            return
+        if not has_last_run():
+            self._notify("Nothing to undo", "There is no organise run in the history.", "info")
+            return
         confirmed = _askyesno(
             title="Undo Last Organize",
             message=(
@@ -1742,31 +1975,21 @@ class SimpleOrganizerApp(tk.Tk):
             ),
             parent=self,
         )
-        if not confirmed:
+        if not confirmed or self._busy_flag:
             return
-        self._set_busy(True)
-        self._set_progress(0.0)
-        self._status("Undoing last run...")
-        self._notebook.select(self._log_tab_idx)
-        t = threading.Thread(target=self._undo_worker, daemon=True)
-        t.start()
-
-    def _undo_worker(self) -> None:
-        def progress(c: int, t: int) -> None:
-            self._event_queue.put({"type": "progress",
-                                   "value": (c / t * 100) if t else 0})
-        def log_msg(msg: str) -> None:
-            self._event_queue.put({"type": "log", "value": msg})
-        try:
-            errors = undo_last_run(progress_callback=progress, log_callback=log_msg)
-            self._event_queue.put({"type": "undo_done", "errors": errors})
-        except Exception as exc:  # noqa: BLE001
-            self._event_queue.put({"type": "error", "value": str(exc)})
+        self._start_task(
+            "Undoing last run...",
+            lambda progress, log: {
+                "type": "undo_done",
+                "errors": undo_last_run(progress_callback=progress, log_callback=log),
+            })
 
     def _handle_undo_done(self, errors: list[str]) -> None:
         self._set_busy(False)
         self._set_progress(100.0)
-        self._refresh_persistent_buttons()
+        # Files moved back: a preview from before the undo no longer matches.
+        self._scan_result = None
+        self._render_scan_result()
         if errors:
             self._log(f"Undo finished with {len(errors)} error(s). See log.")
             self._status(f"Undo done -- {len(errors)} error(s).")
@@ -1782,6 +2005,8 @@ class SimpleOrganizerApp(tk.Tk):
     # =========================================================================
 
     def _confirm_and_commit(self) -> None:
+        if self._busy_flag:
+            return
         confirmed = _askyesno(
             title="Commit Staging",
             message=(
@@ -1792,26 +2017,14 @@ class SimpleOrganizerApp(tk.Tk):
             ),
             parent=self,
         )
-        if not confirmed:
+        if not confirmed or self._busy_flag:
             return
-        self._set_busy(True)
-        self._set_progress(0.0)
-        self._status("Committing staging...")
-        self._notebook.select(self._log_tab_idx)
-        t = threading.Thread(target=self._commit_worker, daemon=True)
-        t.start()
-
-    def _commit_worker(self) -> None:
-        def progress(c: int, t: int) -> None:
-            self._event_queue.put({"type": "progress",
-                                   "value": (c / t * 100) if t else 0})
-        def log_msg(msg: str) -> None:
-            self._event_queue.put({"type": "log", "value": msg})
-        try:
-            errors = commit_staging(progress_callback=progress, log_callback=log_msg)
-            self._event_queue.put({"type": "commit_done", "errors": errors})
-        except Exception as exc:  # noqa: BLE001
-            self._event_queue.put({"type": "error", "value": str(exc)})
+        self._start_task(
+            "Committing staging...",
+            lambda progress, log: {
+                "type": "commit_done",
+                "errors": commit_staging(progress_callback=progress, log_callback=log),
+            })
 
     def _handle_commit_done(self, errors: list[str]) -> None:
         self._set_busy(False)
@@ -1828,6 +2041,8 @@ class SimpleOrganizerApp(tk.Tk):
             self._notify("Staging committed", "Staged files are in their final folders.")
 
     def _confirm_and_revert(self) -> None:
+        if self._busy_flag:
+            return
         confirmed = _askyesno(
             title="Revert Staging",
             message=(
@@ -1837,31 +2052,21 @@ class SimpleOrganizerApp(tk.Tk):
             ),
             parent=self,
         )
-        if not confirmed:
+        if not confirmed or self._busy_flag:
             return
-        self._set_busy(True)
-        self._set_progress(0.0)
-        self._status("Reverting staging...")
-        self._notebook.select(self._log_tab_idx)
-        t = threading.Thread(target=self._revert_worker, daemon=True)
-        t.start()
-
-    def _revert_worker(self) -> None:
-        def progress(c: int, t: int) -> None:
-            self._event_queue.put({"type": "progress",
-                                   "value": (c / t * 100) if t else 0})
-        def log_msg(msg: str) -> None:
-            self._event_queue.put({"type": "log", "value": msg})
-        try:
-            errors = revert_staging(progress_callback=progress, log_callback=log_msg)
-            self._event_queue.put({"type": "revert_done", "errors": errors})
-        except Exception as exc:  # noqa: BLE001
-            self._event_queue.put({"type": "error", "value": str(exc)})
+        self._start_task(
+            "Reverting staging...",
+            lambda progress, log: {
+                "type": "revert_done",
+                "errors": revert_staging(progress_callback=progress, log_callback=log),
+            })
 
     def _handle_revert_done(self, errors: list[str]) -> None:
         self._set_busy(False)
         self._set_progress(100.0)
-        self._refresh_persistent_buttons()
+        # Files are back in the scanned folder: an older preview is stale.
+        self._scan_result = None
+        self._render_scan_result()
         if errors:
             self._log(f"Revert finished with {len(errors)} error(s). See log.")
             self._status(f"Revert done -- {len(errors)} error(s).")
@@ -1877,8 +2082,15 @@ class SimpleOrganizerApp(tk.Tk):
     # =========================================================================
 
     def _poll_queue(self) -> None:
+        # Handle events for at most _POLL_BUDGET_S, then let Tk redraw; if more
+        # are waiting, come back almost immediately instead of after 50 ms.
+        deadline = time.monotonic() + _POLL_BUDGET_S
+        delay    = 50
         try:
             while True:
+                if time.monotonic() >= deadline:
+                    delay = 1
+                    break
                 event = self._event_queue.get_nowait()
                 etype = event["type"]
                 if etype == "progress":
@@ -1903,14 +2115,19 @@ class SimpleOrganizerApp(tk.Tk):
                     self._run_scheduled_organize()
                 elif etype == "error":
                     self._auto_mode = False
-                    self._set_busy(False)
                     self._status("Error -- see log.")
                     self._log(f"[ERROR]  {event['value']}")
-                    _showerror("Error", event["value"], parent=self)
+                    closing = self._close_requested
+                    self._set_busy(False)
+                    if not closing:   # the window is about to close: log only
+                        _showerror("Error", event["value"], parent=self)
         except queue.Empty:
             pass
         finally:
-            self.after(50, self._poll_queue)
+            try:
+                self.after(delay, self._poll_queue)
+            except tk.TclError:
+                pass   # window already destroyed
 
     # =========================================================================
     # Helpers
@@ -1929,8 +2146,10 @@ class SimpleOrganizerApp(tk.Tk):
         self.configure(cursor="watch" if busy else "")
         self._state_var.set("WORKING" if busy else "READY")
         self._state_dot.configure(style="Busy.TLabel" if busy else "Idle.TLabel")
-        if not busy:
-            self._refresh_persistent_buttons()
+        self._refresh_persistent_buttons()
+        if not busy and self._close_requested:
+            # Close after the current handler has finished updating the window.
+            self.after_idle(self._on_close)
 
     def _set_progress(self, value: float) -> None:
         self._progress_var.set(value)
@@ -1951,6 +2170,7 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _clear_preview(self) -> None:
         self._preview_tree.delete(*self._preview_tree.get_children())
+        self._preview_items = {}
         self._set_tab_count(self._preview_tab_idx, 0)
         self._summary_var.set("")
         self._sync_empty(self._preview_tree, self._preview_empty)
@@ -1958,6 +2178,7 @@ class SimpleOrganizerApp(tk.Tk):
     def _clear_duplicates(self) -> None:
         self._dup_tree.delete(*self._dup_tree.get_children())
         self._dup_groups = {}
+        self._dup_paths = {}
         self._dup_sel_var.set("")
         self._trash_btn.configure(state="disabled")
         self._set_tab_count(self._dup_tab_idx, 0)
@@ -1982,8 +2203,8 @@ class SimpleOrganizerApp(tk.Tk):
         """Update selection label and Trash button state when selection changes."""
         file_iids = self._get_selected_file_iids()
         count     = len(file_iids)
-        if count == 0:
-            self._dup_sel_var.set("")
+        if count == 0 or self._busy_flag:
+            self._dup_sel_var.set(f"{count} file(s) selected" if count else "")
             self._trash_btn.configure(state="disabled")
         else:
             self._dup_sel_var.set(f"{count} file(s) selected")
@@ -2011,6 +2232,8 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _confirm_and_trash(self) -> None:
         """Confirm then move selected duplicates to Trash."""
+        if self._busy_flag:
+            return
         file_iids = self._get_selected_file_iids()
         if not file_iids:
             return
@@ -2023,14 +2246,9 @@ class SimpleOrganizerApp(tk.Tk):
             )
             return
 
-        # Build path list from tags
-        paths: list[Path] = []
-        for iid in file_iids:
-            tags = self._dup_tree.item(iid, "tags")
-            for t in tags:
-                if t != "file":
-                    paths.append(Path(t))
-                    break
+        paths: list[Path] = [self._dup_paths[iid] for iid in file_iids if iid in self._dup_paths]
+        if not paths:
+            return
 
         # Build preview list for the dialog
         preview = "\n".join(f"  • {p.name}  ({p.parent})" for p in paths[:10])
@@ -2046,36 +2264,21 @@ class SimpleOrganizerApp(tk.Tk):
             ),
             parent=self,
         )
-        if not confirmed:
+        if not confirmed or self._busy_flag:
             return
 
-        self._set_busy(True)
-        self._set_progress(0.0)
-        self._status(f"Moving {len(paths)} file(s) to Trash...")
-        self._notebook.select(self._log_tab_idx)
+        def work(progress: Callable[[int, int], None], log: Callable[[str], None]) -> dict:
+            errors, trashed = trash_files(paths, log_callback=log, progress_callback=progress)
+            return {"type": "trash_done", "errors": errors, "count": trashed}
 
-        t = threading.Thread(target=self._trash_worker, args=(paths,), daemon=True)
-        t.start()
-
-    def _trash_worker(self, paths: list[Path]) -> None:
-        def progress(c: int, t: int) -> None:
-            self._event_queue.put({"type": "progress",
-                                   "value": (c / t * 100) if t else 0})
-        def log_msg(msg: str) -> None:
-            self._event_queue.put({"type": "log", "value": msg})
-        try:
-            errors, trashed = trash_files(paths, log_callback=log_msg,
-                                          progress_callback=progress)
-            self._event_queue.put({"type": "trash_done", "errors": errors,
-                                   "count": trashed})
-        except Exception as exc:  # noqa: BLE001
-            self._event_queue.put({"type": "error", "value": str(exc)})
+        self._start_task(f"Moving {len(paths)} file(s) to Trash...", work)
 
     def _handle_trash_done(self, errors: list[str], count: int) -> None:
         self._set_busy(False)
         self._set_progress(100.0)
-        # Refresh the duplicates view — re-scan to get updated state
-        self._clear_duplicates()
+        # Trashed files leave the duplicate groups and the organise plan, so
+        # Organize never tries to move a file that is in the Trash now.
+        self._prune_scan_result()
         if errors:
             self._log(f"Trash finished with {len(errors)} error(s). See log.")
             self._status(f"Trash done — {len(errors)} error(s).")
@@ -2117,14 +2320,11 @@ class SimpleOrganizerApp(tk.Tk):
             return
         self._preview_tree.selection_set(item)
 
-        vals  = self._preview_tree.item(item, "values")
-        tags  = self._preview_tree.item(item, "tags")
-        if not vals:
+        plan = self._preview_items.get(item)
+        if plan is None:
             return
-
-        # Source path is stored in tags; destination folder is in values[2]
-        source_path  = Path(tags[0]) if tags else None
-        dest_folder  = vals[2] if len(vals) > 2 else ""
+        source_path  = plan.source
+        dest_folder  = str(plan.destination.parent)
 
         menu = self._menu()
         has_open  = False
@@ -2177,14 +2377,13 @@ class SimpleOrganizerApp(tk.Tk):
             return
         self._dup_tree.selection_set(item)
 
-        vals = self._dup_tree.item(item, "values")
-        # Group header rows have empty values — skip them
-        if not vals or not any(vals):
+        # Group header rows have no path — skip them
+        path = self._dup_paths.get(item)
+        if path is None:
             return
 
-        filename    = vals[0]
-        folder_path = vals[2] if len(vals) > 2 else ""
-        full_path   = str(Path(folder_path) / filename) if filename and folder_path else ""
+        folder_path = str(path.parent)
+        full_path   = str(path)
 
         menu = self._menu()
 

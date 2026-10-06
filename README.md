@@ -8,7 +8,7 @@ Safe, automatic file organisation for Linux and Windows — with sub-categories,
 
 ## Table of Contents
 
-- [What's New in v3.4.1](#whats-new-in-v341)
+- [What's New in v3.4.2](#whats-new-in-v342)
 - [Downloads](#downloads)
 - [Features](#features)
 - [Safety Guarantees](#safety-guarantees)
@@ -25,48 +25,78 @@ Safe, automatic file organisation for Linux and Windows — with sub-categories,
 
 ---
 
-## What's New in v3.4.1
+## What's New in v3.4.2
 
-### Bug-Fix Release
+### Safety & Reliability Release
 
-v3.4.1 fixes every open bug report from v3.4.0. The UI and features are the same as v3.4.0 — this release is about safety and reliability. Updating is recommended for everyone.
+v3.4.2 is the result of a full code review of v3.4.1. The UI looks the same — this release closes every bug found in that review, several of which could move the wrong files or lose undo records. Updating is recommended for everyone.
 
-**Safety fixes**
+**Data safety**
 
-- **Scheduled scan could skip confirmation** (#8) — if a scheduled scan failed, the next *manual* scan organised files immediately without the "Confirm Organize" dialog. Auto-mode is now always reset, even when a scan fails.
-- **Rules could move files outside the scanned folder** (#9) — a rule target like `C:\Backup`, `/tmp/x` or `..\Other` was accepted. The rule dialog now only accepts sub-folder names, and the scanner double-checks every rule target and ignores unsafe ones with a warning in the log.
-- **"Move to Trash" could permanently delete on Windows** (#7) — on drives without a Recycle Bin, Windows deleted files for good. Network drives and UNC paths are now refused (the file is left in place and logged), other drives without a Recycle Bin show a Windows warning first, and a cancelled operation is reported as an error instead of a success.
+- **Closing the app during a task lost the undo record** — the worker thread was killed mid-run and the history was only written at the end. Closing now waits until the running task has finished.
+- **Crash or power cut left no undo record** — the history (and the staging manifest) is now written every 2 seconds while files are moving, and every settings, rules, history and manifest file is written atomically (never half-written).
+- **Undo threw away files it could not restore** — a run was marked "undone" even when some files failed (e.g. locked). Failed files now stay in the history entry, so you can fix the cause and undo the same run again.
+- **A briefly locked `rules.json` deleted your rules** — any read error (sync client, virus scanner) was treated like a corrupt file and the rules were moved away. Read errors now stop the scan with a message instead; only real JSON corruption is backed up, to `rules_corrupt_<time>.json`, without overwriting older backups.
+- **The app could organise its own data** — the settings, history and staging folders are now protected like the program folder.
 
-**Staging fixes**
+**Never move what shouldn't be moved**
 
-- **Organising twice before Commit orphaned files** (#5) — the second run overwrote the staging manifest. New staged files are now added to the existing manifest, so Commit and Revert always cover everything in staging. This also fixes staging mode combined with the scheduler.
-- **Commit/Revert lost track of failed files** (#6) — the manifest was deleted even when some moves failed. Failed files now stay in the manifest so you can fix the problem and simply press Commit or Revert again.
-- **Empty nested staging folders were left behind** (#12) — e.g. `staging/Images/Photos/` with sub-categories on. They are now removed at every level.
+- **System files were moved on Windows** — `desktop.ini`, `Thumbs.db` and files with the Windows *System* attribute are never touched now. "Include hidden files" also respects the Windows *Hidden* attribute, not only dot-files.
+- **Running downloads could be moved** — `.crdownload`, `.part`, `.tmp` and similar files, and Office lock files (`~$…`), are left alone.
+- **Git repositories inside a recursive scan were taken apart** — sub-folders that are Git repositories are now skipped as a whole.
+- **Warning for unusual folders** — scanning a drive root, your home folder, a system/program folder or a Git repository asks for confirmation first. Scheduled runs skip such folders unless you confirmed them in the current session.
+- **Windows junctions were followed** — they are now treated like symlinks and never followed, so files are not found twice.
 
-**Undo fixes**
+**Concurrency fixes**
 
-- **"Undo Last Run" and History got out of sync** (#11) — each run used to be recorded twice. The newest entry in History is now the one and only "last run", so both always agree. An existing `last_run.json` from older versions is merged into History automatically on first start, and old `undone_*.json` files are cleaned up.
+- **Two tasks could run at once** — keyboard shortcuts and several buttons (Undo, History, Commit, Revert, Organize, Trash) still worked while another task was moving files. Everything is now blocked while a task runs or a dialog is open.
+- **Scheduled run could overrun a confirmation dialog** — a run that comes due while a dialog or another task is open now waits until it is finished. Organize also re-checks after confirming that the scan was not replaced in the meantime.
+- **Scheduler could end up with two timers** — and after standby it fired once per missed slot. Now there is always exactly one timer, and missed slots are skipped.
 
-**Other fixes**
+**Scanning fixes**
 
-- **Empty number field blocked closing and scanning** (#10) — clearing *Max depth*, *Max folders*, *Timeout* or the schedule interval made the ✕ button and Scan do nothing. Empty or invalid fields now fall back to the last saved value.
-- **One broken rule wiped all rules** (#12) — invalid entries in `rules.json` are now skipped one by one. An unreadable `rules.json` is backed up to `rules.json.bak` instead of being overwritten.
-- **Rule save errors were silent** (#12) — if rules cannot be written, the app now shows a warning.
-- **Trash count included skipped files** (#12) — the "moved to Trash" message now only counts files that were actually trashed.
-- **Duplicates tab kept stale paths after organising** (#12) — it is now cleared once files have moved. Re-scan to see updated results.
-- **Version label showed v3.3.1** (#13) — title bar and header now show the correct version.
+- **Folders named like categories were skipped everywhere** — a folder such as `Projects/Images`, `Code/Python` or one called `proc`/`sys` was silently ignored in recursive scans. Category folders are now only skipped directly inside the scanned folder.
+- **Organise after "Move to Trash" tried to move trashed files** — trashed files are now removed from the preview and the plan; remaining duplicate groups stay visible.
+- **Empty files were reported as duplicates** — they are ignored now (trashing empty `__init__.py` files would break projects).
+- **Large scans froze the window** — progress updates are throttled and event handling has a time budget.
+- **Duplicate check had no time limit** — it now stops after a generous limit and says so in the log; files over 500 MB that were skipped are reported too.
+
+**Rules**
+
+- **Multi-part extensions never matched** — an extension rule like `tar.gz` now works.
+- **Invalid target folders failed file by file** — names with `< > : " | ? *`, reserved names like `CON`/`NUL` and trailing dots or spaces are rejected in the dialog and ignored with a warning during scans.
+- `inf`/`nan` are no longer accepted as size or age values.
+
+**Usability**
+
+- **Number fields** are clamped to their allowed range; an empty field falls back to the last valid value; −/+ snap to sensible steps (1 → 15 → 30 …); the mouse wheel only changes a focused field; leaving the schedule field no longer restarts the timer.
+- **History shows local time** instead of UTC.
+- **Undo removes empty category folders** that the undone run had created.
+- **Drag-and-drop actually works** when `tkinterdnd2` is installed; without it, the tooltip no longer promises it.
+- **Window icon** is drawn automatically when `icon.png` is missing.
+- **Damaged settings** (`"max_depth": "x"`, `"dark_mode": "false"`) no longer crash the start — wrong values fall back to defaults.
+- Fewer log lines: depth limits and skipped repositories are summarised; `[SCHEDULE ERROR]` lines are coloured.
+
+**Linux**
+
+- Dialogs no longer crash with "grab failed: window not viewable" on slow X11 setups.
+- The built-in Trash fallback now follows the freedesktop.org spec (percent-encoded paths, info file created first), so file managers can restore files with spaces or umlauts.
 
 No new dependencies — still Python standard library only.
+
+### Previously in v3.4.1 — Bug-Fix Release
+
+- Scheduled scans could skip the confirmation dialog for the next manual scan
+- Rules could move files outside the scanned folder
+- "Move to Trash" could permanently delete on drives without a Recycle Bin
+- Staging: organising twice before Commit orphaned files; failed Commit/Revert entries were lost
+- "Undo Last Run" and History are now always in sync
 
 ### Previously in v3.4.0 — UI Refresh
 
 - Folder bar on top, options in a sidebar, tabbed workspace, status bar
 - Dark and light themes with rounded controls, drawn at runtime — no image files shipped
-- Native-looking title bar theming on Windows 10/11
-- Phosphor icons throughout (MIT-licensed, bundled as path data)
-- In-app dialogs and toast notifications
-- −/+ number steppers, timestamped colour-coded log
-- Click a rule's status dot to toggle it; click anywhere on a duplicate group row to expand/collapse it
+- Phosphor icons, in-app dialogs and toast notifications, −/+ number steppers, colour-coded log
 
 > **Note:** On Linux, dialog and toast corners render square instead of rounded — window transparency (used for rounded corners) is Windows-only.
 
@@ -74,14 +104,14 @@ No new dependencies — still Python standard library only.
 
 ## Downloads
 
-### Latest — v3.4.1
+### Latest — v3.4.2
 
 | Platform | File |
 |---|---|
-| Linux x86-64 | `simple_organizer_linux_v3.4.1.tar.gz` |
-| Linux x86-64 | `simple_organizer_linux_v3.4.1.sha256` |
-| Windows 10/11 | `simple_organizer_windows_v3.4.1.zip` |
-| Windows 10/11 | `simple_organizer_windows_v3.4.1.sha256` |
+| Linux x86-64 | `simple_organizer_linux_v3.4.2.tar.gz` |
+| Linux x86-64 | `simple_organizer_linux_v3.4.2.sha256` |
+| Windows 10/11 | `simple_organizer_windows_v3.4.2.zip` |
+| Windows 10/11 | `simple_organizer_windows_v3.4.2.sha256` |
 
 → [GitHub Releases](https://github.com/FreakySneaky787/Simple-Organizer/releases)
 → [Codeberg Releases](https://codeberg.org/Simple-Project/Simple-Organizer/releases)
@@ -94,15 +124,20 @@ No new dependencies — still Python standard library only.
 
 ### Scanning
 
-| Parameter | Default | Description |
-|---|---|---|
-| Max depth | 5 | Directory levels to descend |
-| Max dirs | 10,000 | Max folders before scan aborts |
-| Timeout | 30 s | Wall-clock time limit |
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| Max depth | 5 | 1–50 | Directory levels to descend |
+| Max folders | 10,000 | 100–500,000 | Max folders before the scan stops |
+| Timeout | 30 s | 5–300 s | Wall-clock time limit for collecting files |
 
-- Symbolic links are never followed
+- Top-level only by default; **Scan subdirectories** for recursive mode
+- Symbolic links and Windows junctions are never followed
 - `/proc` and `/sys` unconditionally excluded on Linux
-- App directory excluded from all scans and duplicate detection
+- Program, settings, history and staging folders are never organised
+- Category folders (`Images`, `Documents`, …) are only skipped directly inside the scanned folder
+- Git repositories inside a recursive scan are left alone as a whole
+- Never moved: system files, Office lock files and downloads that are still running
+- Unusual folders (drive root, home, system/program folders, Git repositories) need confirmation
 - All scan options remembered between sessions
 
 ### Default File Categories
@@ -133,17 +168,20 @@ Code/Python/          Code/JavaScript/    Code/Web/
 
 ### Rules Engine
 
+Rules run before extension-based sorting. The first matching enabled rule wins.
+
 | Condition | Example | Matches |
 |---|---|---|
-| Extension | `pdf` | Files with that extension |
+| Extension | `pdf`, `tar.gz` | Files with that extension |
 | Filename pattern | `*.log` | Wildcard match on filename |
-| Min size (MB) | `100` | Files larger than 100 MB |
-| Max size (MB) | `10` | Files smaller than 10 MB |
+| Min size (MB) | `100` | Files of at least 100 MB |
+| Max size (MB) | `10` | Files of at most 10 MB |
 | Older than (days) | `365` | Not modified in over a year |
 | Newer than (days) | `7` | Modified in the last week |
 
-- Click a rule's status dot in the list to toggle it on or off.
-- The target folder is always a sub-folder of the scanned folder (e.g. `Invoices` or `Work/Reports`). Absolute paths, drive letters and `..` are rejected.
+- Click a rule's status dot to toggle it; use the arrows to change the order.
+- The target folder is always a sub-folder of the scanned folder (e.g. `Invoices` or `Work/Reports`). Absolute paths, drive letters, `..`, the characters `< > : " | ? *`, reserved names like `CON`/`NUL` and trailing dots or spaces are rejected.
+- If `rules.json` can't be read right now, scans stop instead of sorting without your rules.
 
 ### Staging Mode
 
@@ -156,27 +194,31 @@ Organising several times before committing is fine — every batch is added to t
 
 ### Multi-Level Undo
 
-**Undo Last Run** reverses the newest run in History. **History** lists the last 20 runs — undo any specific one. Both always show the same state.
+**Undo Last Run** reverses the newest run in History. **History** lists the last 20 runs (local time) — undo any specific one.
+
+- Files that cannot be restored stay in the history entry for another try
+- Empty category folders created by the run are removed again
+- The history is written during the run, so it survives crashes
 
 ### Auto-Organize Scheduler
 
-Fixed-interval automatic organise runs (1–1440 minutes). Stops when the app closes. Never runs as a system service.
+Fixed-interval automatic organise runs (1–1440 minutes). Stops when the app closes. Never runs as a system service. Runs wait while another task or a dialog is open; slots missed during sleep are skipped.
 
 ### Duplicate Detection + Deletion
 
-Two-stage: size buckets then SHA-256. Files over 500 MB skipped. Select duplicates in the **Duplicates** tab and move them to Trash with one click. At least one file per group is always kept. Nothing is permanently deleted — files on network drives, which have no Recycle Bin, are left in place. Click anywhere on a group row to expand or collapse it.
+Two-stage: size buckets then SHA-256. Empty files and files over 500 MB are skipped. Select duplicates in the **Duplicates** tab and move them to Trash with one click. At least one file per group is always kept. Nothing is permanently deleted — files on network drives, which have no Recycle Bin, are left in place. Click anywhere on a group row to expand or collapse it.
 
 ### Context Menus
 
 Right-click any row in the Preview or Duplicates tab to open the folder or copy the path to the clipboard.
 
+### Drag and Drop (optional)
+
+Drop a folder (or a file, to use its folder) on the path field. Needs `tkinterdnd2` — see [Known Limitations](#known-limitations).
+
 ### Persistent Settings
 
-Remembers last folder, theme, all scan options, staging mode, sub-categories, scheduler state, and window size between sessions.
-
-### Self-Protection
-
-The app detects its own location at startup and excludes its own files from all scans, planning, and duplicate detection at three independent layers.
+Remembers last folder, theme, all scan options, staging mode, sub-categories, scheduler state, and window size between sessions. Damaged values fall back to defaults.
 
 ---
 
@@ -188,13 +230,16 @@ The app detects its own location at startup and excludes its own files from all 
 | No overwrites | `resolve_conflict()` runs before every move |
 | Files stay inside the folder | Rule targets validated in the dialog and again during every scan |
 | Every move confirmed | Only scheduled runs skip the dialog; auto-mode can't leak into manual scans |
-| No symlink traversal | `is_symlink()` checked before processing |
-| No system dirs | `/proc` and `/sys` hard-excluded on Linux |
-| Bounded scans | Hard limits on depth, dir count, and time |
-| Thread safety | All file ops in daemon threads via `queue.Queue` |
-| Self-protection | App directory excluded at three independent layers |
+| One task at a time | Buttons and shortcuts blocked while a task runs or a dialog is open |
+| Undo record survives crashes | History and staging manifest written during the run, atomically |
+| Closing is safe | The window waits for a running task before it closes |
+| No link traversal | Symlinks and junctions are never followed |
+| No system files | System files, lock files and running downloads are never moved |
+| No system dirs | `/proc` and `/sys` hard-excluded; system/program folders need confirmation |
+| Bounded scans | Hard limits on depth, folder count, and time |
+| Self-protection | Program, settings, history and staging folders are never organised |
 | Group integrity | Cannot trash all files in a duplicate group |
-| Recoverable staging | Failed commit/revert entries stay in the manifest |
+| Recoverable staging & undo | Failed entries stay in the manifest / history for another try |
 
 ---
 
@@ -213,17 +258,19 @@ The app detects its own location at startup and excludes its own files from all 
 ### Linux
 
 ```bash
-tar -xzf simple_organizer_linux_v3.4.1.tar.gz
-cd simple_organizer_linux_v3.4.1
+tar -xzf simple_organizer_linux_v3.4.2.tar.gz
+cd simple_organizer_linux_v3.4.2
 chmod +x simple_organizer
 ./simple_organizer
 ```
 
 ### Windows
 
-1. Download and extract `simple_organizer_windows_v3.4.1.zip`
+1. Download and extract `simple_organizer_windows_v3.4.2.zip`
 2. Double-click `simple_organizer.exe`
 3. If Windows Defender warns: right-click → **Properties** → **Unblock**
+
+Settings, rules and history from older versions are kept and used automatically.
 
 ---
 
@@ -233,14 +280,14 @@ The `.sha256` file is a checksum of the binary — not the archive.
 
 ```bash
 # Linux — verify after extracting
-tar -xzf simple_organizer_linux_v3.4.1.tar.gz
-cd simple_organizer_linux_v3.4.1
-sha256sum -c ../simple_organizer_linux_v3.4.1.sha256
+tar -xzf simple_organizer_linux_v3.4.2.tar.gz
+cd simple_organizer_linux_v3.4.2
+sha256sum -c ../simple_organizer_linux_v3.4.2.sha256
 ```
 
 ```powershell
-# Windows — compare with the hash in simple_organizer_windows_v3.4.1.sha256
-Get-FileHash simple_organizer_windows_v3.4.1\simple_organizer.exe -Algorithm SHA256
+# Windows — compare with the hash in simple_organizer_windows_v3.4.2.sha256
+Get-FileHash simple_organizer_windows_v3.4.2\simple_organizer.exe -Algorithm SHA256
 ```
 
 ---
@@ -250,7 +297,7 @@ Get-FileHash simple_organizer_windows_v3.4.1\simple_organizer.exe -Algorithm SHA
 ### Basic Workflow
 
 1. **Launch** — last folder pre-selected automatically
-2. **Browse** to choose a folder
+2. **Browse** (or drop a folder) to choose a folder
 3. Set scan options
 4. **Scan** (`Ctrl+R`) — Preview tab shows planned moves with file count
 5. Review Preview; right-click rows for folder/path actions
@@ -262,7 +309,7 @@ Get-FileHash simple_organizer_windows_v3.4.1\simple_organizer.exe -Algorithm SHA
 1. Run a **Scan**
 2. Open the **Duplicates** tab
 3. Click file rows to select — `Ctrl+click` for multiple, `Shift+click` for range
-4. Click **Move Selected to Trash**
+4. Click **Move selected to Trash**
 5. Review the confirmation dialog
 6. Click **Continue** — files go to Trash/Recycle Bin
 
@@ -273,7 +320,9 @@ Get-FileHash simple_organizer_windows_v3.4.1\simple_organizer.exe -Algorithm SHA
 | `Ctrl+R` | Scan |
 | `Ctrl+O` | Organize |
 | `Ctrl+Z` | Undo last run |
-| `Ctrl+Q` | Quit |
+| `Ctrl+Q` | Quit (waits for a running task) |
+
+Shortcuts do nothing while a task is running or a dialog is open.
 
 ---
 
@@ -283,10 +332,10 @@ Get-FileHash simple_organizer_windows_v3.4.1\simple_organizer.exe -Algorithm SHA
 |---|---|---|
 | Settings | `~/.config/simple_organizer/settings.json` | `%APPDATA%\simple_organizer\settings.json` |
 | Rules | `~/.config/simple_organizer/rules.json` | `%APPDATA%\simple_organizer\rules.json` |
-| Undo history (incl. last run) | `~/.local/share/simple_organizer/history/` | `%APPDATA%\simple_organizer\history\` |
+| Undo history | `~/.local/share/simple_organizer/history/` | `%APPDATA%\simple_organizer\history\` |
 | Staging | `~/.local/share/simple_organizer/staging/` | `%APPDATA%\simple_organizer\staging\` |
 
-> Since v3.4.1 there is no separate `last_run.json` — the newest file in `history/` is the last run. An existing `last_run.json` is migrated automatically.
+> The newest file in `history/` is the last run. A `last_run.json` from v3.4.0 or older is migrated automatically.
 
 ---
 
@@ -318,7 +367,7 @@ update-desktop-database ~/.local/share/applications
 
 ## Developer Mode (Run from Source)
 
-Requires Python 3.11+ and Tkinter. No third-party packages.
+Requires Python 3.11+ and Tkinter. No third-party packages (`tkinterdnd2` is optional for drag-and-drop).
 
 ```bash
 # Fedora / Bazzite
@@ -350,16 +399,17 @@ py -m PyInstaller --onefile --windowed --name simple_organizer ^
     --add-data "icon.png;." --icon icon.ico main.py
 ```
 
+If `icon.png` is not available, leave out `--add-data` — the app draws its own window icon.
+
 ---
 
 ## Known Limitations
 
-- Trashing duplicates clears the Duplicates tab — re-scan to see updated results
-- Organising also clears the Duplicates tab — re-scan to see updated results
+- Organising, Undo and Revert clear the Preview and Duplicates tabs — re-scan to see updated results
 - In recursive mode, files land in the top-level category folder
-- Files over 500 MB skipped for duplicate detection
+- Files over 500 MB and empty files are skipped for duplicate detection
 - Duplicates on network drives can't be moved to Trash (no Recycle Bin) — they are left in place
-- Drag-and-drop requires the tkdnd Tcl extension (silently disabled if absent)
+- Drag-and-drop needs tkdnd: `pip install tkinterdnd2` (bundles it) or a system Tcl package; without it the feature is off
 - macOS not supported
 - On Linux, dialog and toast windows have square corners (rounded corners rely on Windows-only transparency)
 

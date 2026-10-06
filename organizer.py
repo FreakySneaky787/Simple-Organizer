@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import shutil
+import stat
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -11,19 +13,22 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Generator
+from urllib.parse import quote
 
 # All local imports at the top (fixes O4)
 from utils import (
     CATEGORY_MAP,
-    ALL_SUBCATEGORY_NAMES,
     DEFAULT_EXCLUDED_DIRS,
+    atomic_write_text,
     get_category,
     get_subcategory,
     get_data_dir,
-    get_app_dir,
+    is_inside,
+    is_transient_file,
+    protected_dirs,
     resolve_conflict,
 )
-from rules import load_rules, apply_rules, is_safe_target_folder
+from rules import RulesReadError, load_rules, apply_rules, is_safe_target_folder
 
 # ---------------------------------------------------------------------------
 # Paths  (cross-platform via get_data_dir())
@@ -36,11 +41,18 @@ STAGING_MANIFEST_FILE = DATA_DIR / "staging_manifest.json"
 HISTORY_DIR           = DATA_DIR / "history"
 MAX_HISTORY           = 20
 
-# Only top-level category folder names are always excluded.
-# Sub-category names (Photos, PDFs, Python…) are added dynamically inside
-# scan_folder when use_subcategories=True so they don't accidentally block
-# legitimate user folders with the same name when sub-categories is OFF.
+# Journals (history run / staging manifest) are rewritten at most this often
+# while files are being moved, so a crash or power cut mid-run still leaves a
+# record of every file moved up to that point.
+JOURNAL_FLUSH_SECONDS = 2.0
+
+# Category folders are only excluded directly inside the scanned folder --
+# that is the only place the organiser creates them. Sub-category folders
+# (Photos, PDFs, Python...) live inside those and are therefore never reached,
+# and a user's own "Projects/Images" or "Code/Python" folder is still scanned.
 _CATEGORY_NAMES: frozenset[str] = frozenset(CATEGORY_MAP.keys())
+
+_ALWAYS_EXCLUDED_ABS: frozenset[str] = frozenset({"/proc", "/sys"})
 
 
 def _is_safe_rule_target(root_resolved: Path, target: str) -> bool:
@@ -61,6 +73,10 @@ def _is_safe_rule_target(root_resolved: Path, target: str) -> bool:
 def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -87,40 +103,51 @@ def find_duplicates(
     files: list[Path],
     progress_callback: Callable[[int, int], None] | None = None,
     max_hash_size: int = DEFAULT_MAX_HASH_SIZE,
+    skipped_large: list[Path] | None = None,
+    deadline: float | None = None,
+    log_callback: Callable[[str], None] | None = None,
 ) -> list[list[Path]]:
     """Return groups of byte-identical files (2+ members each).
 
     Two-stage: size buckets first (cheap), then SHA-256 for matches only.
-    Files larger than max_hash_size are skipped entirely.
+    Empty files are ignored: they are all "identical", and offering to trash
+    e.g. empty __init__.py files would break projects. Files larger than
+    max_hash_size are skipped and appended to skipped_large. Hashing stops at
+    deadline (time.monotonic() value); groups found so far are still correct.
     """
     size_buckets: dict[int, list[Path]] = defaultdict(list)
     for f in files:
         try:
             sz = f.stat().st_size
-            if sz <= max_hash_size:
-                size_buckets[sz].append(f)
         except (OSError, PermissionError):
-            pass
+            continue
+        if sz == 0:
+            continue
+        if sz > max_hash_size:
+            if skipped_large is not None:
+                skipped_large.append(f)
+            continue
+        size_buckets[sz].append(f)
 
-    candidates: list[Path] = [
-        f for group in size_buckets.values() if len(group) > 1 for f in group
+    candidates: list[tuple[int, Path]] = [
+        (sz, f) for sz, group in size_buckets.items() if len(group) > 1 for f in group
     ]
 
     hash_buckets: dict[tuple[int, str], list[Path]] = defaultdict(list)
-    total   = len(candidates)
-    current = 0
+    total = len(candidates)
 
-    for f in candidates:
+    for current, (sz, f) in enumerate(candidates, start=1):
+        if deadline is not None and time.monotonic() >= deadline:
+            if log_callback:
+                log_callback(f"[TIMEOUT]  Duplicate check stopped after {current - 1} of "
+                             f"{total} files -- the duplicate list may be incomplete.")
+            break
         digest = _sha256(f)
-        current += 1
         if progress_callback:
             progress_callback(current, total)
         if digest is None:
             continue
-        try:
-            hash_buckets[(f.stat().st_size, digest)].append(f)
-        except (OSError, PermissionError):
-            pass
+        hash_buckets[(sz, digest)].append(f)
 
     return [g for g in hash_buckets.values() if len(g) > 1]
 
@@ -135,19 +162,64 @@ class FilePlan:
     destination: Path
     category:    str   # may be "Images/Photos" when subcategories are on
     skipped:     bool = False
+    size:        int  = 0
 
 
 @dataclass
 class ScanResult:
     plans:            list[FilePlan]   = field(default_factory=list)
     duplicate_groups: list[list[Path]] = field(default_factory=list)
-    errors:           list[str]        = field(default_factory=list)
+    errors:           list[str]        = field(default_factory=list)  # problems, shown as warnings
+    notes:            list[str]        = field(default_factory=list)  # tagged info lines for the log
     total_files:      int              = 0
+    total_bytes:      int              = 0   # size of all files that would move
 
 
 # ---------------------------------------------------------------------------
-# Safeguarded recursive file iterator
+# Safeguarded file iteration
 # ---------------------------------------------------------------------------
+
+def _entry_flags(entry: os.DirEntry) -> tuple[bool, bool]:
+    """Return (hidden, system) for a directory entry.
+
+    Hidden means a dot name, or on Windows the Hidden attribute. System means
+    the Windows System attribute (desktop.ini, $RECYCLE.BIN, ...). On Windows
+    os.scandir already has the attributes, so this costs no extra system call.
+    """
+    hidden = entry.name.startswith(".")
+    system = False
+    if sys.platform == "win32":
+        try:
+            attrs = entry.stat(follow_symlinks=False).st_file_attributes
+        except OSError:
+            attrs = 0
+        hidden = hidden or bool(attrs & stat.FILE_ATTRIBUTE_HIDDEN)
+        system = bool(attrs & stat.FILE_ATTRIBUTE_SYSTEM)
+    return hidden, system
+
+
+def _is_link(entry: os.DirEntry) -> bool:
+    """True for symlinks and Windows junctions -- neither is ever followed."""
+    if entry.is_symlink():
+        return True
+    is_junction = getattr(entry, "is_junction", None)
+    return bool(is_junction and is_junction())
+
+
+def _keep_file(entry: os.DirEntry, include_hidden: bool, counter: list[int]) -> bool:
+    """Decide whether a regular file entry is organised; counts the ones left alone."""
+    hidden, system = _entry_flags(entry)
+    if hidden and not include_hidden:
+        return False
+    if system or is_transient_file(entry.name):
+        counter[0] += 1
+        return False
+    return True
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
 
 def _iter_files_recursive(
     root:               Path,
@@ -158,81 +230,116 @@ def _iter_files_recursive(
     excluded_dirs:      frozenset[str] | None        = None,
     excluded_abs_paths: frozenset[str]               = frozenset(),
     log_callback:       Callable[[str], None] | None = None,
+    left_alone:         list[int] | None             = None,
 ) -> Generator[Path, None, None]:
     """Yield every regular file under root subject to hard safety limits.
 
-    Symlinks are never followed. /proc and /sys are unconditionally excluded.
-    Category folders are skipped to prevent re-processing organised files.
-    excluded_abs_paths: resolved absolute directory paths that are always
-    skipped regardless of name — used to protect the app's own directory.
+    Symlinks and junctions are never followed. /proc and /sys are
+    unconditionally excluded. Category folders directly inside root are
+    skipped to prevent re-processing organised files. Sub-folders that are Git
+    repositories are left alone as a whole. excluded_abs_paths: absolute
+    directory paths (compared case-insensitively on Windows) that are always
+    skipped -- used to protect the app's own folders.
     """
     if excluded_dirs is None:
         excluded_dirs = DEFAULT_EXCLUDED_DIRS
+    if left_alone is None:
+        left_alone = [0]
 
-    all_excluded: frozenset[str] = excluded_dirs | _CATEGORY_NAMES
+    abs_excluded = {os.path.normcase(p) for p in _ALWAYS_EXCLUDED_ABS | excluded_abs_paths}
 
-    # Merge hard-coded absolute exclusions with caller-supplied ones.
-    abs_excluded: frozenset[str] = frozenset({"/proc", "/sys"}) | excluded_abs_paths
+    deadline:     float                  = time.monotonic() + scan_timeout
+    dirs_visited: int                    = 0
+    too_deep:     int                    = 0
+    repos:        list[str]              = []
+    stack:        list[tuple[str, int]]  = [(str(root.resolve()), 0)]
 
-    deadline:     float              = time.monotonic() + scan_timeout
-    dirs_visited: int                = 0
-    stack: list[tuple[str, int]]     = [(str(root.resolve()), 0)]
+    def log(msg: str) -> None:
+        if log_callback:
+            log_callback(msg)
 
-    while stack:
-        if time.monotonic() >= deadline:
-            if log_callback:
-                log_callback(
-                    f"[TIMEOUT]  Scan aborted after {scan_timeout:.0f}s — "
-                    f"{dirs_visited} director{'y' if dirs_visited == 1 else 'ies'} visited."
-                )
-            return
+    try:
+        while stack:
+            if time.monotonic() >= deadline:
+                log(f"[TIMEOUT]  Scan stopped after {scan_timeout:.0f}s -- "
+                    f"{_plural(dirs_visited, 'folder', 'folders')} scanned. "
+                    "Files in the remaining folders are not part of this run.")
+                return
 
-        current_str, depth = stack.pop()
-        dirs_visited += 1
+            current_str, depth = stack.pop()
+            dirs_visited += 1
 
-        if dirs_visited > max_dirs:
-            if log_callback:
-                log_callback(f"[LIMIT]  Directory count exceeded {max_dirs:,} — scan aborted.")
-            return
+            if dirs_visited > max_dirs:
+                log(f"[LIMIT]  More than {max_dirs:,} folders -- scan stopped. "
+                    "Files in the remaining folders are not part of this run.")
+                return
 
-        try:
-            with os.scandir(current_str) as it:
-                entries = list(it)
-        except PermissionError:
-            if log_callback:
-                log_callback(f"[SKIP]  Permission denied: {current_str}")
-            continue
-        except OSError as exc:
-            if log_callback:
-                log_callback(f"[SKIP]  OS error reading {current_str}: {exc}")
-            continue
-
-        for entry in entries:
-            if not include_hidden and entry.name.startswith("."):
-                continue
             try:
-                if entry.is_symlink():
+                with os.scandir(current_str) as it:
+                    entries = list(it)
+            except PermissionError:
+                log(f"[SKIP]  Permission denied: {current_str}")
+                continue
+            except OSError as exc:
+                log(f"[SKIP]  OS error reading {current_str}: {exc}")
+                continue
+
+            for entry in entries:
+                try:
+                    if _is_link(entry):
+                        continue
+                    is_file = entry.is_file(follow_symlinks=False)
+                    is_dir  = entry.is_dir(follow_symlinks=False)
+                except OSError:
                     continue
-                is_file = entry.is_file(follow_symlinks=False)
-                is_dir  = entry.is_dir(follow_symlinks=False)
+
+                if is_file:
+                    if _keep_file(entry, include_hidden, left_alone):
+                        yield Path(entry.path)
+                elif is_dir:
+                    hidden, system = _entry_flags(entry)
+                    # Hidden+system folders are OS internals ($RECYCLE.BIN, System
+                    # Volume Information). System alone is set on ordinary folders
+                    # with a custom icon, so that is not a reason to skip.
+                    if hidden and (system or not include_hidden):
+                        continue
+                    if entry.name in excluded_dirs:
+                        continue
+                    if depth == 0 and entry.name in _CATEGORY_NAMES:
+                        continue
+                    if os.path.normcase(entry.path) in abs_excluded:
+                        continue
+                    if os.path.exists(os.path.join(entry.path, ".git")):
+                        repos.append(entry.name)
+                        continue
+                    if depth + 1 > max_depth:
+                        too_deep += 1
+                        continue
+                    stack.append((entry.path, depth + 1))
+    finally:
+        # Summaries instead of one log line per folder.
+        if too_deep:
+            log(f"[DEPTH]  {_plural(too_deep, 'folder', 'folders')} deeper than "
+                f"max depth {max_depth} were not scanned.")
+        if repos:
+            shown = ", ".join(repos[:5]) + (" ..." if len(repos) > 5 else "")
+            log(f"[SKIP]  {_plural(len(repos), 'Git repository', 'Git repositories')} "
+                f"left alone: {shown}")
+
+
+def _iter_files_top_level(
+    root: Path, include_hidden: bool, left_alone: list[int],
+) -> Generator[Path, None, None]:
+    """Yield the regular files directly inside root (no recursion)."""
+    with os.scandir(str(root)) as it:
+        for entry in it:
+            try:
+                if _is_link(entry) or not entry.is_file(follow_symlinks=False):
+                    continue
             except OSError:
                 continue
-
-            if is_file:
+            if _keep_file(entry, include_hidden, left_alone):
                 yield Path(entry.path)
-            elif is_dir:
-                if entry.name in all_excluded:
-                    continue
-                if entry.path in abs_excluded:
-                    continue
-                next_depth = depth + 1
-                if next_depth > max_depth:
-                    if log_callback:
-                        log_callback(
-                            f"[DEPTH]  Max depth {max_depth} reached, skipping: {entry.path}"
-                        )
-                    continue
-                stack.append((entry.path, next_depth))
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +358,11 @@ def scan_folder(
     progress_callback: Callable[[int, int], None] | None = None,
     status_callback:   Callable[[str], None]       | None = None,
 ) -> ScanResult:
-    """Scan folder and return a ScanResult with file plans and duplicate groups."""
+    """Scan folder and return a ScanResult with file plans and duplicate groups.
+
+    progress_callback receives (done, 1000): planning is the first 30 %,
+    duplicate detection the remaining 70 %.
+    """
     result = ScanResult()
 
     if not folder.exists():
@@ -261,141 +372,160 @@ def scan_folder(
         result.errors.append(f"Path is not a directory: {folder}")
         return result
 
-    # Build effective exclusion set.
-    # Sub-category folder names are only excluded when use_subcategories=True
-    # so common folder names like "Python", "Photos", "Web" are not silently
-    # skipped when the user has sub-categories turned off.
-    base_excl = excluded_dirs if excluded_dirs is not None else DEFAULT_EXCLUDED_DIRS
-    eff_excluded: frozenset[str] = (
-        base_excl | ALL_SUBCATEGORY_NAMES if use_subcategories else base_excl
-    )
+    # Work on the resolved path throughout, so "already placed" comparisons and
+    # destinations agree with the paths the scanner yields (junctions, subst
+    # drives, relative or differently spelled paths).
+    try:
+        root = folder.resolve()
+    except OSError as exc:
+        result.errors.append(f"Could not resolve {folder}: {exc}")
+        return result
 
-    # Self-protection: resolve the app's own directory once and never touch it.
-    app_dir: Path = get_app_dir()
-    app_dir_str: str = str(app_dir)
+    # Self-protection: the program folder, settings and history are never touched.
+    protected = protected_dirs()
+    for d in protected:
+        if is_inside(root, d):
+            result.errors.append(
+                f"{root} belongs to Simple Organizer itself (program, settings or "
+                "history) and is never organised.")
+            return result
+
+    try:
+        active_rules = load_rules()
+    except RulesReadError as exc:
+        result.errors.append(
+            f"{exc} -- scan stopped so no file is sorted without your rules. "
+            "Try again in a moment.")
+        return result
+
+    def report(fraction: float) -> None:
+        if progress_callback:
+            progress_callback(round(fraction * 1000), 1000)
+
+    def note(msg: str) -> None:
+        result.notes.append(msg)
+        if status_callback:
+            status_callback(msg)
 
     if status_callback:
         status_callback("Collecting files...")
 
-    def _log_warning(msg: str) -> None:
-        result.errors.append(msg)
-        if status_callback:
-            status_callback(msg)
-
+    left_alone = [0]
     try:
         if recursive:
             all_files: list[Path] = list(
                 _iter_files_recursive(
-                    root=folder,
+                    root=root,
                     include_hidden=include_hidden,
                     max_depth=max_depth,
                     max_dirs=max_dirs,
                     scan_timeout=scan_timeout,
-                    excluded_dirs=eff_excluded,
-                    excluded_abs_paths=frozenset({app_dir_str}),
-                    log_callback=_log_warning,
+                    excluded_dirs=excluded_dirs,
+                    excluded_abs_paths=frozenset(str(d) for d in protected),
+                    log_callback=note,
+                    left_alone=left_alone,
                 )
             )
         else:
-            all_files = []
-            try:
-                with os.scandir(str(folder)) as it:
-                    for entry in it:
-                        if not include_hidden and entry.name.startswith("."):
-                            continue
-                        try:
-                            if entry.is_symlink():
-                                continue
-                            if entry.is_file(follow_symlinks=False):
-                                # Self-protection: skip files inside the app dir
-                                if str(Path(entry.path).resolve().parent) == app_dir_str:
-                                    continue
-                                all_files.append(Path(entry.path))
-                        except OSError:
-                            continue
-            except PermissionError as exc:
-                result.errors.append(f"Permission denied reading {folder}: {exc}")
-                return result
+            all_files = list(_iter_files_top_level(root, include_hidden, left_alone))
     except PermissionError as exc:
-        result.errors.append(f"Permission denied reading {folder}: {exc}")
+        result.errors.append(f"Permission denied reading {root}: {exc}")
         return result
+    except OSError as exc:
+        result.errors.append(f"Could not read {root}: {exc}")
+        return result
+
+    if left_alone[0]:
+        result.notes.append(
+            f"[SKIP]  {_plural(left_alone[0], 'file', 'files')} left alone: system files, "
+            "temporary files or downloads that are still in progress.")
 
     result.total_files = len(all_files)
     if result.total_files == 0:
         return result
 
-    if status_callback:
-        status_callback(f"Scanning: 0 / {result.total_files} files (0%)")
-
-    active_rules = load_rules()
-    folder_resolved = folder.resolve()
     unsafe_targets: set[str] = set()
+    last_pct = -1
 
     for idx, file_path in enumerate(all_files, start=1):
-        pct = int(idx / result.total_files * 100)
-        if progress_callback:
-            progress_callback(idx, result.total_files)
-        if status_callback:
-            status_callback(f"Scanning: {idx} / {result.total_files} files ({pct}%)")
+        pct = idx * 100 // result.total_files
+        if pct != last_pct:   # at most ~100 UI updates, however many files there are
+            last_pct = pct
+            report(0.3 * idx / result.total_files)
+            if status_callback:
+                status_callback(f"Scanning: {idx} / {result.total_files} files ({pct}%)")
 
         try:
-            # Self-protection: resolve once, check once.
-            # app_dir in .parents covers files at any depth inside the app dir,
-            # including direct children — the .parent == app_dir check is redundant.
-            resolved = file_path.resolve()
-            if app_dir in resolved.parents:
-                continue
-
             rule_category = apply_rules(file_path, active_rules) if active_rules else None
-            if rule_category and not _is_safe_rule_target(folder_resolved, rule_category):
+            if rule_category and not _is_safe_rule_target(root, rule_category):
                 if rule_category not in unsafe_targets:
                     unsafe_targets.add(rule_category)
-                    _log_warning(
-                        f"Rule target '{rule_category}' points outside the scanned "
-                        f"folder -- rule ignored."
-                    )
+                    result.errors.append(
+                        f"Rule target '{rule_category}' is not a valid folder inside the "
+                        f"scanned folder -- rule ignored.")
                 rule_category = None
-            category      = rule_category if rule_category else get_category(file_path)
+            category = rule_category if rule_category else get_category(file_path)
 
             if use_subcategories and not rule_category:
                 sub = get_subcategory(file_path, category)
                 if sub:
-                    target_dir  = folder / category / sub
+                    target_dir  = root / category / sub
                     display_cat = f"{category}/{sub}"
                 else:
-                    target_dir  = folder / category
+                    target_dir  = root / category
                     display_cat = category
             else:
-                target_dir  = folder / category
+                target_dir  = root / category
                 display_cat = category
 
             destination    = target_dir / file_path.name
             already_placed = (file_path.parent == target_dir)
+            try:
+                size = file_path.stat().st_size
+            except OSError:
+                size = 0
+            if not already_placed:
+                result.total_bytes += size
 
             result.plans.append(FilePlan(
                 source=file_path,
                 destination=destination,
                 category=display_cat,
                 skipped=already_placed,
+                size=size,
             ))
         except Exception as exc:  # noqa: BLE001
             result.errors.append(f"Error processing {file_path.name}: {exc}")
 
     if status_callback:
         status_callback("Detecting duplicates...")
+    report(0.3)
 
-    # Only pass files that are not inside the app directory to duplicate detection.
-    # all_files may still contain app-dir files that were skipped during planning.
-    dup_candidates = [f for f in all_files if app_dir not in f.resolve().parents]
+    skipped_large: list[Path] = []
+    dup_last = [-1]
+
+    def dup_progress(current: int, total: int) -> None:
+        pct = current * 100 // total if total else 100
+        if pct != dup_last[0]:
+            dup_last[0] = pct
+            report(0.3 + 0.7 * current / total if total else 1.0)
 
     try:
         result.duplicate_groups = find_duplicates(
-            files=dup_candidates,
-            progress_callback=progress_callback,
+            files=all_files,
+            progress_callback=dup_progress,
+            skipped_large=skipped_large,
+            deadline=time.monotonic() + max(60.0, scan_timeout * 10),
+            log_callback=note,
         )
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"Duplicate detection error: {exc}")
+    if skipped_large:
+        result.notes.append(
+            f"[SKIP]  {_plural(len(skipped_large), 'file', 'files')} larger than "
+            f"{DEFAULT_MAX_HASH_SIZE // (1024 * 1024)} MB not checked for duplicates.")
 
+    report(1.0)
     if status_callback:
         status_callback("Scan complete.")
 
@@ -406,6 +536,34 @@ def scan_folder(
 # Organising
 # ---------------------------------------------------------------------------
 
+def _mkdir_tracked(directory: Path, created: list[str]) -> None:
+    """mkdir -p that records every folder it had to create (for a clean undo)."""
+    missing: list[Path] = []
+    p = directory
+    while not p.exists() and p.parent != p:
+        missing.append(p)
+        p = p.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    for d in reversed(missing):
+        s = str(d)
+        if s not in created:
+            created.append(s)
+
+
+def _remove_created_dirs(dirs: object) -> None:
+    """Remove folders a run created, deepest first, if they are empty again.
+
+    os.rmdir only ever succeeds on an empty folder, so no file can be lost.
+    """
+    if not isinstance(dirs, list):
+        return
+    for d in sorted({str(x) for x in dirs}, key=len, reverse=True):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+
 def organise_files(
     plans:             list[FilePlan],
     progress_callback: Callable[[int, int], None] | None = None,
@@ -415,11 +573,43 @@ def organise_files(
     """Execute planned file moves. Files are NEVER deleted or overwritten."""
     _ensure_data_dir()
 
-    errors:    list[str]           = []
-    actionable                     = [p for p in plans if not p.skipped]
-    total                          = len(actionable)
-    timestamp                      = datetime.now(timezone.utc).isoformat()
-    move_log: list[dict[str, str]] = []
+    errors:       list[str]           = []
+    actionable                        = [p for p in plans if not p.skipped]
+    total                             = len(actionable)
+    timestamp                         = _now_iso()
+    move_log:     list[dict[str, str]] = []
+    created_dirs: list[str]           = []
+
+    # Journal: written every JOURNAL_FLUSH_SECONDS and at the end.
+    run_path: Path | None = None
+    if staging:
+        manifest_ts, staged_before = _read_staging_manifest(log_callback)
+        manifest_ts = manifest_ts or timestamp
+    journal_failed = False
+
+    def write_journal() -> None:
+        nonlocal run_path, journal_failed
+        if not move_log:
+            return
+        if staging:
+            try:
+                _write_staging_manifest(manifest_ts, staged_before + move_log)
+            except Exception as exc:  # noqa: BLE001
+                if not journal_failed:
+                    journal_failed = True
+                    err = (f"[ERROR]  Could not write the staging manifest ({exc}). "
+                           f"Staged files are in {STAGING_DIR}.")
+                    errors.append(err)
+                    if log_callback:
+                        log_callback(err)
+        else:
+            run_path = _write_history_run({
+                "timestamp":    timestamp,
+                "moves":        [{"src": m["src"], "dst": m["dst"]} for m in move_log],
+                "created_dirs": created_dirs,
+            }, log_callback, path=run_path)
+
+    last_flush = time.monotonic()
 
     for idx, plan in enumerate(actionable, start=1):
         if progress_callback:
@@ -428,10 +618,11 @@ def organise_files(
         try:
             if staging:
                 actual_dest = STAGING_DIR / Path(plan.category) / plan.source.name
+                actual_dest.parent.mkdir(parents=True, exist_ok=True)
             else:
                 actual_dest = plan.destination
+                _mkdir_tracked(actual_dest.parent, created_dirs)
 
-            actual_dest.parent.mkdir(parents=True, exist_ok=True)
             safe_dest = resolve_conflict(actual_dest)
             shutil.move(str(plan.source), str(safe_dest))
 
@@ -464,21 +655,12 @@ def organise_files(
             if log_callback:
                 log_callback(err)
 
-    if staging:
-        if move_log:
-            # Only write manifest when at least one file was actually staged.
-            # Merge with an existing manifest so files staged by an earlier run
-            # (e.g. scheduled runs) are not orphaned.
-            _append_staging_entries(timestamp, move_log, log_callback)
-    else:
-        if move_log:
-            # Only write history when at least one file was actually moved.
-            run_data = {
-                "timestamp": timestamp,
-                "moves": [{"src": m["src"], "dst": m["dst"]} for m in move_log],
-            }
-            _write_history_run(run_data, log_callback)
+        if time.monotonic() - last_flush >= JOURNAL_FLUSH_SECONDS:
+            write_journal()
+            last_flush = time.monotonic()
 
+    # Only written when at least one file was actually moved / staged.
+    write_journal()
     return errors
 
 
@@ -493,23 +675,33 @@ def _write_history_run(
     run_data: dict,
     log_callback: Callable[[str], None] | None = None,
     when: datetime | None = None,
-) -> None:
-    """Write a timestamped history file and trim oldest beyond MAX_HISTORY."""
+    path: Path | None = None,
+) -> Path | None:
+    """Write a history run file and return its path.
+
+    Without path a new timestamped file is created and the oldest runs beyond
+    MAX_HISTORY are trimmed; with path that file is rewritten (journal flush).
+    """
     try:
         HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-        ts   = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S_%f")
-        path = resolve_conflict(HISTORY_DIR / f"run_{ts}.json")
-        path.write_text(json.dumps(run_data, indent=2), encoding="utf-8")
-        runs = sorted(HISTORY_DIR.glob("run_*.json"))
-        for old in runs[:-MAX_HISTORY]:
-            try:
-                old.unlink()
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[WARN]  Could not trim old history file: {exc}")
+        new = path is None
+        if path is None:
+            ts   = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S_%f")
+            path = resolve_conflict(HISTORY_DIR / f"run_{ts}.json")
+        atomic_write_text(path, json.dumps(run_data, indent=2))
+        if new:
+            runs = sorted(HISTORY_DIR.glob("run_*.json"))
+            for old in runs[:-MAX_HISTORY]:
+                try:
+                    old.unlink()
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[WARN]  Could not trim old history file: {exc}")
+        return path
     except Exception as exc:
         if log_callback:
             log_callback(f"[WARN]  Failed to write history: {exc}")
+        return None if path is None or not path.exists() else path
 
 
 def _migrate_legacy_last_run() -> None:
@@ -579,7 +771,8 @@ def list_undo_history() -> list[dict]:
             ts    = data.get("timestamp", "")
             count = len(data.get("moves", []))
             try:
-                dt  = datetime.fromisoformat(ts)  # O3 fix: no re-import needed
+                # Stored in UTC; shown in the computer's local time.
+                dt  = datetime.fromisoformat(ts).astimezone()
                 lbl = dt.strftime("%b %d %H:%M") + f"  -  {count} file(s)"
             except Exception:
                 lbl = f"{f.stem}  -  {count} file(s)"
@@ -600,30 +793,41 @@ def _undo_run_file(
     progress_callback: Callable[[int, int], None] | None = None,
     log_callback:      Callable[[str], None]       | None = None,
 ) -> list[str]:
-    """Reverse all moves in run_file. Renames it to undone_* when done."""
+    """Reverse all moves in run_file.
+
+    When everything is restored the file is renamed to undone_*. Moves that
+    failed stay in the run file, so the user can fix the cause and undo again.
+    """
     errors: list[str] = []
+
+    def log(msg: str) -> None:
+        if log_callback:
+            log_callback(msg)
 
     try:
         data  = json.loads(run_file.read_text(encoding="utf-8"))
         moves = list(reversed(data.get("moves", [])))
     except Exception as exc:  # noqa: BLE001
         errors.append(f"Failed to read {run_file.name}: {exc}")
-        if log_callback:
-            log_callback(f"[ERROR]  {errors[-1]}")
+        log(f"[ERROR]  {errors[-1]}")
         return errors
 
     total = len(moves)
+    failed: list[dict] = []
 
     for idx, entry in enumerate(moves, start=1):
         if progress_callback:
             progress_callback(idx, total)
 
-        src_path = Path(entry["src"])
-        dst_path = Path(entry["dst"])
+        try:
+            src_path = Path(entry["src"])
+            dst_path = Path(entry["dst"])
+        except (KeyError, TypeError):
+            log(f"[SKIP]  Unreadable history entry skipped: {entry!r}")
+            continue
 
         if not dst_path.exists():
-            if log_callback:
-                log_callback(f"[SKIP]  {dst_path.name} not found -- skipping.")
+            log(f"[SKIP]  {dst_path.name} not found -- skipping.")
             continue
 
         try:
@@ -633,31 +837,37 @@ def _undo_run_file(
             msg = f"[UNDONE]  {dst_path.name}  ->  {safe_src.parent.name}/"
             if safe_src.name != src_path.name:
                 msg += f"  (renamed -> {safe_src.name})"
-            if log_callback:
-                log_callback(msg)
+            log(msg)
+            continue
         except PermissionError as exc:
             err = f"[ERROR]  Permission denied restoring {dst_path.name}: {exc}"
-            errors.append(err)
-            if log_callback:
-                log_callback(err)
         except shutil.Error as exc:
             err = f"[ERROR]  shutil error restoring {dst_path.name}: {exc}"
-            errors.append(err)
-            if log_callback:
-                log_callback(err)
         except Exception as exc:  # noqa: BLE001
             err = f"[ERROR]  Unexpected error restoring {dst_path.name}: {exc}"
-            errors.append(err)
-            if log_callback:
-                log_callback(err)
+        errors.append(err)
+        failed.append(entry)
+        log(err)
+
+    # Category folders this run created are removed again if they are empty now.
+    _remove_created_dirs(data.get("created_dirs"))
+
+    if failed:
+        data["moves"] = list(reversed(failed))
+        try:
+            atomic_write_text(run_file, json.dumps(data, indent=2))
+            log(f"[WARN]  {_plural(len(failed), 'file', 'files')} could not be restored and "
+                "stay in the history -- fix the problem and undo this run again.")
+        except Exception as exc:  # noqa: BLE001
+            log(f"[WARN]  Could not update {run_file.name}: {exc}")
+        return errors
 
     ts_safe     = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
     undone_path = run_file.parent / f"undone_{ts_safe}.json"
     try:
         run_file.rename(undone_path)
     except Exception as exc:  # noqa: BLE001
-        if log_callback:
-            log_callback(f"[WARN]  Could not rename {run_file.name}: {exc}")
+        log(f"[WARN]  Could not rename {run_file.name}: {exc}")
     _trim_undone_history()
 
     return errors
@@ -692,36 +902,42 @@ def undo_specific_run(
 # ---------------------------------------------------------------------------
 
 def _write_staging_manifest(timestamp: str, entries: list[dict]) -> None:
-    STAGING_MANIFEST_FILE.write_text(
+    STAGING_MANIFEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        STAGING_MANIFEST_FILE,
         json.dumps({"timestamp": timestamp, "entries": entries}, indent=2),
-        encoding="utf-8",
     )
 
 
-def _append_staging_entries(
-    timestamp:    str,
-    new_entries:  list[dict],
+def _staged_file_exists(entry: object) -> bool:
+    return isinstance(entry, dict) and bool(entry.get("dst")) and Path(entry["dst"]).exists()
+
+
+def _read_staging_manifest(
     log_callback: Callable[[str], None] | None = None,
-) -> None:
-    """Add new_entries to the staging manifest, keeping any existing entries."""
-    entries: list[dict] = []
-    if STAGING_MANIFEST_FILE.exists():
+) -> tuple[str | None, list[dict]]:
+    """Return (timestamp, entries) of the current manifest, or (None, []) if there is none.
+
+    Entries whose staged file no longer exists are dropped. An unreadable
+    manifest is moved aside instead of being overwritten.
+    """
+    if not STAGING_MANIFEST_FILE.exists():
+        return None, []
+    try:
+        data = json.loads(STAGING_MANIFEST_FILE.read_text(encoding="utf-8"))
+        entries = [e for e in data.get("entries", []) if _staged_file_exists(e)]
+        return data.get("timestamp"), entries
+    except Exception as exc:  # noqa: BLE001
+        backup = STAGING_MANIFEST_FILE.with_name(
+            f"staging_manifest_corrupt_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}.json")
         try:
-            data      = json.loads(STAGING_MANIFEST_FILE.read_text(encoding="utf-8"))
-            entries   = list(data.get("entries", []))
-            timestamp = data.get("timestamp", timestamp)
-        except Exception as exc:  # noqa: BLE001
-            # Keep the unreadable manifest instead of overwriting it.
-            backup = STAGING_MANIFEST_FILE.with_name(
-                f"staging_manifest_corrupt_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}.json")
-            try:
-                STAGING_MANIFEST_FILE.replace(backup)
-            except OSError:
-                pass
-            if log_callback:
-                log_callback(f"[WARN]  Staging manifest was unreadable ({exc}); "
-                             f"backed up to {backup.name}.")
-    _write_staging_manifest(timestamp, entries + new_entries)
+            STAGING_MANIFEST_FILE.replace(backup)
+        except OSError:
+            pass
+        if log_callback:
+            log_callback(f"[WARN]  Staging manifest was unreadable ({exc}); "
+                         f"backed up to {backup.name}.")
+        return None, []
 
 
 def _finish_staging(
@@ -743,11 +959,12 @@ def _finish_staging(
         if log_callback:
             log_callback(f"[WARN]  Could not clean staging area: {exc}")
 
+
 def commit_staging(
     progress_callback: Callable[[int, int], None] | None = None,
     log_callback:      Callable[[str], None]       | None = None,
 ) -> list[str]:
-    """Move staged files to final destinations. Writes last_run for undo."""
+    """Move staged files to final destinations. Writes a history run for undo."""
     _ensure_data_dir()
     errors: list[str] = []
 
@@ -765,17 +982,33 @@ def commit_staging(
             log_callback(f"[ERROR]  {err}")
         return [err]
 
-    total     = len(entries)
-    timestamp = datetime.now(timezone.utc).isoformat()
-    move_log: list[dict[str, str]] = []
-    failed:   list[dict]           = []
+    total        = len(entries)
+    timestamp    = _now_iso()
+    move_log:     list[dict[str, str]] = []
+    failed:       list[dict]           = []
+    created_dirs: list[str]            = []
+    run_path:     Path | None          = None
+    last_flush   = time.monotonic()
+
+    def write_journal() -> None:
+        nonlocal run_path
+        if move_log:
+            run_path = _write_history_run(
+                {"timestamp": timestamp, "moves": move_log, "created_dirs": created_dirs},
+                log_callback, path=run_path)
 
     for idx, entry in enumerate(entries, start=1):
         if progress_callback:
             progress_callback(idx, total)
 
-        staged_path = Path(entry["dst"])
-        final_dst   = Path(entry["final_dst"])
+        try:
+            staged_path = Path(entry["dst"])
+            final_dst   = Path(entry["final_dst"])
+            original    = entry["src"]
+        except (KeyError, TypeError):
+            if log_callback:
+                log_callback(f"[SKIP]  Unreadable staging entry skipped: {entry!r}")
+            continue
 
         if not staged_path.exists():
             if log_callback:
@@ -783,31 +1016,35 @@ def commit_staging(
             continue
 
         try:
-            final_dst.parent.mkdir(parents=True, exist_ok=True)
+            _mkdir_tracked(final_dst.parent, created_dirs)
             safe_final = resolve_conflict(final_dst)
             shutil.move(str(staged_path), str(safe_final))
-            move_log.append({"src": entry["src"], "dst": str(safe_final)})
+            move_log.append({"src": original, "dst": str(safe_final)})
             msg = f"[COMMITTED]  {staged_path.name}  ->  {safe_final.parent.name}/"
             if safe_final.name != staged_path.name:
                 msg += f"  (renamed -> {safe_final.name})"
             if log_callback:
                 log_callback(msg)
-            continue
         except PermissionError as exc:
             err = f"[ERROR]  Permission denied committing {staged_path.name}: {exc}"
         except shutil.Error as exc:
             err = f"[ERROR]  shutil error committing {staged_path.name}: {exc}"
         except Exception as exc:  # noqa: BLE001
             err = f"[ERROR]  Unexpected error committing {staged_path.name}: {exc}"
-        errors.append(err)
-        failed.append(entry)
-        if log_callback:
-            log_callback(err)
+        else:
+            err = ""
+        if err:
+            errors.append(err)
+            failed.append(entry)
+            if log_callback:
+                log_callback(err)
 
-    run_data = {"timestamp": timestamp, "moves": move_log}
-    if move_log:
-        # Only write history when at least one file was actually moved.
-        _write_history_run(run_data, log_callback)
+        if time.monotonic() - last_flush >= JOURNAL_FLUSH_SECONDS:
+            write_journal()
+            last_flush = time.monotonic()
+
+    # Only written when at least one file was actually moved.
+    write_journal()
 
     _finish_staging(data.get("timestamp", timestamp), failed, log_callback)
     return errors
@@ -841,8 +1078,13 @@ def revert_staging(
         if progress_callback:
             progress_callback(idx, total)
 
-        staged_path  = Path(entry["dst"])
-        original_src = Path(entry["src"])
+        try:
+            staged_path  = Path(entry["dst"])
+            original_src = Path(entry["src"])
+        except (KeyError, TypeError):
+            if log_callback:
+                log_callback(f"[SKIP]  Unreadable staging entry skipped: {entry!r}")
+            continue
 
         if not staged_path.exists():
             if log_callback:
@@ -871,7 +1113,7 @@ def revert_staging(
             log_callback(err)
 
     # entries were processed newest-first; store the remainder in original order.
-    timestamp = data.get("timestamp", datetime.now(timezone.utc).isoformat())
+    timestamp = data.get("timestamp", _now_iso())
     _finish_staging(timestamp, list(reversed(failed)), log_callback)
     return errors
 
@@ -892,6 +1134,45 @@ def _remove_empty_staging_dirs() -> None:
 # ---------------------------------------------------------------------------
 # Duplicate trash
 # ---------------------------------------------------------------------------
+
+def _trash_xdg(resolved: Path) -> None:
+    """Move a file into the user's XDG Trash (freedesktop.org Trash spec 1.0).
+
+    The .trashinfo file is created first with O_EXCL, as the spec requires, so
+    two programs can never claim the same name; Path= is percent-encoded so
+    names with spaces or umlauts can be restored by file managers.
+    """
+    trash_dir = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "Trash"
+    files_dir = trash_dir / "files"
+    info_dir  = trash_dir / "info"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    info_dir.mkdir(parents=True, exist_ok=True)
+
+    stem, suffix = resolved.stem, resolved.suffix
+    for counter in range(1000):
+        name = resolved.name if counter == 0 else f"{stem}_{counter}{suffix}"
+        info = info_dir / f"{name}.trashinfo"
+        try:
+            fd = os.open(info, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        dest = files_dir / name
+        if dest.exists():
+            os.close(fd)
+            info.unlink(missing_ok=True)
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("[Trash Info]\n"
+                     f"Path={quote(str(resolved), safe='/')}\n"
+                     f"DeletionDate={datetime.now():%Y-%m-%dT%H:%M:%S}\n")
+        try:
+            shutil.move(str(resolved), str(dest))
+        except Exception:
+            info.unlink(missing_ok=True)
+            raise
+        return
+    raise OSError("could not find a free name in the Trash")
+
 
 def _trash_file_platform(path: Path) -> None:
     """Move a single file to the system Trash/Recycle Bin.
@@ -929,6 +1210,8 @@ def _trash_file_platform(path: Path) -> None:
         # Network shares / mapped drives have no Recycle Bin: Windows would
         # delete permanently. Refuse instead of breaking the "never delete" promise.
         root = resolved.anchor
+        if root.startswith("\\\\?\\") and not root.upper().startswith("\\\\?\\UNC\\"):
+            root = root[4:]   # long-path prefix on a local drive, e.g. \\?\C:\
         if root.startswith("\\\\") or \
                 ctypes.windll.kernel32.GetDriveTypeW(root) == DRIVE_REMOTE:  # type: ignore[attr-defined]
             raise OSError("network drive has no Recycle Bin -- file left in place")
@@ -952,42 +1235,13 @@ def _trash_file_platform(path: Path) -> None:
         # Linux / macOS: try gio trash first (GNOME), then trash-put (trash-cli),
         # then fall back to a manual XDG Trash implementation.
         resolved = path.resolve()
-
-        # Attempt 1: gio trash
-        try:
-            import subprocess as _sp
-            _sp.run(["gio", "trash", str(resolved)],
-                    check=True, capture_output=True)
-            return
-        except (FileNotFoundError, Exception):
-            pass
-
-        # Attempt 2: trash-put
-        try:
-            import subprocess as _sp
-            _sp.run(["trash-put", str(resolved)],
-                    check=True, capture_output=True)
-            return
-        except (FileNotFoundError, Exception):
-            pass
-
-        # Attempt 3: manual XDG Trash
-        from datetime import datetime as _dt
-        trash_dir   = Path.home() / ".local" / "share" / "Trash"
-        files_dir   = trash_dir / "files"
-        info_dir    = trash_dir / "info"
-        files_dir.mkdir(parents=True, exist_ok=True)
-        info_dir.mkdir(parents=True, exist_ok=True)
-
-        dest = resolve_conflict(files_dir / resolved.name)
-        info = info_dir / f"{dest.name}.trashinfo"
-        shutil.move(str(resolved), str(dest))
-        info.write_text(
-            "[Trash Info]\n"
-            f"Path={resolved}\n"
-            f"DeletionDate={_dt.now().strftime('%Y-%m-%dT%H:%M:%S')}\n",
-            encoding="utf-8",
-        )
+        for command in (["gio", "trash"], ["trash-put"]):
+            try:
+                subprocess.run([*command, str(resolved)], check=True, capture_output=True)
+                return
+            except Exception:  # noqa: BLE001 -- tool missing or refused: try the next way
+                pass
+        _trash_xdg(resolved)
 
 
 def trash_files(
@@ -1033,7 +1287,15 @@ def has_last_run() -> bool:
 
 
 def has_staging() -> bool:
-    return STAGING_MANIFEST_FILE.exists()
+    """True if at least one staged file is still waiting for Commit or Revert."""
+    if not STAGING_MANIFEST_FILE.exists():
+        return False
+    try:
+        data = json.loads(STAGING_MANIFEST_FILE.read_text(encoding="utf-8"))
+        entries = data.get("entries", [])
+    except Exception:  # noqa: BLE001
+        return True   # unreadable: keep Commit/Revert enabled so the error is shown
+    return any(_staged_file_exists(e) for e in entries)
 
 
 def has_undo_history() -> bool:

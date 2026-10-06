@@ -2,7 +2,9 @@
 utils.py — Shared constants, category mappings, and helper utilities.
 """
 
+import os
 import sys
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -133,9 +135,50 @@ def get_subcategory(file_path: Path, category: str) -> str:
 
 
 # Default directory names excluded from recursive scanning at all depths.
+# /proc and /sys are excluded by absolute path in the scanner, not by name,
+# so user folders that happen to be called "proc" or "sys" are still scanned.
 DEFAULT_EXCLUDED_DIRS: frozenset[str] = frozenset({
-    ".cache", ".local", ".git", "node_modules", "proc", "sys",
+    ".cache", ".local", ".git", "node_modules",
 })
+
+# Files that are never moved: OS metadata that breaks folder views when moved.
+ALWAYS_SKIPPED_FILES: frozenset[str] = frozenset({
+    "desktop.ini", "thumbs.db", "ehthumbs.db", ".ds_store", ".directory",
+})
+
+# Downloads that are still running and temporary files that a program has open.
+IN_PROGRESS_SUFFIXES: frozenset[str] = frozenset({
+    ".crdownload", ".part", ".partial", ".download", ".opdownload",
+    ".tmp", ".temp", ".!ut", ".!qb",
+})
+
+
+def is_transient_file(name: str) -> bool:
+    """Return True for files that must be left alone: OS metadata, downloads
+    still in progress, temp files and Office lock files (~$Report.docx)."""
+    lower = name.lower()
+    if lower in ALWAYS_SKIPPED_FILES or lower.startswith("~$"):
+        return True
+    return Path(lower).suffix in IN_PROGRESS_SUFFIXES
+
+
+def atomic_write_text(path: Path, text: str, retries: int = 5) -> None:
+    """Write text so readers see either the old or the new file, never half of it.
+
+    Retries the final rename briefly: on Windows a virus scanner or sync client
+    can hold the target open for a moment.
+    """
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    for attempt in range(retries):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def resolve_conflict(destination: Path, max_retries: int = 1000) -> Path:
@@ -197,6 +240,83 @@ def get_app_dir() -> Path:
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
+
+def get_config_dir() -> Path:
+    """Return the directory holding settings.json and rules.json."""
+    if sys.platform == "win32":
+        return get_data_dir()
+    return Path.home() / ".config" / "simple_organizer"
+
+
+def protected_dirs() -> list[Path]:
+    """Directories the organiser must never move files out of: its own program
+    folder plus the folders holding its settings, history and staging area."""
+    dirs: list[Path] = []
+    for d in (get_app_dir(), get_data_dir(), get_config_dir()):
+        try:
+            d = d.resolve()
+        except OSError:
+            pass
+        if d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def is_inside(path: Path, folder: Path) -> bool:
+    """Return True if path is folder itself or anywhere below it."""
+    return path == folder or folder in path.parents
+
+
+def risky_folder_reason(folder: Path) -> str | None:
+    """Explain why organising folder could break something, or None if it looks safe.
+
+    Flags drive roots, the home folder itself, program/system folders, the
+    folders where programs keep their settings, and Git repositories.
+    """
+    try:
+        p = folder.resolve()
+    except OSError:
+        p = folder
+    if p.parent == p:
+        return "is the root of a drive"
+    if (p / ".git").exists():
+        return "is a Git repository -- organising it would move its source files"
+
+    home = Path.home()
+    try:
+        home = home.resolve()
+    except OSError:
+        pass
+    if p == home:
+        return "is your home folder"
+    if home in p.parents:
+        for name in (".config", ".local", ".cache", "AppData"):
+            d = home / name
+            if is_inside(p, d):
+                return f"is inside {d}, where programs keep their settings and data"
+        return None
+
+    if sys.platform == "win32":
+        candidates = [os.environ.get(v) for v in (
+            "SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData")]
+    else:
+        # /run and /media are left out on purpose: removable drives are mounted there.
+        candidates = ["/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/opt",
+                      "/proc", "/root", "/sbin", "/sys", "/usr", "/var"]
+        # Fedora Atomic / Bazzite keep /home and /mnt under /var.
+        for allowed in ("/var/home", "/var/mnt", "/var/media"):
+            if is_inside(p, Path(allowed)):
+                return None
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            cp = Path(c).resolve()
+        except OSError:
+            continue
+        if is_inside(p, cp):
+            return f"is inside the system folder {cp}"
+    return None
 
 # ---------------------------------------------------------------------------
 # Light / Dark colour palettes

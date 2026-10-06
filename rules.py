@@ -11,26 +11,25 @@ Storage:
 
 import fnmatch
 import json
-import sys
+import re
 import time
 from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
+
+from utils import atomic_write_text, get_config_dir
 
 
 def _rules_path() -> Path:
     """Return the platform-appropriate path to rules.json."""
-    if sys.platform == "win32":
-        import os
-        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-        return base / "simple_organizer" / "rules.json"
-    return Path.home() / ".config" / "simple_organizer" / "rules.json"
+    return get_config_dir() / "rules.json"
 
 
 RULES_FILE: Path = _rules_path()
 
 # Human-readable labels for the UI
 CONDITION_LABELS: dict[str, str] = {
-    "extension":       "Extension (e.g. pdf)",
+    "extension":       "Extension (e.g. pdf or tar.gz)",
     "name_pattern":    "Filename pattern (e.g. *.log)",
     "min_size_mb":     "Min size (MB, e.g. 100)",
     "max_size_mb":     "Max size (MB, e.g. 10)",
@@ -39,6 +38,14 @@ CONDITION_LABELS: dict[str, str] = {
 }
 
 CONDITION_TYPES = list(CONDITION_LABELS.keys())
+
+
+class RulesReadError(OSError):
+    """rules.json exists but could not be read (locked, no permission, I/O error).
+
+    Callers must not treat this as "no rules": saving afterwards would wipe the
+    file, and scanning would sort files without the user's rules.
+    """
 
 
 @dataclass
@@ -67,7 +74,7 @@ def _rule_from_dict(raw: dict) -> Rule | None:
     try:
         return Rule(
             name=str(raw["name"]),
-            enabled=bool(raw["enabled"]),
+            enabled=raw["enabled"] is True,
             condition_type=str(raw["condition_type"]),
             condition_value=str(raw["condition_value"]),
             target_folder=str(raw["target_folder"]),
@@ -76,23 +83,48 @@ def _rule_from_dict(raw: dict) -> Rule | None:
         return None
 
 
+def _backup_corrupt_file() -> None:
+    """Move an unparseable rules.json aside (never overwriting an older backup)."""
+    stamp  = datetime.now().strftime("%Y%m%dT%H%M%S")
+    backup = RULES_FILE.with_name(f"rules_corrupt_{stamp}.json")
+    counter = 1
+    while backup.exists():
+        backup = RULES_FILE.with_name(f"rules_corrupt_{stamp}_{counter}.json")
+        counter += 1
+    try:
+        RULES_FILE.replace(backup)
+    except OSError:
+        pass
+
+
 def load_rules() -> list[Rule]:
     """Load rules from disk. Invalid entries are skipped one by one.
 
-    If the file cannot be parsed at all it is backed up to rules.json.bak
-    before returning [], so the next save does not silently destroy it.
+    If the file is not valid JSON (or not a list) it is backed up to
+    rules_corrupt_<time>.json before returning [], so the next save does not
+    silently destroy it. If the file exists but cannot be read, RulesReadError
+    is raised instead -- a temporary lock must never look like "no rules".
     """
     if not RULES_FILE.exists():
         return []
-    try:
-        data = json.loads(RULES_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    text: str | None = None
+    for attempt in range(3):
         try:
-            RULES_FILE.replace(RULES_FILE.with_suffix(".json.bak"))
-        except OSError:
-            pass
+            text = RULES_FILE.read_text(encoding="utf-8")
+            break
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            if attempt == 2:
+                raise RulesReadError(f"Could not read {RULES_FILE}: {exc}") from exc
+            time.sleep(0.1)
+    try:
+        data = json.loads(text or "")
+    except (ValueError, UnicodeDecodeError):
+        _backup_corrupt_file()
         return []
     if not isinstance(data, list):
+        _backup_corrupt_file()
         return []
     rules = [_rule_from_dict(r) for r in data if isinstance(r, dict)]
     return [r for r in rules if r is not None]
@@ -102,19 +134,27 @@ def save_rules(rules: list[Rule]) -> bool:
     """Persist rules to disk. Returns False on any write error."""
     try:
         RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        RULES_FILE.write_text(
-            json.dumps([asdict(r) for r in rules], indent=2), encoding="utf-8"
-        )
+        atomic_write_text(RULES_FILE, json.dumps([asdict(r) for r in rules], indent=2))
         return True
     except Exception:
         return False
+
+
+_INVALID_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
 
 
 def is_safe_target_folder(target: str) -> bool:
     """Return True if target is a relative sub-path with no '..' parts.
 
     Rejects absolute paths, drive letters and UNC paths on every platform so a
-    rule can never move files outside the scanned folder.
+    rule can never move files outside the scanned folder. Also rejects names
+    Windows cannot create (reserved characters, CON/NUL/COM1..., trailing dots
+    or spaces), so a rule never fails file by file at organise time.
     """
     target = target.strip()
     if not target:
@@ -123,7 +163,14 @@ def is_safe_target_folder(target: str) -> bool:
     if win.anchor or win.drive or posix.is_absolute():
         return False
     parts = [p for p in win.parts if p not in ("", ".")]
-    return bool(parts) and ".." not in parts
+    if not parts or ".." in parts:
+        return False
+    for part in parts:
+        if _INVALID_CHARS.search(part) or part != part.rstrip(" ."):
+            return False
+        if part.split(".")[0].upper() in _RESERVED_NAMES:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +186,9 @@ def match_rule(file_path: Path, rule: Rule) -> bool:
         cv = rule.condition_value.strip()
 
         if ct == "extension":
-            return file_path.suffix.lstrip(".").lower() == cv.lstrip(".").lower()
+            # endswith instead of comparing .suffix, so "tar.gz" works as well as "gz".
+            ext = cv.lstrip(".").lower()
+            return bool(ext) and file_path.name.lower().endswith("." + ext)
 
         elif ct == "name_pattern":
             return fnmatch.fnmatch(file_path.name.lower(), cv.lower())

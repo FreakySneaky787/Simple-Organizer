@@ -9,8 +9,11 @@ Falls back to DEFAULT_SETTINGS silently on any error.
 """
 
 import json
-import sys
+import math
 from pathlib import Path
+from typing import Any
+
+from utils import atomic_write_text, get_config_dir
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -39,12 +42,7 @@ DEFAULT_SETTINGS: dict = {
 
 def get_settings_path() -> Path:
     """Return the platform-appropriate path to settings.json."""
-    if sys.platform == "win32":
-        import os
-        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-        cfg_dir = base / "simple_organizer"
-    else:
-        cfg_dir = Path.home() / ".config" / "simple_organizer"
+    cfg_dir = get_config_dir()
     cfg_dir.mkdir(parents=True, exist_ok=True)
     return cfg_dir / "settings.json"
 
@@ -53,27 +51,47 @@ def get_settings_path() -> Path:
 # Load / Save
 # ---------------------------------------------------------------------------
 
+def _coerce(key: str, value: Any) -> Any:
+    """Return value if it has the type of the default for key, else the default.
+
+    Protects the app from hand-edited files: "max_depth": "x" or
+    "dark_mode": "false" must not crash the start or flip a switch.
+    """
+    default = DEFAULT_SETTINGS[key]
+    if isinstance(default, bool):
+        return value if isinstance(value, bool) else default
+    if isinstance(default, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return default
+        if not math.isfinite(value):
+            return default
+        return int(value) if isinstance(default, int) else float(value)
+    if isinstance(default, str):
+        return value if isinstance(value, str) else default
+    return value
+
+
 def load_settings() -> dict:
     """Load settings from disk. Returns defaults on missing or corrupted file."""
-    path = get_settings_path()
-    if not path.exists():
-        return dict(DEFAULT_SETTINGS)
+    merged = dict(DEFAULT_SETTINGS)
     try:
+        path = get_settings_path()
+        if not path.exists():
+            return merged
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            raise ValueError("not a dict")
-        merged = dict(DEFAULT_SETTINGS)
-        merged.update(data)
-        return merged
-    except Exception:
+            return merged
+        for key, value in data.items():
+            merged[key] = _coerce(key, value) if key in DEFAULT_SETTINGS else value
+    except Exception:  # noqa: BLE001
         return dict(DEFAULT_SETTINGS)
+    return merged
 
 
 def save_settings(settings: dict) -> bool:
     """Write settings dict to disk. Returns False on any write error."""
     try:
-        path = get_settings_path()
-        path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        atomic_write_text(get_settings_path(), json.dumps(settings, indent=2))
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
