@@ -114,7 +114,6 @@ No new dependencies — still Python standard library only.
 | Windows 10/11 | `simple_organizer_windows_v3.4.2.sha256` |
 
 → [GitHub Releases](https://github.com/FreakySneaky787/Simple-Organizer/releases)
-→ [Codeberg Releases](https://codeberg.org/Simple-Project/Simple-Organizer/releases)
 
 > **Note:** The `.sha256` file is a checksum of the binary or exe directly — not of the tar/zip archive.
 
