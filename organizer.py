@@ -26,7 +26,9 @@ from utils import (
     is_inside,
     is_transient_file,
     protected_dirs,
+    protected_files,
     resolve_conflict,
+    xdg_base_dir,
 )
 from rules import RulesReadError, load_rules, apply_rules, is_safe_target_folder
 
@@ -86,6 +88,23 @@ def _now_iso() -> str:
 _CHUNK_SIZE:           int = 65_536
 DEFAULT_MAX_HASH_SIZE: int = 500 * 1024 * 1024
 
+# Windows attributes of files whose content is not on the disk: OneDrive /
+# Dropbox / iCloud "online-only" placeholders and offline storage. Reading such
+# a file downloads (recalls) it, so it is never hashed.
+_FILE_ATTRIBUTE_OFFLINE               = 0x0000_1000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN        = 0x0004_0000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x0040_0000
+_NOT_LOCAL_ATTRIBUTES = (_FILE_ATTRIBUTE_OFFLINE | _FILE_ATTRIBUTE_RECALL_ON_OPEN
+                         | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+
+def is_cloud_placeholder(st: os.stat_result) -> bool:
+    """True if the file's content is only in the cloud (or offline storage).
+
+    st_file_attributes only exists on Windows; elsewhere this is always False.
+    """
+    return bool(getattr(st, "st_file_attributes", 0) & _NOT_LOCAL_ATTRIBUTES)
+
 
 def _sha256(path: Path) -> str | None:
     """Return SHA-256 hex digest of path, or None on any read error."""
@@ -106,22 +125,30 @@ def find_duplicates(
     skipped_large: list[Path] | None = None,
     deadline: float | None = None,
     log_callback: Callable[[str], None] | None = None,
+    skipped_cloud: list[Path] | None = None,
 ) -> list[list[Path]]:
     """Return groups of byte-identical files (2+ members each).
 
     Two-stage: size buckets first (cheap), then SHA-256 for matches only.
     Empty files are ignored: they are all "identical", and offering to trash
-    e.g. empty __init__.py files would break projects. Files larger than
-    max_hash_size are skipped and appended to skipped_large. Hashing stops at
-    deadline (time.monotonic() value); groups found so far are still correct.
+    e.g. empty __init__.py files would break projects. Cloud placeholders
+    (OneDrive "online-only" etc.) are never read -- that would download them --
+    and are appended to skipped_cloud. Files larger than max_hash_size are
+    skipped and appended to skipped_large. Hashing stops at deadline
+    (time.monotonic() value); groups found so far are still correct.
     """
     size_buckets: dict[int, list[Path]] = defaultdict(list)
     for f in files:
         try:
-            sz = f.stat().st_size
+            st = f.stat()
         except (OSError, PermissionError):
             continue
+        sz = st.st_size
         if sz == 0:
+            continue
+        if is_cloud_placeholder(st):
+            if skipped_cloud is not None:
+                skipped_cloud.append(f)
             continue
         if sz > max_hash_size:
             if skipped_large is not None:
@@ -381,7 +408,9 @@ def scan_folder(
         result.errors.append(f"Could not resolve {folder}: {exc}")
         return result
 
-    # Self-protection: the program folder, settings and history are never touched.
+    # Self-protection: settings, history, staging and the program code are never
+    # touched. A folder that merely contains the exe is organised normally; only
+    # the exe itself is skipped (protected_files below).
     protected = protected_dirs()
     for d in protected:
         if is_inside(root, d):
@@ -434,6 +463,10 @@ def scan_folder(
     except OSError as exc:
         result.errors.append(f"Could not read {root}: {exc}")
         return result
+
+    own_files = protected_files()
+    if own_files:
+        all_files = [f for f in all_files if os.path.normcase(str(f)) not in own_files]
 
     if left_alone[0]:
         result.notes.append(
@@ -502,6 +535,7 @@ def scan_folder(
     report(0.3)
 
     skipped_large: list[Path] = []
+    skipped_cloud: list[Path] = []
     dup_last = [-1]
 
     def dup_progress(current: int, total: int) -> None:
@@ -517,9 +551,14 @@ def scan_folder(
             skipped_large=skipped_large,
             deadline=time.monotonic() + max(60.0, scan_timeout * 10),
             log_callback=note,
+            skipped_cloud=skipped_cloud,
         )
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"Duplicate detection error: {exc}")
+    if skipped_cloud:
+        result.notes.append(
+            f"[SKIP]  {_plural(len(skipped_cloud), 'online-only cloud file', 'online-only cloud files')} "
+            "(e.g. OneDrive) not checked for duplicates, so nothing is downloaded.")
     if skipped_large:
         result.notes.append(
             f"[SKIP]  {_plural(len(skipped_large), 'file', 'files')} larger than "
@@ -704,13 +743,21 @@ def _write_history_run(
         return None if path is None or not path.exists() else path
 
 
+_legacy_migrated = False
+
+
 def _migrate_legacy_last_run() -> None:
     """Fold a last_run.json written by v3.4.0 or older into history, then remove it.
 
     Older versions wrote every run to both files, so usually the run is already
     in history and the legacy file can simply be dropped. Also removes stale
     undone_*.json files that older versions left in the data directory.
+    Only old versions create these files, so this runs once per app start.
     """
+    global _legacy_migrated
+    if _legacy_migrated:
+        return
+    _legacy_migrated = True
     for stale in DATA_DIR.glob("undone_*.json"):
         try:
             stale.unlink()
@@ -788,6 +835,42 @@ def list_undo_history() -> list[dict]:
     return result
 
 
+def _later_moves(run_file: Path) -> dict[str, str]:
+    """Map source -> destination of every move recorded by runs newer than run_file.
+
+    Keys are os.path.normcase'd. If several newer runs moved a file away from
+    the same path, the earliest of them wins -- that is the move that took the
+    file away from where run_file left it.
+    """
+    later: dict[str, str] = {}
+    for f in sorted(HISTORY_DIR.glob("run_*.json")):
+        if f.name <= run_file.name:
+            continue
+        try:
+            moves = json.loads(f.read_text(encoding="utf-8")).get("moves", [])
+        except Exception:  # noqa: BLE001
+            continue
+        for m in moves:
+            try:
+                later.setdefault(os.path.normcase(str(m["src"])), str(m["dst"]))
+            except (KeyError, TypeError):
+                continue
+    return later
+
+
+def _follow_moves(path: Path, later: dict[str, str]) -> Path | None:
+    """Return where the file that was at path is now, following newer runs."""
+    seen: set[str] = set()
+    current = path
+    while not current.exists():
+        key = os.path.normcase(str(current))
+        if key in seen or key not in later:
+            return None
+        seen.add(key)
+        current = Path(later[key])
+    return current
+
+
 def _undo_run_file(
     run_file:          Path,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -797,8 +880,11 @@ def _undo_run_file(
 
     When everything is restored the file is renamed to undone_*. Moves that
     failed stay in the run file, so the user can fix the cause and undo again.
+    A file that a newer run has moved on is followed to where it is now and
+    restored from there, so runs can be undone in any order.
     """
     errors: list[str] = []
+    later: dict[str, str] | None = None   # built only when a file is missing
 
     def log(msg: str) -> None:
         if log_callback:
@@ -826,9 +912,15 @@ def _undo_run_file(
             log(f"[SKIP]  Unreadable history entry skipped: {entry!r}")
             continue
 
+        followed = False
         if not dst_path.exists():
-            log(f"[SKIP]  {dst_path.name} not found -- skipping.")
-            continue
+            if later is None:
+                later = _later_moves(run_file)
+            current = _follow_moves(dst_path, later)
+            if current is None:
+                log(f"[SKIP]  {dst_path.name} not found -- skipping.")
+                continue
+            dst_path, followed = current, True
 
         try:
             src_path.parent.mkdir(parents=True, exist_ok=True)
@@ -837,6 +929,8 @@ def _undo_run_file(
             msg = f"[UNDONE]  {dst_path.name}  ->  {safe_src.parent.name}/"
             if safe_src.name != src_path.name:
                 msg += f"  (renamed -> {safe_src.name})"
+            if followed:
+                msg += "  (found where a newer run had moved it)"
             log(msg)
             continue
         except PermissionError as exc:
@@ -1135,19 +1229,86 @@ def _remove_empty_staging_dirs() -> None:
 # Duplicate trash
 # ---------------------------------------------------------------------------
 
+def _existing_ancestor(path: Path) -> Path:
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
+
+
+def _mount_point(path: Path) -> Path:
+    """Return the top directory of the file system that holds path."""
+    dev = path.stat().st_dev
+    current = path.parent
+    while current.parent != current:
+        try:
+            if current.parent.stat().st_dev != dev:
+                break
+        except OSError:
+            break
+        current = current.parent
+    return current
+
+
+def _trash_candidates(resolved: Path) -> list[tuple[Path, Path | None]]:
+    """Trash folders to try for resolved, best first, as (trash_dir, topdir).
+
+    topdir is None for the home trash. Following the freedesktop.org Trash
+    spec, a file on another file system (USB stick, second partition) goes to
+    that volume's own trash -- $topdir/.Trash/$uid if an admin prepared a
+    shared .Trash (directory, sticky bit, not a symlink), else
+    $topdir/.Trash-$uid -- so it is never copied across devices. The home
+    trash is the last resort, as the spec allows.
+    """
+    home_trash = xdg_base_dir("XDG_DATA_HOME", Path.home() / ".local" / "share") / "Trash"
+    try:
+        same_device = resolved.stat().st_dev == _existing_ancestor(home_trash).stat().st_dev
+    except OSError:
+        same_device = True
+    if same_device:
+        return [(home_trash, None)]
+
+    top = _mount_point(resolved)
+    uid = getattr(os, "getuid", lambda: 0)()
+    candidates: list[tuple[Path, Path | None]] = []
+    shared = top / ".Trash"
+    try:
+        st = os.lstat(shared)
+        if stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX:
+            candidates.append((shared / str(uid), top))
+    except OSError:
+        pass
+    candidates.append((top / f".Trash-{uid}", top))
+    candidates.append((home_trash, None))
+    return candidates
+
+
 def _trash_xdg(resolved: Path) -> None:
-    """Move a file into the user's XDG Trash (freedesktop.org Trash spec 1.0).
+    """Move a file into an XDG Trash (freedesktop.org Trash spec 1.0).
 
     The .trashinfo file is created first with O_EXCL, as the spec requires, so
     two programs can never claim the same name; Path= is percent-encoded so
     names with spaces or umlauts can be restored by file managers.
     """
-    trash_dir = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "Trash"
+    last_error: OSError | None = None
+    for trash_dir, top in _trash_candidates(resolved):
+        try:
+            trash_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            (trash_dir / "files").mkdir(mode=0o700, exist_ok=True)
+            (trash_dir / "info").mkdir(mode=0o700, exist_ok=True)
+        except OSError as exc:   # read-only volume, no permission: try the next trash
+            last_error = exc
+            continue
+        # A volume trash stores the path relative to the volume, so the entry
+        # still restores when the drive is mounted somewhere else next time.
+        original = resolved.relative_to(top).as_posix() if top else str(resolved)
+        _trash_into(resolved, trash_dir, original)
+        return
+    raise OSError(f"no usable Trash folder: {last_error}")
+
+
+def _trash_into(resolved: Path, trash_dir: Path, original: str) -> None:
     files_dir = trash_dir / "files"
     info_dir  = trash_dir / "info"
-    files_dir.mkdir(parents=True, exist_ok=True)
-    info_dir.mkdir(parents=True, exist_ok=True)
-
     stem, suffix = resolved.stem, resolved.suffix
     for counter in range(1000):
         name = resolved.name if counter == 0 else f"{stem}_{counter}{suffix}"
@@ -1163,7 +1324,7 @@ def _trash_xdg(resolved: Path) -> None:
             continue
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write("[Trash Info]\n"
-                     f"Path={quote(str(resolved), safe='/')}\n"
+                     f"Path={quote(original, safe='/')}\n"
                      f"DeletionDate={datetime.now():%Y-%m-%dT%H:%M:%S}\n")
         try:
             shutil.move(str(resolved), str(dest))
@@ -1283,21 +1444,35 @@ def trash_files(
 
 
 def has_last_run() -> bool:
+    """True if there is a run to undo. Only lists file names -- the UI calls
+    this after every task, so it must not read the history files themselves."""
     return _newest_run_file() is not None
+
+
+# (mtime_ns, size) of the manifest -> its entries; the UI asks after every task.
+_manifest_cache: tuple[tuple[int, int], list] | None = None
 
 
 def has_staging() -> bool:
     """True if at least one staged file is still waiting for Commit or Revert."""
-    if not STAGING_MANIFEST_FILE.exists():
-        return False
+    global _manifest_cache
     try:
-        data = json.loads(STAGING_MANIFEST_FILE.read_text(encoding="utf-8"))
-        entries = data.get("entries", [])
-    except Exception:  # noqa: BLE001
-        return True   # unreadable: keep Commit/Revert enabled so the error is shown
-    return any(_staged_file_exists(e) for e in entries)
+        st = STAGING_MANIFEST_FILE.stat()
+    except OSError:
+        return False
+    key = (st.st_mtime_ns, st.st_size)
+    if _manifest_cache is None or _manifest_cache[0] != key:
+        try:
+            data = json.loads(STAGING_MANIFEST_FILE.read_text(encoding="utf-8"))
+            entries = data.get("entries", [])
+            if not isinstance(entries, list):
+                raise ValueError("entries is not a list")
+        except Exception:  # noqa: BLE001
+            return True   # unreadable: keep Commit/Revert enabled so the error is shown
+        _manifest_cache = (key, entries)
+    return any(_staged_file_exists(e) for e in _manifest_cache[1])
 
 
 def has_undo_history() -> bool:
     """Return True if there is at least one undoable history entry."""
-    return bool(list_undo_history())
+    return has_last_run()

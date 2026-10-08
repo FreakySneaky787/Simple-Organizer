@@ -8,7 +8,7 @@ Safe, automatic file organisation for Linux and Windows — with sub-categories,
 
 ## Table of Contents
 
-- [What's New in v3.4.2](#whats-new-in-v342)
+- [What's New in v3.4.3](#whats-new-in-v343)
 - [Downloads](#downloads)
 - [Features](#features)
 - [Safety Guarantees](#safety-guarantees)
@@ -25,64 +25,56 @@ Safe, automatic file organisation for Linux and Windows — with sub-categories,
 
 ---
 
-## What's New in v3.4.2
+## What's New in v3.4.3
 
-### Safety & Reliability Release
+### Bug-Fix Release
 
-v3.4.2 is the result of a full code review of v3.4.1. The UI looks the same — this release closes every bug found in that review, several of which could move the wrong files or lose undo records. Updating is recommended for everyone.
+v3.4.3 fixes all 15 issues found in a review of v3.4.2 (#14 – #28), including one regression. Updating is recommended — especially if you keep `simple_organizer.exe` inside the folder you organise.
 
-**Data safety**
+**Safety & data**
 
-- **Closing the app during a task lost the undo record** — the worker thread was killed mid-run and the history was only written at the end. Closing now waits until the running task has finished.
-- **Crash or power cut left no undo record** — the history (and the staging manifest) is now written every 2 seconds while files are moving, and every settings, rules, history and manifest file is written atomically (never half-written).
-- **Undo threw away files it could not restore** — a run was marked "undone" even when some files failed (e.g. locked). Failed files now stay in the history entry, so you can fix the cause and undo the same run again.
-- **A briefly locked `rules.json` deleted your rules** — any read error (sync client, virus scanner) was treated like a corrupt file and the rules were moved away. Read errors now stop the scan with a message instead; only real JSON corruption is backed up, to `rules_corrupt_<time>.json`, without overwriting older backups.
-- **The app could organise its own data** — the settings, history and staging folders are now protected like the program folder.
+- **The folder that contains the exe could not be organised** (#14, regression in v3.4.2) — the whole folder was refused as "belongs to Simple Organizer itself". Now only the exe itself is left alone and the folder is organised normally. The settings, history and staging folders stay fully protected.
+- **The duplicate check downloaded OneDrive files** (#15) — "online-only" cloud files (OneDrive, Dropbox, iCloud) were read for hashing, which downloads them. They are now skipped and counted in the log.
+- **Undoing runs out of order left files in the wrong place** (#25) — when a newer run had moved a file again, undoing the older run skipped it. Undo now follows the file to where it is and restores it to its original location.
+- **Organize stayed enabled with an outdated plan after a crash** (#21) — after a task that moves files fails unexpectedly, the preview is cleared so you scan again first.
+- **No warning for `C:\Users` or `/home`** (#23) — the folder that holds all users' home folders now asks for confirmation like other unusual folders.
 
-**Never move what shouldn't be moved**
+**Scheduler**
 
-- **System files were moved on Windows** — `desktop.ini`, `Thumbs.db` and files with the Windows *System* attribute are never touched now. "Include hidden files" also respects the Windows *Hidden* attribute, not only dot-files.
-- **Running downloads could be moved** — `.crdownload`, `.part`, `.tmp` and similar files, and Office lock files (`~$…`), are left alone.
-- **Git repositories inside a recursive scan were taken apart** — sub-folders that are Git repositories are now skipped as a whole.
-- **Warning for unusual folders** — scanning a drive root, your home folder, a system/program folder or a Git repository asks for confirmation first. Scheduled runs skip such folders unless you confirmed them in the current session.
-- **Windows junctions were followed** — they are now treated like symlinks and never followed, so files are not found twice.
+- **Scheduled runs silently stopped after a restart** (#24) — your "scan anyway" answer for an unusual folder is now remembered, also for automatic runs. If a run is paused because a folder still needs that confirmation, the Auto-organize card and a notification say so.
+- **The schedule timer restarted after an automatic correction** (#26) — e.g. after an out-of-range interval was corrected.
 
-**Concurrency fixes**
+**Performance**
 
-- **Two tasks could run at once** — keyboard shortcuts and several buttons (Undo, History, Commit, Revert, Organize, Trash) still worked while another task was moving files. Everything is now blocked while a task runs or a dialog is open.
-- **Scheduled run could overrun a confirmation dialog** — a run that comes due while a dialog or another task is open now waits until it is finished. Organize also re-checks after confirming that the scan was not replaced in the meantime.
-- **Scheduler could end up with two timers** — and after standby it fired once per missed slot. Now there is always exactly one timer, and missed slots are skipped.
-
-**Scanning fixes**
-
-- **Folders named like categories were skipped everywhere** — a folder such as `Projects/Images`, `Code/Python` or one called `proc`/`sys` was silently ignored in recursive scans. Category folders are now only skipped directly inside the scanned folder.
-- **Organise after "Move to Trash" tried to move trashed files** — trashed files are now removed from the preview and the plan; remaining duplicate groups stay visible.
-- **Empty files were reported as duplicates** — they are ignored now (trashing empty `__init__.py` files would break projects).
-- **Large scans froze the window** — progress updates are throttled and event handling has a time budget.
-- **Duplicate check had no time limit** — it now stops after a generous limit and says so in the log; files over 500 MB that were skipped are reported too.
-
-**Rules**
-
-- **Multi-part extensions never matched** — an extension rule like `tar.gz` now works.
-- **Invalid target folders failed file by file** — names with `< > : " | ? *`, reserved names like `CON`/`NUL` and trailing dots or spaces are rejected in the dialog and ignored with a warning during scans.
-- `inf`/`nan` are no longer accepted as size or age values.
+- **The window froze while showing very large scans** (#16) — Preview and Duplicates are now filled in small slices, so the window stays responsive.
+- **The log grew without limit** (#17) — it now keeps the newest 5 000 lines.
+- **The UI stuttered after every task** (#18) — button states no longer read every history file.
 
 **Usability**
 
-- **Number fields** are clamped to their allowed range; an empty field falls back to the last valid value; −/+ snap to sensible steps (1 → 15 → 30 …); the mouse wheel only changes a focused field; leaving the schedule field no longer restarts the timer.
-- **History shows local time** instead of UTC.
-- **Undo removes empty category folders** that the undone run had created.
-- **Drag-and-drop actually works** when `tkinterdnd2` is installed; without it, the tooltip no longer promises it.
-- **Window icon** is drawn automatically when `icon.png` is missing.
-- **Damaged settings** (`"max_depth": "x"`, `"dark_mode": "false"`) no longer crash the start — wrong values fall back to defaults.
-- Fewer log lines: depth limits and skipped repositories are summarised; `[SCHEDULE ERROR]` lines are coloured.
+- **Shortcuts did not work with Caps Lock on** (#22).
+- **Window size and position** (#27) — a maximised window no longer overwrites the normal size with the screen size. Position and maximised state are remembered, and the window is moved and shrunk to fit if the monitor changed.
 
 **Linux**
 
-- Dialogs no longer crash with "grab failed: window not viewable" on slow X11 setups.
-- The built-in Trash fallback now follows the freedesktop.org spec (percent-encoded paths, info file created first), so file managers can restore files with spaces or umlauts.
+- **Trash on USB sticks and other partitions** (#28) — the built-in Trash fallback now uses the drive's own trash (`.Trash-<uid>`) instead of copying the file into the home folder.
+- **`XDG_CONFIG_HOME` and `XDG_DATA_HOME` are honoured** (#28) — an existing folder in the old location keeps being used, so nothing gets lost.
+
+**Project**
+
+- **The README promised a Linux build that does not exist** (#19) — Downloads and Installation now explain how to run Simple Organizer on Linux (from source or self-built).
+- **Building from source failed** (#20) — `icon.png` and `icon.ico` are now in the repository.
 
 No new dependencies — still Python standard library only.
+
+### Previously in v3.4.2 — Safety & Reliability Release
+
+- Closing during a task waits for it; history and staging manifest are written during the run and atomically
+- Undo keeps files it could not restore; a locked `rules.json` no longer wipes the rules
+- System files, Office lock files and running downloads are never moved; Git repositories and junctions are skipped
+- Confirmation before organising drive roots, home, system folders or Git repositories
+- One task at a time; scheduled runs wait for open dialogs; exactly one scheduler timer
+- Multi-part extension rules (`tar.gz`), invalid rule targets rejected, clamped number fields, history in local time
 
 ### Previously in v3.4.1 — Bug-Fix Release
 
@@ -90,7 +82,6 @@ No new dependencies — still Python standard library only.
 - Rules could move files outside the scanned folder
 - "Move to Trash" could permanently delete on drives without a Recycle Bin
 - Staging: organising twice before Commit orphaned files; failed Commit/Revert entries were lost
-- "Undo Last Run" and History are now always in sync
 
 ### Previously in v3.4.0 — UI Refresh
 
@@ -104,18 +95,17 @@ No new dependencies — still Python standard library only.
 
 ## Downloads
 
-### Latest — v3.4.2
+### Latest — v3.4.3
 
 | Platform | File |
 |---|---|
-| Linux x86-64 | `simple_organizer_linux_v3.4.2.tar.gz` |
-| Linux x86-64 | `simple_organizer_linux_v3.4.2.sha256` |
-| Windows 10/11 | `simple_organizer_windows_v3.4.2.zip` |
-| Windows 10/11 | `simple_organizer_windows_v3.4.2.sha256` |
+| Windows 10/11 | `simple_organizer_windows_v3.4.3.zip` |
+| Windows 10/11 | `simple_organizer_windows_v3.4.3.sha256` |
+| Linux x86-64 | No prebuilt binary on GitHub — [run it from source](#linux) or [build your own](#developer-mode-run-from-source) |
 
 → [GitHub Releases](https://github.com/FreakySneaky787/Simple-Organizer/releases)
 
-> **Note:** The `.sha256` file is a checksum of the binary or exe directly — not of the tar/zip archive.
+> **Note:** The `.sha256` file is a checksum of the exe directly — not of the zip archive.
 
 ---
 
@@ -132,11 +122,12 @@ No new dependencies — still Python standard library only.
 - Top-level only by default; **Scan subdirectories** for recursive mode
 - Symbolic links and Windows junctions are never followed
 - `/proc` and `/sys` unconditionally excluded on Linux
-- Program, settings, history and staging folders are never organised
+- Settings, history and staging folders are never organised; the exe itself is never moved, but the folder it sits in is organised normally
+- Online-only cloud files (OneDrive, Dropbox, iCloud) are never downloaded — they are left out of the duplicate check
 - Category folders (`Images`, `Documents`, …) are only skipped directly inside the scanned folder
 - Git repositories inside a recursive scan are left alone as a whole
 - Never moved: system files, Office lock files and downloads that are still running
-- Unusual folders (drive root, home, system/program folders, Git repositories) need confirmation
+- Unusual folders (drive root, home, the folder holding all home folders, system/program folders, Git repositories) need confirmation once
 - All scan options remembered between sessions
 
 ### Default File Categories
@@ -198,14 +189,17 @@ Organising several times before committing is fine — every batch is added to t
 - Files that cannot be restored stay in the history entry for another try
 - Empty category folders created by the run are removed again
 - The history is written during the run, so it survives crashes
+- Runs can be undone in any order: a file that a newer run moved again is followed and restored to its original place
 
 ### Auto-Organize Scheduler
 
 Fixed-interval automatic organise runs (1–1440 minutes). Stops when the app closes. Never runs as a system service. Runs wait while another task or a dialog is open; slots missed during sleep are skipped.
 
+Unusual folders (drive root, home, `C:\Users` / `/home`, system folders, Git repositories) are only organised automatically after you scanned them once by hand and confirmed. That answer is remembered. Until then the Auto-organize card shows "Paused" and a notification explains why.
+
 ### Duplicate Detection + Deletion
 
-Two-stage: size buckets then SHA-256. Empty files and files over 500 MB are skipped. Select duplicates in the **Duplicates** tab and move them to Trash with one click. At least one file per group is always kept. Nothing is permanently deleted — files on network drives, which have no Recycle Bin, are left in place. Click anywhere on a group row to expand or collapse it.
+Two-stage: size buckets then SHA-256. Empty files, files over 500 MB and online-only cloud files are skipped. Select duplicates in the **Duplicates** tab and move them to Trash with one click. At least one file per group is always kept. Nothing is permanently deleted — files on network drives, which have no Recycle Bin, are left in place. Click anywhere on a group row to expand or collapse it.
 
 ### Context Menus
 
@@ -217,7 +211,7 @@ Drop a folder (or a file, to use its folder) on the path field. Needs `tkinterdn
 
 ### Persistent Settings
 
-Remembers last folder, theme, all scan options, staging mode, sub-categories, scheduler state, and window size between sessions. Damaged values fall back to defaults.
+Remembers last folder, theme, all scan options, staging mode, sub-categories, scheduler state, confirmed unusual folders, and window size, position and maximised state between sessions. If the monitor changed, the window is moved and shrunk to fit. Damaged values fall back to defaults.
 
 ---
 
@@ -236,7 +230,8 @@ Remembers last folder, theme, all scan options, staging mode, sub-categories, sc
 | No system files | System files, lock files and running downloads are never moved |
 | No system dirs | `/proc` and `/sys` hard-excluded; system/program folders need confirmation |
 | Bounded scans | Hard limits on depth, folder count, and time |
-| Self-protection | Program, settings, history and staging folders are never organised |
+| Self-protection | Settings, history and staging folders are never organised; the exe is never moved |
+| No surprise downloads | Online-only cloud files are never read |
 | Group integrity | Cannot trash all files in a duplicate group |
 | Recoverable staging & undo | Failed entries stay in the manifest / history for another try |
 
@@ -246,7 +241,7 @@ Remembers last folder, theme, all scan options, staging mode, sub-categories, sc
 
 | Platform | Format | Tested on |
 |---|---|---|
-| Linux x86-64 | tar.gz + binary | Bazzite, Fedora 40, Ubuntu 24.04 |
+| Linux x86-64 | From source (Python 3.11+, Tkinter) | Bazzite, Fedora 40, Ubuntu 24.04 |
 | Windows 10/11 | .zip + .exe | Windows 10, Windows 11 |
 | macOS | Not supported | — |
 
@@ -256,16 +251,25 @@ Remembers last folder, theme, all scan options, staging mode, sub-categories, sc
 
 ### Linux
 
+There is no prebuilt Linux binary on GitHub at the moment. Simple Organizer runs directly from source — it only needs Python 3.11+ with Tkinter:
+
 ```bash
-tar -xzf simple_organizer_linux_v3.4.2.tar.gz
-cd simple_organizer_linux_v3.4.2
-chmod +x simple_organizer
-./simple_organizer
+# Fedora / Bazzite
+sudo dnf install python3-tkinter
+
+# Debian / Ubuntu
+sudo apt install python3-tk
+
+git clone https://github.com/FreakySneaky787/Simple-Organizer.git
+cd Simple-Organizer
+python3 main.py
 ```
+
+To get a single executable file, build it yourself — see [Developer Mode](#developer-mode-run-from-source).
 
 ### Windows
 
-1. Download and extract `simple_organizer_windows_v3.4.2.zip`
+1. Download and extract `simple_organizer_windows_v3.4.3.zip`
 2. Double-click `simple_organizer.exe`
 3. If Windows Defender warns: right-click → **Properties** → **Unblock**
 
@@ -275,18 +279,11 @@ Settings, rules and history from older versions are kept and used automatically.
 
 ## Verifying Downloads
 
-The `.sha256` file is a checksum of the binary — not the archive.
-
-```bash
-# Linux — verify after extracting
-tar -xzf simple_organizer_linux_v3.4.2.tar.gz
-cd simple_organizer_linux_v3.4.2
-sha256sum -c ../simple_organizer_linux_v3.4.2.sha256
-```
+The `.sha256` file is a checksum of the exe — not the zip archive.
 
 ```powershell
-# Windows — compare with the hash in simple_organizer_windows_v3.4.2.sha256
-Get-FileHash simple_organizer_windows_v3.4.2\simple_organizer.exe -Algorithm SHA256
+# Windows — compare with the hash in simple_organizer_windows_v3.4.3.sha256
+Get-FileHash simple_organizer_windows_v3.4.3\simple_organizer.exe -Algorithm SHA256
 ```
 
 ---
@@ -329,11 +326,13 @@ Shortcuts do nothing while a task is running or a dialog is open.
 
 | Data | Linux | Windows |
 |---|---|---|
-| Settings | `~/.config/simple_organizer/settings.json` | `%APPDATA%\simple_organizer\settings.json` |
-| Rules | `~/.config/simple_organizer/rules.json` | `%APPDATA%\simple_organizer\rules.json` |
-| Undo history | `~/.local/share/simple_organizer/history/` | `%APPDATA%\simple_organizer\history\` |
-| Staging | `~/.local/share/simple_organizer/staging/` | `%APPDATA%\simple_organizer\staging\` |
+| Settings | `$XDG_CONFIG_HOME/simple_organizer/settings.json` | `%APPDATA%\simple_organizer\settings.json` |
+| Rules | `$XDG_CONFIG_HOME/simple_organizer/rules.json` | `%APPDATA%\simple_organizer\rules.json` |
+| Undo history | `$XDG_DATA_HOME/simple_organizer/history/` | `%APPDATA%\simple_organizer\history\` |
+| Staging | `$XDG_DATA_HOME/simple_organizer/staging/` | `%APPDATA%\simple_organizer\staging\` |
 
+> On Linux `$XDG_CONFIG_HOME` defaults to `~/.config` and `$XDG_DATA_HOME` to `~/.local/share`. If you set them after using v3.4.2 or older, the existing folders in the default locations keep being used so nothing gets lost — move them yourself if you want.
+>
 > The newest file in `history/` is the last run. A `last_run.json` from v3.4.0 or older is migrated automatically.
 
 ---
@@ -398,7 +397,7 @@ py -m PyInstaller --onefile --windowed --name simple_organizer ^
     --add-data "icon.png;." --icon icon.ico main.py
 ```
 
-If `icon.png` is not available, leave out `--add-data` — the app draws its own window icon.
+`icon.png` and `icon.ico` are part of the repository. Without them the app still works — it draws its own window icon.
 
 ---
 
@@ -406,7 +405,8 @@ If `icon.png` is not available, leave out `--add-data` — the app draws its own
 
 - Organising, Undo and Revert clear the Preview and Duplicates tabs — re-scan to see updated results
 - In recursive mode, files land in the top-level category folder
-- Files over 500 MB and empty files are skipped for duplicate detection
+- Files over 500 MB, empty files and online-only cloud files are skipped for duplicate detection
+- No prebuilt Linux binary on GitHub — run from source or build it yourself
 - Duplicates on network drives can't be moved to Trash (no Recycle Bin) — they are left in place
 - Drag-and-drop needs tkdnd: `pip install tkinterdnd2` (bundles it) or a system Tcl package; without it the feature is off
 - macOS not supported

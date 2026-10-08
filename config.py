@@ -8,6 +8,7 @@ Storage:
 Falls back to DEFAULT_SETTINGS silently on any error.
 """
 
+import copy
 import json
 import math
 from pathlib import Path
@@ -23,8 +24,12 @@ DEFAULT_SETTINGS: dict = {
     "last_folder":               "",      # last selected directory (str path)
     "staging_mode":              False,   # staging checkbox state
     "dark_mode":                 False,   # theme toggle state
-    "window_width":              980,     # saved window width
-    "window_height":             720,     # saved window height
+    "window_width":              980,     # saved window width (normal, not maximised)
+    "window_height":             720,     # saved window height (normal, not maximised)
+    "window_x":                  None,    # saved window position, None = let the OS decide
+    "window_y":                  None,
+    "window_maximized":          False,   # window was maximised when the app closed
+    "approved_folders":          [],      # unusual folders the user agreed to organise
     "schedule_enabled":          False,   # auto-organise on/off
     "schedule_interval_minutes": 60,      # auto-organise interval in minutes
     "use_subcategories":         False,   # granular sub-folder sorting
@@ -58,6 +63,14 @@ def _coerce(key: str, value: Any) -> Any:
     "dark_mode": "false" must not crash the start or flip a switch.
     """
     default = DEFAULT_SETTINGS[key]
+    if default is None:   # optional whole number (window position)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return None
+        return int(value)
+    if isinstance(default, list):   # list of strings
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            return list(value)
+        return []
     if isinstance(default, bool):
         return value if isinstance(value, bool) else default
     if isinstance(default, (int, float)):
@@ -73,7 +86,8 @@ def _coerce(key: str, value: Any) -> Any:
 
 def load_settings() -> dict:
     """Load settings from disk. Returns defaults on missing or corrupted file."""
-    merged = dict(DEFAULT_SETTINGS)
+    # deepcopy: the defaults contain a list that must never be shared or mutated.
+    merged = copy.deepcopy(DEFAULT_SETTINGS)
     try:
         path = get_settings_path()
         if not path.exists():
@@ -84,7 +98,7 @@ def load_settings() -> dict:
         for key, value in data.items():
             merged[key] = _coerce(key, value) if key in DEFAULT_SETTINGS else value
     except Exception:  # noqa: BLE001
-        return dict(DEFAULT_SETTINGS)
+        return copy.deepcopy(DEFAULT_SETTINGS)
     return merged
 
 

@@ -3,6 +3,7 @@
 import math
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -10,7 +11,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, ttk
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from organizer import (
     FilePlan,
@@ -41,7 +42,7 @@ from scheduler import OrganizerScheduler
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.4.2"
+APP_VERSION  = "3.4.3"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -72,6 +73,16 @@ _LIMITS: dict[str, tuple[float, float, float]] = {
 
 # Longest time _poll_queue may spend on queued events before letting Tk redraw.
 _POLL_BUDGET_S = 0.03
+
+# Longest time one slice of filling the Preview / Duplicates trees may take.
+_RENDER_BUDGET_S = 0.02
+
+# Pause between two slices of work. Tk redraws only when no timer is due, so
+# rescheduling with after(1) would keep the window from repainting.
+_YIELD_MS = 10
+
+# The Log tab keeps at most this many lines; older lines are dropped.
+_LOG_MAX_LINES = 5000
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +179,15 @@ class _Stepper(ttk.Frame):
         self._entry.bind("<Button-5>",   lambda _e: self._wheel(-1))
         self._entry.bind("<Return>",     lambda _e: self._nudge(0))
         self._entry.bind("<FocusOut>",   lambda _e: self._nudge(0))
+
+    def sync(self) -> None:
+        """Adopt the variable's current value as the committed one. Called after
+        the app itself corrected the value, so leaving the field next time does
+        not count as a change (and, e.g., does not restart the schedule timer)."""
+        try:
+            self._value = self._clamp(float(self._var.get()))
+        except (tk.TclError, ValueError):
+            pass
 
     def _clamp(self, value: float) -> float:
         value = min(self._high, max(self._low, value))
@@ -350,7 +370,7 @@ class _HistoryDialog(_Overlay):
 
         ttk.Label(
             f,
-            text="Undoing an older run may partially fail if files have moved since.",
+            text="Files that a newer run moved again are followed and restored too.",
             style="CardHint.TLabel",
         ).pack(anchor="w", pady=(10, 0))
 
@@ -616,10 +636,7 @@ class SimpleOrganizerApp(tk.Tk):
         self.title(f"{APP_TITLE}  v{APP_VERSION}")
         self.minsize(MIN_W, MIN_H)
         self.resizable(True, True)
-
-        w = max(self._settings["window_width"],  MIN_W)
-        h = max(self._settings["window_height"], MIN_H)
-        self.geometry(f"{w}x{h}")
+        self._restore_geometry()
 
         # ── State ─────────────────────────────────────────────────────────────
         _saved_folder = self._settings.get("last_folder", "")
@@ -640,8 +657,11 @@ class SimpleOrganizerApp(tk.Tk):
         self._schedule_pending: bool = False   # a scheduled run is waiting for the app to be idle
         self._close_requested:  bool = False   # window closed while a task was running
         self._native_dialog:    bool = False   # the system folder picker is open
-        self._risky_ok:   set[str] = set()     # unusual folders the user confirmed this session
         self._dnd_enabled:      bool = False
+        self._render_gen:       int  = 0       # bumped to cancel an unfinished tree fill
+        self._task_moves_files: bool = False   # the running task moves files (not a scan)
+        self._schedule_notified: set[str] = set()   # folders whose "paused" toast was shown
+        self._steppers: dict[str, _Stepper] = {}     # settings key -> its number field
 
         self._recursive:      tk.BooleanVar = tk.BooleanVar(
             value=bool(self._settings.get("recursive", False)))
@@ -687,6 +707,98 @@ class SimpleOrganizerApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Configure>", self._on_configure)
         self._poll_queue()
+
+    # =========================================================================
+    # Window geometry
+    # =========================================================================
+
+    def _work_area(self, x: int, y: int) -> tuple[int, int, int, int]:
+        """Usable area (left, top, right, bottom) of the monitor nearest to x, y.
+
+        On Windows this is the monitor's work area (without the taskbar), so a
+        window saved on a monitor that is gone or smaller is moved and shrunk
+        to fit. Elsewhere Tk only knows the whole screen.
+        """
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class MONITORINFO(ctypes.Structure):
+                    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+                user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+                user32.MonitorFromPoint.restype = wintypes.HMONITOR
+                user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+                monitor = user32.MonitorFromPoint(wintypes.POINT(x, y), 2)  # MONITOR_DEFAULTTONEAREST
+                info = MONITORINFO()
+                info.cbSize = ctypes.sizeof(info)
+                if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                    r = info.rcWork
+                    return r.left, r.top, r.right, r.bottom
+            except Exception:  # noqa: BLE001
+                pass
+        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
+
+    def _restore_geometry(self) -> None:
+        """Restore size, position and maximised state, always fitting the screen."""
+        s = self._settings
+        x, y = s.get("window_x"), s.get("window_y")
+        left, top, right, bottom = self._work_area(
+            x if x is not None else 0, y if y is not None else 0)
+        area_w, area_h = max(1, right - left), max(1, bottom - top)
+        # On a screen smaller than the minimum size, the minimum gives way.
+        self.minsize(min(MIN_W, area_w), min(MIN_H, area_h))
+        w = min(max(s["window_width"],  MIN_W), area_w)
+        h = min(max(s["window_height"], MIN_H), area_h)
+        geometry = f"{w}x{h}"
+        if x is not None and y is not None:
+            x = min(max(x, left), right - w)
+            y = min(max(y, top), bottom - h)
+            geometry += f"+{x}+{y}"
+        self.geometry(geometry)
+        if s.get("window_maximized"):
+            self._set_zoomed()
+
+    def _set_zoomed(self) -> None:
+        try:
+            self.state("zoomed")                 # Windows
+        except tk.TclError:
+            try:
+                self.attributes("-zoomed", True)  # X11
+            except tk.TclError:
+                pass
+
+    def _is_zoomed(self) -> bool:
+        try:
+            if self.state() == "zoomed":
+                return True
+        except tk.TclError:
+            pass
+        try:
+            return bool(int(self.attributes("-zoomed")))
+        except (tk.TclError, ValueError):
+            return False
+
+    def _geometry_settings(self) -> dict[str, Any]:
+        """Window values to save. While maximised only the flag changes, so the
+        normal size is not overwritten with the size of the whole screen."""
+        try:
+            if self.state() in ("iconic", "withdrawn"):
+                return {}
+        except tk.TclError:
+            return {}
+        if self._is_zoomed():
+            return {"window_maximized": True}
+        match = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", self.wm_geometry())
+        if not match:
+            return {"window_maximized": False}
+        w, h, x, y = (int(v) for v in match.groups())
+        if w <= 1 or h <= 1:   # not mapped yet
+            return {}
+        return {"window_width": w, "window_height": h, "window_x": x, "window_y": y,
+                "window_maximized": False}
 
     def _load_window_icon(self) -> None:
         """Use icon.png when it ships with the app, otherwise draw one."""
@@ -866,8 +978,16 @@ class SimpleOrganizerApp(tk.Tk):
         self._sched_spin.pack(side="left", padx=8)
         ttk.Label(every, text="minutes", style="CardDim.TLabel").pack(side="left")
 
-        ttk.Label(sched, textvariable=self._schedule_status_var,
-                  style="CardHint.TLabel").pack(anchor="w", pady=(8, 0))
+        ttk.Label(sched, textvariable=self._schedule_status_var, style="CardHint.TLabel",
+                  wraplength=self._px(SIDEBAR_W - 48), justify="left").pack(
+            anchor="w", pady=(8, 0))
+
+        self._steppers = {
+            "max_depth":                 self._max_depth_spin,
+            "max_dirs":                  self._max_dirs_spin,
+            "scan_timeout":              self._timeout_spin,
+            "schedule_interval_minutes": self._sched_spin,
+        }
 
     def _card(self, parent: ttk.Frame, title: str) -> ttk.Frame:
         card = ttk.Frame(parent, style="Card.TFrame", padding=(14, 12, 14, 14))
@@ -1290,10 +1410,17 @@ class SimpleOrganizerApp(tk.Tk):
                 return "break"
             return handler
 
-        self.bind_all("<Control-r>", shortcut(self._start_scan))
-        self.bind_all("<Control-o>", shortcut(self._confirm_and_organize))
-        self.bind_all("<Control-z>", shortcut(self._confirm_and_undo))
-        self.bind_all("<Control-q>", lambda _e: (self._on_close(), "break")[1])
+        def close(_event: Any) -> str:
+            self._on_close()
+            return "break"
+
+        # Both cases: with Caps Lock on, Tk reports Control-R instead of Control-r.
+        for key, handler in (("r", shortcut(self._start_scan)),
+                             ("o", shortcut(self._confirm_and_organize)),
+                             ("z", shortcut(self._confirm_and_undo)),
+                             ("q", close)):
+            self.bind_all(f"<Control-{key}>", handler)
+            self.bind_all(f"<Control-{key.upper()}>", handler)
 
     def _modal_open(self) -> bool:
         return bool(self._overlays) or self._native_dialog
@@ -1352,6 +1479,7 @@ class SimpleOrganizerApp(tk.Tk):
         self._scan_result = None
         self._render_scan_result()   # clears Preview and Duplicates of the old folder
         self._log(f"Folder set: {self._folder}")
+        self._update_schedule_status()
         self._save_settings()
 
     # =========================================================================
@@ -1424,11 +1552,27 @@ class SimpleOrganizerApp(tk.Tk):
         self._save_settings()
 
     def _update_schedule_status(self) -> None:
-        if self._schedule_enabled.get():
+        if not self._schedule_enabled.get():
+            self._schedule_status_var.set("Off")
+        elif risky_folder_reason(self._folder) and not self._is_approved(self._folder):
+            self._schedule_status_var.set(
+                "Paused: this folder needs one manual scan and confirmation first.")
+        else:
             mins = self._num(self._schedule_interval, "schedule_interval_minutes")
             self._schedule_status_var.set(f"Active, runs every {mins} min")
-        else:
-            self._schedule_status_var.set("Off")
+
+    # Unusual folders (see risky_folder_reason) the user agreed to organise.
+    # Stored in settings.json, so automatic runs keep working after a restart.
+
+    def _is_approved(self, folder: Path) -> bool:
+        key = os.path.normcase(str(folder))
+        return any(os.path.normcase(f) == key for f in self._settings.get("approved_folders", []))
+
+    def _approve(self, folder: Path) -> None:
+        if not self._is_approved(folder):
+            self._settings["approved_folders"] = [
+                *self._settings.get("approved_folders", []), str(folder)]
+        self._update_schedule_status()
 
     def _on_schedule_fire(self) -> None:
         self._event_queue.put({"type": "schedule_fire"})
@@ -1455,9 +1599,16 @@ class SimpleOrganizerApp(tk.Tk):
             return
 
         reason = risky_folder_reason(self._folder)
-        if reason and str(self._folder) not in self._risky_ok:
+        if reason and not self._is_approved(self._folder):
             self._log(f"[SCHEDULE]  Skipped -- {self._folder} {reason}. "
                       "Scan it once by hand and confirm to allow automatic runs.")
+            self._update_schedule_status()
+            key = os.path.normcase(str(self._folder))
+            if key not in self._schedule_notified:   # one toast per folder and session
+                self._schedule_notified.add(key)
+                self._notify("Auto-organize paused",
+                             "This folder needs one manual scan and confirmation first.",
+                             "warning")
             return
 
         self._log(f"[SCHEDULE]  Auto-organize triggered for: {self._folder}")
@@ -1635,12 +1786,16 @@ class SimpleOrganizerApp(tk.Tk):
         status: str,
         work: Callable[[Callable[[int, int], None], Callable[[str], None]], dict[str, Any]],
         log_tab: bool = True,
+        moves_files: bool = True,
     ) -> None:
         """Run work(progress, log) on a worker thread and queue its result event.
 
         progress only queues an event when the whole percentage changes, so a
         run over 100 000 files sends ~100 progress events instead of 100 000.
+        moves_files tells the error handler whether a crash may have left the
+        shown scan result out of date.
         """
+        self._task_moves_files = moves_files
         self._set_busy(True)
         self._set_progress(0.0)
         self._status(status)
@@ -1690,15 +1845,16 @@ class SimpleOrganizerApp(tk.Tk):
         value = int(round(value)) if isinstance(default, int) else float(value)
         if commit:
             var.set(value)
+            if key in self._steppers:
+                self._steppers[key].sync()
         return value
 
     def _save_settings(self) -> None:
+        self._settings.update(self._geometry_settings())
         self._settings.update({
             "last_folder":               str(self._folder),
             "staging_mode":              self._use_staging.get(),
             "dark_mode":                 self._dark_mode,
-            "window_width":              self.winfo_width(),
-            "window_height":             self.winfo_height(),
             "schedule_enabled":          self._schedule_enabled.get(),
             "schedule_interval_minutes": self._num(self._schedule_interval, "schedule_interval_minutes"),
             "use_subcategories":         self._use_subcats.get(),
@@ -1731,24 +1887,24 @@ class SimpleOrganizerApp(tk.Tk):
             return
         folder = self._folder
         reason = risky_folder_reason(folder)
-        if reason and str(folder) not in self._risky_ok and not confirmed:
+        if reason and not self._is_approved(folder) and not confirmed:
             if not _askyesno(
                 title="Unusual folder",
                 message=(
                     f"{folder} {reason}.\n\n"
                     "Organising it can move files that programs or the system rely on. "
                     "Everything can be undone, but programs may misbehave until then.\n\n"
-                    "Scan this folder anyway?"
+                    "Scan this folder anyway? Your answer is remembered for this folder, "
+                    "also for automatic runs."
                 ),
                 parent=self,
             ) or self._busy_flag:
                 return
-            self._risky_ok.add(str(folder))
+            self._approve(folder)
 
         self._save_settings()   # persist current scan options before running
-        self._clear_preview()
-        self._clear_duplicates()
         self._scan_result = None
+        self._render_scan_result()   # also cancels a tree fill that is still running
 
         recursive      = self._recursive.get()
         include_hidden = self._include_hidden.get()
@@ -1773,6 +1929,7 @@ class SimpleOrganizerApp(tk.Tk):
                 ),
             },
             log_tab=False,
+            moves_files=False,
         )
 
     def _handle_scan_done(self, result: ScanResult) -> None:
@@ -1824,7 +1981,13 @@ class SimpleOrganizerApp(tk.Tk):
                 self._run_auto_organize(list(actionable))
 
     def _render_scan_result(self) -> None:
-        """Fill the Preview and Duplicates tabs from self._scan_result."""
+        """Fill the Preview and Duplicates tabs from self._scan_result.
+
+        The rows are inserted in slices of _RENDER_BUDGET_S, so even a scan of
+        100 000 files never freezes the window. Every call cancels a fill that
+        is still running from an earlier call.
+        """
+        self._render_gen += 1
         result = self._scan_result
         self._clear_preview()
         self._clear_duplicates()
@@ -1834,12 +1997,23 @@ class SimpleOrganizerApp(tk.Tk):
 
         actionable = self._actionable_plans()
         skipped    = len(result.plans) - len(actionable)
+        self._set_tab_count(self._preview_tab_idx, len(actionable))
+        self._set_tab_count(self._dup_tab_idx, len(result.duplicate_groups))
+        self._fill_trees(self._render_gen, self._tree_rows(result, actionable))
+
+        summary = f"{len(actionable)} to move  ·  {skipped} in place"
+        if result.duplicate_groups:
+            summary += f"  ·  {len(result.duplicate_groups)} duplicate groups"
+        self._summary_var.set(summary)
+        self._refresh_persistent_buttons()
+
+    def _tree_rows(self, result: ScanResult, actionable: list[FilePlan]) -> Iterator[None]:
+        """Insert the Preview and Duplicates rows one by one, yielding after each."""
         for plan in actionable:
             iid = self._preview_tree.insert("", "end",
                 values=(plan.source.name, plan.category, str(plan.destination.parent)))
             self._preview_items[iid] = plan
-        self._set_tab_count(self._preview_tab_idx, len(actionable))
-        self._sync_empty(self._preview_tree, self._preview_empty)
+            yield
 
         # _dup_groups: group_node_iid -> list of file iids in that group
         for group_idx, group in enumerate(result.duplicate_groups, start=1):
@@ -1847,6 +2021,10 @@ class SimpleOrganizerApp(tk.Tk):
                                          values=("", "", ""), open=True,
                                          tags=("group",))
             file_iids: list[str] = []
+            # Registered before its rows exist: while a group is half filled,
+            # selecting its visible rows already counts as "whole group", so
+            # Trash can only become stricter, never let a whole group go.
+            self._dup_groups[node] = file_iids
             for dup in group:
                 iid = self._dup_tree.insert(
                     node, "end",
@@ -1855,15 +2033,21 @@ class SimpleOrganizerApp(tk.Tk):
                 )
                 self._dup_paths[iid] = dup
                 file_iids.append(iid)
-            self._dup_groups[node] = file_iids
-        self._set_tab_count(self._dup_tab_idx, len(result.duplicate_groups))
-        self._sync_empty(self._dup_tree, self._dup_empty)
+                yield
 
-        summary = f"{len(actionable)} to move  ·  {skipped} in place"
-        if result.duplicate_groups:
-            summary += f"  ·  {len(result.duplicate_groups)} duplicate groups"
-        self._summary_var.set(summary)
-        self._refresh_persistent_buttons()
+    def _fill_trees(self, gen: int, rows: Iterator[None]) -> None:
+        """Insert rows for at most _RENDER_BUDGET_S, then continue on the next tick."""
+        if gen != self._render_gen:
+            return   # a newer result replaced this one
+        deadline = time.monotonic() + _RENDER_BUDGET_S
+        for _ in rows:
+            if time.monotonic() >= deadline:
+                # The gap lets Tk redraw: a timer that is already due would
+                # always run before the (idle) redraw and starve it.
+                self.after(_YIELD_MS, self._fill_trees, gen, rows)
+                break
+        self._sync_empty(self._preview_tree, self._preview_empty)
+        self._sync_empty(self._dup_tree, self._dup_empty)
 
     def _prune_scan_result(self) -> None:
         """Drop files that no longer exist (e.g. just trashed) from the scan
@@ -2083,13 +2267,13 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _poll_queue(self) -> None:
         # Handle events for at most _POLL_BUDGET_S, then let Tk redraw; if more
-        # are waiting, come back almost immediately instead of after 50 ms.
+        # are waiting, come back after a short redraw gap instead of after 50 ms.
         deadline = time.monotonic() + _POLL_BUDGET_S
         delay    = 50
         try:
             while True:
                 if time.monotonic() >= deadline:
-                    delay = 1
+                    delay = _YIELD_MS
                     break
                 event = self._event_queue.get_nowait()
                 etype = event["type"]
@@ -2118,6 +2302,11 @@ class SimpleOrganizerApp(tk.Tk):
                     self._status("Error -- see log.")
                     self._log(f"[ERROR]  {event['value']}")
                     closing = self._close_requested
+                    if self._task_moves_files:
+                        # Some files may have moved before the crash: the plan
+                        # shown is out of date and must not be organised again.
+                        self._scan_result = None
+                        self._render_scan_result()
                     self._set_busy(False)
                     if not closing:   # the window is about to close: log only
                         _showerror("Error", event["value"], parent=self)
@@ -2160,6 +2349,10 @@ class SimpleOrganizerApp(tk.Tk):
         self._log_box.configure(state="normal")
         self._log_box.insert("end", time.strftime("%H:%M:%S  "), "time")
         self._log_box.insert("end", message + "\n", _LOG_TAGS.get(prefix, ""))
+        # With the scheduler running for days the log would grow forever.
+        excess = int(self._log_box.index("end-1c").split(".")[0]) - 1 - _LOG_MAX_LINES
+        if excess > 0:
+            self._log_box.delete("1.0", f"{excess + 1}.0")
         self._log_box.see("end")
         self._log_box.configure(state="disabled")
 

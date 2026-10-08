@@ -214,45 +214,70 @@ def safe_expanduser(path_str: str) -> Path:
 # Platform-aware data directory
 # ---------------------------------------------------------------------------
 
+def xdg_base_dir(env_var: str, default: Path) -> Path:
+    """Return $env_var if it holds an absolute path, else default.
+
+    The XDG Base Directory spec says relative values must be ignored.
+    """
+    value = os.environ.get(env_var, "")
+    return Path(value) if value and os.path.isabs(value) else default
+
+
+def _xdg_app_dir(env_var: str, default_base: Path) -> Path:
+    """simple_organizer folder under an XDG base directory.
+
+    Up to v3.4.2 the XDG variables were ignored. If the user has set one and
+    the old folder exists while the new one does not, the old folder keeps
+    being used: its history and staging manifest hold absolute paths, so
+    moving it behind the user's back could orphan staged files.
+    """
+    legacy    = default_base / "simple_organizer"
+    preferred = xdg_base_dir(env_var, default_base) / "simple_organizer"
+    if preferred != legacy and not preferred.exists() and legacy.exists():
+        return legacy
+    return preferred
+
+
 def get_data_dir() -> Path:
     """Return the OS-appropriate data directory for Simple Organizer.
 
-    Linux/macOS : ~/.local/share/simple_organizer
+    Linux/macOS : $XDG_DATA_HOME/simple_organizer (default ~/.local/share/...)
     Windows     : %APPDATA%/simple_organizer
     """
     if sys.platform == "win32":
-        import os
-        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-    else:
-        base = Path.home() / ".local" / "share"
-    return base / "simple_organizer"
-
-
-def get_app_dir() -> Path:
-    """Return the directory containing the running application.
-
-    PyInstaller frozen build : directory of the .exe / binary
-    Source mode              : directory containing this utils.py file
-
-    Used by the scanner to ensure the app never moves its own files.
-    """
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "simple_organizer"
+    return _xdg_app_dir("XDG_DATA_HOME", Path.home() / ".local" / "share")
 
 
 def get_config_dir() -> Path:
-    """Return the directory holding settings.json and rules.json."""
+    """Return the directory holding settings.json and rules.json.
+
+    Linux/macOS : $XDG_CONFIG_HOME/simple_organizer (default ~/.config/...)
+    Windows     : %APPDATA%/simple_organizer
+    """
     if sys.platform == "win32":
         return get_data_dir()
-    return Path.home() / ".config" / "simple_organizer"
+    return _xdg_app_dir("XDG_CONFIG_HOME", Path.home() / ".config")
 
 
 def protected_dirs() -> list[Path]:
-    """Directories the organiser must never move files out of: its own program
-    folder plus the folders holding its settings, history and staging area."""
+    """Folders that are never organised and never entered by a scan.
+
+    Always: the folders holding settings, rules, history and staging.
+    Source mode: the folder with the .py files -- it *is* the program.
+    Frozen build: only the bundle folder (sys._MEIPASS). The folder that
+    merely contains the exe belongs to the user and is organised normally;
+    the exe itself is protected through protected_files().
+    """
+    candidates = [get_data_dir(), get_config_dir()]
+    if getattr(sys, "frozen", False):
+        bundle = getattr(sys, "_MEIPASS", None)
+        if bundle:
+            candidates.append(Path(bundle))
+    else:
+        candidates.append(Path(__file__).parent)
     dirs: list[Path] = []
-    for d in (get_app_dir(), get_data_dir(), get_config_dir()):
+    for d in candidates:
         try:
             d = d.resolve()
         except OSError:
@@ -260,6 +285,17 @@ def protected_dirs() -> list[Path]:
         if d not in dirs:
             dirs.append(d)
     return dirs
+
+
+def protected_files() -> frozenset[str]:
+    """Single files that are never moved (os.path.normcase'd): the running executable."""
+    if not getattr(sys, "frozen", False):
+        return frozenset()
+    try:
+        exe = Path(sys.executable).resolve()
+    except OSError:
+        exe = Path(sys.executable)
+    return frozenset({os.path.normcase(str(exe))})
 
 
 def is_inside(path: Path, folder: Path) -> bool:
@@ -270,8 +306,9 @@ def is_inside(path: Path, folder: Path) -> bool:
 def risky_folder_reason(folder: Path) -> str | None:
     """Explain why organising folder could break something, or None if it looks safe.
 
-    Flags drive roots, the home folder itself, program/system folders, the
-    folders where programs keep their settings, and Git repositories.
+    Flags drive roots, the home folder itself and the folder holding all home
+    folders (C:\\Users, /home), program/system folders, the folders where
+    programs keep their settings, and Git repositories.
     """
     try:
         p = folder.resolve()
@@ -289,6 +326,8 @@ def risky_folder_reason(folder: Path) -> str | None:
         pass
     if p == home:
         return "is your home folder"
+    if p == home.parent:
+        return "contains the home folders of all users"
     if home in p.parents:
         for name in (".config", ".local", ".cache", "AppData"):
             d = home / name
