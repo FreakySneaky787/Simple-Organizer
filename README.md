@@ -8,7 +8,7 @@ Safe, automatic file organisation for Linux and Windows — with sub-categories,
 
 ## Table of Contents
 
-- [What's New in v3.4.3](#whats-new-in-v343)
+- [What's New in v3.4.4](#whats-new-in-v344)
 - [Downloads](#downloads)
 - [Features](#features)
 - [Safety Guarantees](#safety-guarantees)
@@ -25,47 +25,62 @@ Safe, automatic file organisation for Linux and Windows — with sub-categories,
 
 ---
 
-## What's New in v3.4.3
+## What's New in v3.4.4
 
 ### Bug-Fix Release
 
-v3.4.3 fixes all 15 issues found in a review of v3.4.2 (#14 – #28), including one regression. Updating is recommended — especially if you keep `simple_organizer.exe` inside the folder you organise.
+v3.4.4 fixes all 23 issues from the third review (#29 – #51). The most important ones could leave stray copies of files behind, mix up the undo history, or move files that should stay where they are. Updating is recommended for everyone.
 
-**Safety & data**
+**Never lose track of a file**
 
-- **The folder that contains the exe could not be organised** (#14, regression in v3.4.2) — the whole folder was refused as "belongs to Simple Organizer itself". Now only the exe itself is left alone and the folder is organised normally. The settings, history and staging folders stay fully protected.
-- **The duplicate check downloaded OneDrive files** (#15) — "online-only" cloud files (OneDrive, Dropbox, iCloud) were read for hashing, which downloads them. They are now skipped and counted in the log.
-- **Undoing runs out of order left files in the wrong place** (#25) — when a newer run had moved a file again, undoing the older run skipped it. Undo now follows the file to where it is and restores it to its original location.
-- **Organize stayed enabled with an outdated plan after a crash** (#21) — after a task that moves files fails unexpectedly, the preview is cleared so you scan again first.
-- **No warning for `C:\Users` or `/home`** (#23) — the folder that holds all users' home folders now asks for confirmation like other unusual folders.
+- **Moves across drives left orphaned copies** (#29) — when a file was copied to another drive (e.g. into the staging area) but the original could not be deleted because it was open, the copy stayed behind, unknown to Commit, Revert and Undo. Now the copy is removed again and the error is reported; a copy also never overwrites an existing file.
+- **Two running instances overwrote each other's staging and history** (#30) — Simple Organizer now runs only once. Starting it again brings the open window to the front.
+- **Commit / Revert recreated a renamed or deleted folder** (#35) — if the scanned folder no longer exists, the files stay staged with a clear error instead of a resurrected folder tree.
+- **A category folder that is a link moved files out of the folder** (#43) — if e.g. `Images` is a junction or symlink to another place, those files are not planned and the scan says why.
+- **Shortcuts were moved and disappeared from the Desktop** (#41) — `.lnk`, `.url`, `.desktop` and `.webloc` files are never moved.
 
-**Scheduler**
+**Undo history**
 
-- **Scheduled runs silently stopped after a restart** (#24) — your "scan anyway" answer for an unusual folder is now remembered, also for automatic runs. If a run is paused because a folder still needs that confirmation, the Auto-organize card and a notification say so.
-- **The schedule timer restarted after an automatic correction** (#26) — e.g. after an out-of-range interval was corrected.
+- **Scheduled runs pushed manual runs out of the history** (#31) — manual and automatic runs are now limited separately (20 each), and History marks automatic runs.
+- **"Undo last" depended on the system clock** (#45) — runs are numbered, so a wrong or jumping clock (e.g. dual boot) can no longer reorder them.
+- **Undo could not follow a file after the newer run was trimmed** (#38) — runs dropped from the undo list are kept for a while (`history/trimmed/`), so undo still finds the file.
+- **Undo from History started without asking** (#32) — it now asks for confirmation, like Undo last.
 
-**Performance**
+**OneDrive & cloud files**
 
-- **The window froze while showing very large scans** (#16) — Preview and Duplicates are now filled in small slices, so the window stays responsive.
-- **The log grew without limit** (#17) — it now keeps the newest 5 000 lines.
-- **The UI stuttered after every task** (#18) — button states no longer read every history file.
+- **Staging mode downloaded online-only files** (#33) — moving them out of the OneDrive folder into the staging area would download them; they now stay where they are, with a note in the log.
 
-**Usability**
+**Errors are visible**
 
-- **Shortcuts did not work with Caps Lock on** (#22).
-- **Window size and position** (#27) — a maximised window no longer overwrites the normal size with the screen size. Position and maximised state are remembered, and the window is moved and shrunk to fit if the monitor changed.
+- **Errors in the exe vanished silently** (#42) — unexpected errors are now shown as a notification, written to the log and to `error.log` in the data folder.
+- **The trash confirmation could hide behind the window** (#46) — Windows' Recycle Bin dialogs now open above Simple Organizer.
+- **Dialogs could end up behind the main window** (#34) — dialogs and notifications are now owned by the main window and always stay above it.
 
-**Linux**
+**Sorting**
 
-- **Trash on USB sticks and other partitions** (#28) — the built-in Trash fallback now uses the drive's own trash (`.Trash-<uid>`) instead of copying the file into the home folder.
-- **`XDG_CONFIG_HOME` and `XDG_DATA_HOME` are honoured** (#28) — an existing folder in the old location keeps being used, so nothing gets lost.
+- **New categories and file types** (#47) — iPhone photos (`.heic`, `.heif`), `.avif`, `.jxl`; e-books and e-mails (`.epub`, `.mobi`, `.eml`, `.msg`); Office macro files (`.docm`, `.xlsm`, `.pptm`); a new **Programs** category (`.exe`, `.msi`, `.dmg`, `.pkg`, `.apk`, `.appimage`, `.deb`, `.rpm`, `.flatpakref`) and **Disk Images** (`.iso`, `.img`).
+- **`.ts` videos were sorted as TypeScript** (#44) — MPEG transport stream videos are detected by their content and go to `Videos/TS` (also `.m2ts`, `.mts`).
+- **A file named like a category folder** (#37) — e.g. a file called `Documents` no longer causes one error per PDF; the scan reports the conflict once.
+- **Hard links were reported as duplicates** (#40) — several links to the same file are counted once.
 
-**Project**
+**Smaller fixes**
 
-- **The README promised a Linux build that does not exist** (#19) — Downloads and Installation now explain how to run Simple Organizer on Linux (from source or self-built).
-- **Building from source failed** (#20) — `icon.png` and `icon.ico` are now in the repository.
+- **Auto-organize ran silently into a missing folder** (#48) — the card shows "Paused: the folder was not found" and a notification appears once.
+- **Ctrl+Z in a number field opened Undo** (#36) — it no longer does.
+- **Settings write failures flooded the log** (#49) — reported once.
+- **A damaged `rules.json` could be overwritten** (#50) — if it cannot be backed up, the Rules tab refuses to save instead.
+- **Window position on Linux/X11** (#39) — only Windows restores the window position; on Linux the window manager places the window, so it no longer creeps down on every start.
+- **Dead code removed** (#51).
 
 No new dependencies — still Python standard library only.
+
+### Previously in v3.4.3 — Bug-Fix Release
+
+- The folder that contains the exe is organised again (only the exe is skipped)
+- Online-only OneDrive files are not downloaded by the duplicate check
+- Large scans fill Preview and Duplicates in slices; the log keeps 5 000 lines
+- Undo follows files that a newer run moved again; confirmed unusual folders are remembered
+- Window size, position and maximised state are remembered; Linux per-volume trash and XDG directories
 
 ### Previously in v3.4.2 — Safety & Reliability Release
 
@@ -95,12 +110,12 @@ No new dependencies — still Python standard library only.
 
 ## Downloads
 
-### Latest — v3.4.3
+### Latest — v3.4.4
 
 | Platform | File |
 |---|---|
-| Windows 10/11 | `simple_organizer_windows_v3.4.3.zip` |
-| Windows 10/11 | `simple_organizer_windows_v3.4.3.sha256` |
+| Windows 10/11 | `simple_organizer_windows_v3.4.4.zip` |
+| Windows 10/11 | `simple_organizer_windows_v3.4.4.sha256` |
 | Linux x86-64 | No prebuilt binary on GitHub — [run it from source](#linux) or [build your own](#developer-mode-run-from-source) |
 
 → [GitHub Releases](https://github.com/FreakySneaky787/Simple-Organizer/releases)
@@ -126,7 +141,8 @@ No new dependencies — still Python standard library only.
 - Online-only cloud files (OneDrive, Dropbox, iCloud) are never downloaded — they are left out of the duplicate check
 - Category folders (`Images`, `Documents`, …) are only skipped directly inside the scanned folder
 - Git repositories inside a recursive scan are left alone as a whole
-- Never moved: system files, Office lock files and downloads that are still running
+- Never moved: system files, shortcuts (`.lnk`, `.url`, `.desktop`, `.webloc`), Office lock files and downloads that are still running
+- Category folders that are links pointing outside the scanned folder, or blocked by a file with the same name, are reported instead of used
 - Unusual folders (drive root, home, the folder holding all home folders, system/program folders, Git repositories) need confirmation once
 - All scan options remembered between sessions
 
@@ -134,12 +150,14 @@ No new dependencies — still Python standard library only.
 
 | Category | Extensions |
 |---|---|
-| Images | jpg, jpeg, png, gif, webp, bmp, tiff, svg, ico, psd, xcf, kra, raw, cr2, nef, arw, dng |
-| Documents | pdf, docx, doc, txt, odt, rtf, xlsx, xls, ods, pptx, ppt, odp, pps, ppsx, csv, md |
+| Images | jpg, jpeg, png, gif, webp, bmp, tiff, heic, heif, avif, jxl, svg, ico, psd, xcf, kra, raw, cr2, nef, arw, dng |
+| Documents | pdf, docx, docm, doc, txt, odt, rtf, xlsx, xlsm, xls, ods, pptx, pptm, ppt, odp, pps, ppsx, csv, md, epub, mobi, eml, msg |
 | Archives | zip, tar, gz, rar, 7z, bz2, xz, tgz |
-| Videos | mp4, mkv, mov, avi, wmv, flv, webm, m4v, mpeg, mpg |
+| Videos | mp4, mkv, mov, avi, wmv, flv, webm, m4v, mpeg, mpg, m2ts, mts, and `.ts` files that are MPEG transport streams |
 | Music | mp3, wav, flac, aac, ogg, wma, m4a, opus, aiff |
-| Code | py, ipynb, js, ts, jsx, tsx, html, css, cpp, c, h, java, rb, go, rs, php, sh, bash, json, yaml, toml, xml, sql, swift, kt, dart |
+| Code | py, ipynb, js, ts (TypeScript), jsx, tsx, html, css, cpp, c, h, java, rb, go, rs, php, sh, bash, json, yaml, toml, xml, sql, swift, kt, dart |
+| Programs | exe, msi, dmg, pkg, apk, appimage, deb, rpm, flatpakref |
+| Disk Images | iso, img |
 | Others | Everything else |
 
 ### Sub-Categories (Toggle)
@@ -150,10 +168,12 @@ Enable **Use sub-categories** to sort into sub-folders inside each category. Off
 Images/Photos/        Images/Raw/         Images/Editing/
 Documents/PDFs/       Documents/Word/     Documents/Spreadsheets/
 Documents/Presentations/                  Documents/Text/
+Documents/Ebooks/     Documents/Email/
 Music/Lossless/       Music/MP3/          Music/AAC/
-Videos/MP4/           Videos/MKV/
+Videos/MP4/           Videos/MKV/         Videos/TS/
 Archives/ZIP/         Archives/RAR/       Archives/TAR/
 Code/Python/          Code/JavaScript/    Code/Web/
+Programs/Windows/     Programs/macOS/     Programs/Linux/     Programs/Android/
 ```
 
 ### Rules Engine
@@ -182,24 +202,28 @@ Files move to a temporary area first. Inspect, then **Commit** or **Revert**.
 
 Organising several times before committing is fine — every batch is added to the staging area. If some files fail to commit or revert, they stay staged so you can retry.
 
+- If the scanned folder was renamed, moved or deleted in the meantime, Commit and Revert leave those files staged with an error instead of recreating the old folder.
+- Online-only cloud files (OneDrive …) are not staged, because moving them out of the cloud folder would download them. Organise without staging to sort them.
+
 ### Multi-Level Undo
 
-**Undo Last Run** reverses the newest run in History. **History** lists the last 20 runs (local time) — undo any specific one.
+**Undo Last Run** reverses the newest run in History. **History** lists the last 20 manual and the last 20 automatic runs (local time, automatic runs are marked) — undo any specific one after a confirmation.
 
 - Files that cannot be restored stay in the history entry for another try
 - Empty category folders created by the run are removed again
 - The history is written during the run, so it survives crashes
-- Runs can be undone in any order: a file that a newer run moved again is followed and restored to its original place
+- Runs can be undone in any order: a file that a newer run moved again is followed and restored to its original place — even when that newer run has already dropped out of the list
+- Runs are numbered, so the order never depends on the system clock
 
 ### Auto-Organize Scheduler
 
 Fixed-interval automatic organise runs (1–1440 minutes). Stops when the app closes. Never runs as a system service. Runs wait while another task or a dialog is open; slots missed during sleep are skipped.
 
-Unusual folders (drive root, home, `C:\Users` / `/home`, system folders, Git repositories) are only organised automatically after you scanned them once by hand and confirmed. That answer is remembered. Until then the Auto-organize card shows "Paused" and a notification explains why.
+Unusual folders (drive root, home, `C:\Users` / `/home`, system folders, Git repositories) are only organised automatically after you scanned them once by hand and confirmed. That answer is remembered. Until then — and while the folder cannot be found, e.g. an unplugged drive — the Auto-organize card shows "Paused" and a notification explains why.
 
 ### Duplicate Detection + Deletion
 
-Two-stage: size buckets then SHA-256. Empty files, files over 500 MB and online-only cloud files are skipped. Select duplicates in the **Duplicates** tab and move them to Trash with one click. At least one file per group is always kept. Nothing is permanently deleted — files on network drives, which have no Recycle Bin, are left in place. Click anywhere on a group row to expand or collapse it.
+Two-stage: size buckets then SHA-256. Empty files, files over 500 MB and online-only cloud files are skipped; several hard links to one file count as one file. Select duplicates in the **Duplicates** tab and move them to Trash with one click. At least one file per group is always kept. Nothing is permanently deleted — files on network drives, which have no Recycle Bin, are left in place. Click anywhere on a group row to expand or collapse it.
 
 ### Context Menus
 
@@ -209,9 +233,13 @@ Right-click any row in the Preview or Duplicates tab to open the folder or copy 
 
 Drop a folder (or a file, to use its folder) on the path field. Needs `tkinterdnd2` — see [Known Limitations](#known-limitations).
 
+### Error Reports
+
+Unexpected errors are shown as a notification and written to the log and to `error.log` in the data folder (see [Where Data Is Stored](#where-data-is-stored)). Please attach that file when you report a bug.
+
 ### Persistent Settings
 
-Remembers last folder, theme, all scan options, staging mode, sub-categories, scheduler state, confirmed unusual folders, and window size, position and maximised state between sessions. If the monitor changed, the window is moved and shrunk to fit. Damaged values fall back to defaults.
+Remembers last folder, theme, all scan options, staging mode, sub-categories, scheduler state, confirmed unusual folders, and window size, maximised state and (on Windows) position between sessions. If the monitor changed, the window is moved and shrunk to fit. Damaged values fall back to defaults.
 
 ---
 
@@ -220,14 +248,16 @@ Remembers last folder, theme, all scan options, staging mode, sub-categories, sc
 | Guarantee | How enforced |
 |---|---|
 | No permanent deletion | Duplicates go to system Trash only — never `os.remove()`; drives without a Recycle Bin are refused or warned about |
-| No overwrites | `resolve_conflict()` runs before every move |
-| Files stay inside the folder | Rule targets validated in the dialog and again during every scan |
+| No overwrites | `resolve_conflict()` runs before every move; copies across drives never overwrite |
+| No stray copies | A move across drives that cannot delete the original removes its copy again |
+| One instance | A second start only brings the running window to the front |
+| Files stay inside the folder | Rule and category targets checked during every scan, links pointing outside are refused |
 | Every move confirmed | Only scheduled runs skip the dialog; auto-mode can't leak into manual scans |
 | One task at a time | Buttons and shortcuts blocked while a task runs or a dialog is open |
 | Undo record survives crashes | History and staging manifest written during the run, atomically |
 | Closing is safe | The window waits for a running task before it closes |
 | No link traversal | Symlinks and junctions are never followed |
-| No system files | System files, lock files and running downloads are never moved |
+| No system files | System files, shortcuts, lock files and running downloads are never moved |
 | No system dirs | `/proc` and `/sys` hard-excluded; system/program folders need confirmation |
 | Bounded scans | Hard limits on depth, folder count, and time |
 | Self-protection | Settings, history and staging folders are never organised; the exe is never moved |
@@ -269,11 +299,11 @@ To get a single executable file, build it yourself — see [Developer Mode](#dev
 
 ### Windows
 
-1. Download and extract `simple_organizer_windows_v3.4.3.zip`
+1. Download and extract `simple_organizer_windows_v3.4.4.zip`
 2. Double-click `simple_organizer.exe`
 3. If Windows Defender warns: right-click → **Properties** → **Unblock**
 
-Settings, rules and history from older versions are kept and used automatically.
+Settings, rules and history from older versions are kept and used automatically. Simple Organizer runs only once at a time — starting it again brings the open window to the front.
 
 ---
 
@@ -282,8 +312,8 @@ Settings, rules and history from older versions are kept and used automatically.
 The `.sha256` file is a checksum of the exe — not the zip archive.
 
 ```powershell
-# Windows — compare with the hash in simple_organizer_windows_v3.4.3.sha256
-Get-FileHash simple_organizer_windows_v3.4.3\simple_organizer.exe -Algorithm SHA256
+# Windows — compare with the hash in simple_organizer_windows_v3.4.4.sha256
+Get-FileHash simple_organizer_windows_v3.4.4\simple_organizer.exe -Algorithm SHA256
 ```
 
 ---
@@ -315,7 +345,7 @@ Get-FileHash simple_organizer_windows_v3.4.3\simple_organizer.exe -Algorithm SHA
 |---|---|
 | `Ctrl+R` | Scan |
 | `Ctrl+O` | Organize |
-| `Ctrl+Z` | Undo last run |
+| `Ctrl+Z` | Undo last run (not while typing in a number field) |
 | `Ctrl+Q` | Quit (waits for a running task) |
 
 Shortcuts do nothing while a task is running or a dialog is open.
@@ -330,10 +360,11 @@ Shortcuts do nothing while a task is running or a dialog is open.
 | Rules | `$XDG_CONFIG_HOME/simple_organizer/rules.json` | `%APPDATA%\simple_organizer\rules.json` |
 | Undo history | `$XDG_DATA_HOME/simple_organizer/history/` | `%APPDATA%\simple_organizer\history\` |
 | Staging | `$XDG_DATA_HOME/simple_organizer/staging/` | `%APPDATA%\simple_organizer\staging\` |
+| Error report | `$XDG_DATA_HOME/simple_organizer/error.log` | `%APPDATA%\simple_organizer\error.log` |
 
 > On Linux `$XDG_CONFIG_HOME` defaults to `~/.config` and `$XDG_DATA_HOME` to `~/.local/share`. If you set them after using v3.4.2 or older, the existing folders in the default locations keep being used so nothing gets lost — move them yourself if you want.
 >
-> The newest file in `history/` is the last run. A `last_run.json` from v3.4.0 or older is migrated automatically.
+> The highest-numbered file in `history/` is the last run; `history/trimmed/` keeps runs that dropped out of the undo list, so undo can still follow files they moved. A `last_run.json` from v3.4.0 or older is migrated automatically.
 
 ---
 

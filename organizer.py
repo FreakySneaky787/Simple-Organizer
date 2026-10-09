@@ -3,7 +3,7 @@
 import hashlib
 import json
 import os
-import shutil
+import re
 import stat
 import subprocess
 import sys
@@ -23,11 +23,13 @@ from utils import (
     get_category,
     get_subcategory,
     get_data_dir,
+    is_cloud_placeholder,
     is_inside,
     is_transient_file,
     protected_dirs,
     protected_files,
     resolve_conflict,
+    safe_move,
     xdg_base_dir,
 )
 from rules import RulesReadError, load_rules, apply_rules, is_safe_target_folder
@@ -41,7 +43,11 @@ STAGING_DIR           = DATA_DIR / "staging"
 LAST_RUN_FILE         = DATA_DIR / "last_run.json"
 STAGING_MANIFEST_FILE = DATA_DIR / "staging_manifest.json"
 HISTORY_DIR           = DATA_DIR / "history"
-MAX_HISTORY           = 20
+# Runs dropped from the undo list are kept here for a while, so undoing an
+# older run can still follow a file that one of them moved again.
+TRIMMED_DIR           = HISTORY_DIR / "trimmed"
+MAX_HISTORY           = 20    # undoable runs kept -- separately for manual and scheduled runs
+MAX_TRIMMED           = 200
 
 # Journals (history run / staging manifest) are rewritten at most this often
 # while files are being moved, so a crash or power cut mid-run still leaves a
@@ -72,6 +78,31 @@ def _is_safe_rule_target(root_resolved: Path, target: str) -> bool:
     return resolved != root_resolved and root_resolved in resolved.parents
 
 
+def _target_problem(root: Path, target_dir: Path) -> str | None:
+    """Why files must not be moved into target_dir (a folder below root), or None.
+
+    Checks every folder between root and target_dir: a *file* with a folder's
+    name makes creating the folder fail for every single file, and a link or
+    junction that leads outside root would move the files out of the scanned
+    folder -- possibly onto another drive.
+    """
+    rel = target_dir.relative_to(root)
+    current = root
+    for part in rel.parts:
+        current = current / part
+        if current.exists() and not current.is_dir():
+            return (f"a file named '{current.name}' blocks the folder '{rel.as_posix()}' "
+                    "-- rename or move that file")
+    try:
+        resolved = target_dir.resolve()
+    except (OSError, RuntimeError) as exc:
+        return f"the folder '{rel.as_posix()}' cannot be resolved ({exc})"
+    if not is_inside(resolved, root):
+        return (f"the folder '{rel.as_posix()}' is a link that points outside the scanned "
+                f"folder ({resolved})")
+    return None
+
+
 def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -87,24 +118,6 @@ def _now_iso() -> str:
 
 _CHUNK_SIZE:           int = 65_536
 DEFAULT_MAX_HASH_SIZE: int = 500 * 1024 * 1024
-
-# Windows attributes of files whose content is not on the disk: OneDrive /
-# Dropbox / iCloud "online-only" placeholders and offline storage. Reading such
-# a file downloads (recalls) it, so it is never hashed.
-_FILE_ATTRIBUTE_OFFLINE               = 0x0000_1000
-_FILE_ATTRIBUTE_RECALL_ON_OPEN        = 0x0004_0000
-_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x0040_0000
-_NOT_LOCAL_ATTRIBUTES = (_FILE_ATTRIBUTE_OFFLINE | _FILE_ATTRIBUTE_RECALL_ON_OPEN
-                         | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
-
-
-def is_cloud_placeholder(st: os.stat_result) -> bool:
-    """True if the file's content is only in the cloud (or offline storage).
-
-    st_file_attributes only exists on Windows; elsewhere this is always False.
-    """
-    return bool(getattr(st, "st_file_attributes", 0) & _NOT_LOCAL_ATTRIBUTES)
-
 
 def _sha256(path: Path) -> str | None:
     """Return SHA-256 hex digest of path, or None on any read error."""
@@ -126,6 +139,7 @@ def find_duplicates(
     deadline: float | None = None,
     log_callback: Callable[[str], None] | None = None,
     skipped_cloud: list[Path] | None = None,
+    hard_links: list[Path] | None = None,
 ) -> list[list[Path]]:
     """Return groups of byte-identical files (2+ members each).
 
@@ -134,10 +148,13 @@ def find_duplicates(
     e.g. empty __init__.py files would break projects. Cloud placeholders
     (OneDrive "online-only" etc.) are never read -- that would download them --
     and are appended to skipped_cloud. Files larger than max_hash_size are
-    skipped and appended to skipped_large. Hashing stops at deadline
-    (time.monotonic() value); groups found so far are still correct.
+    skipped and appended to skipped_large. Hard links of one file are the same
+    file, not duplicates: only the first path is checked, the others are
+    appended to hard_links. Hashing stops at deadline (time.monotonic()
+    value); groups found so far are still correct.
     """
     size_buckets: dict[int, list[Path]] = defaultdict(list)
+    seen_files: set[tuple[int, int]] = set()
     for f in files:
         try:
             st = f.stat()
@@ -146,6 +163,13 @@ def find_duplicates(
         sz = st.st_size
         if sz == 0:
             continue
+        if st.st_ino:   # 0 on file systems without file IDs: cannot tell, keep it
+            file_id = (st.st_dev, st.st_ino)
+            if file_id in seen_files:
+                if hard_links is not None:
+                    hard_links.append(f)
+                continue
+            seen_files.add(file_id)
         if is_cloud_placeholder(st):
             if skipped_cloud is not None:
                 skipped_cloud.append(f)
@@ -190,6 +214,7 @@ class FilePlan:
     category:    str   # may be "Images/Photos" when subcategories are on
     skipped:     bool = False
     size:        int  = 0
+    root:        Path | None = None   # the scanned folder the plan belongs to
 
 
 @dataclass
@@ -471,13 +496,16 @@ def scan_folder(
     if left_alone[0]:
         result.notes.append(
             f"[SKIP]  {_plural(left_alone[0], 'file', 'files')} left alone: system files, "
-            "temporary files or downloads that are still in progress.")
+            "shortcuts, temporary files or downloads that are still in progress.")
 
     result.total_files = len(all_files)
     if result.total_files == 0:
         return result
 
     unsafe_targets: set[str] = set()
+    # target folder -> problem (None = fine); checked once per folder, not per file
+    target_problems: dict[Path, str | None] = {}
+    blocked: dict[Path, int] = defaultdict(int)
     last_pct = -1
 
     for idx, file_path in enumerate(all_files, start=1):
@@ -511,6 +539,12 @@ def scan_folder(
                 target_dir  = root / category
                 display_cat = category
 
+            if target_dir not in target_problems:
+                target_problems[target_dir] = _target_problem(root, target_dir)
+            if target_problems[target_dir]:
+                blocked[target_dir] += 1
+                continue
+
             destination    = target_dir / file_path.name
             already_placed = (file_path.parent == target_dir)
             try:
@@ -526,9 +560,14 @@ def scan_folder(
                 category=display_cat,
                 skipped=already_placed,
                 size=size,
+                root=root,
             ))
         except Exception as exc:  # noqa: BLE001
             result.errors.append(f"Error processing {file_path.name}: {exc}")
+
+    for target_dir, count in blocked.items():
+        result.errors.append(
+            f"{_plural(count, 'file', 'files')} not planned: {target_problems[target_dir]}.")
 
     if status_callback:
         status_callback("Detecting duplicates...")
@@ -536,6 +575,7 @@ def scan_folder(
 
     skipped_large: list[Path] = []
     skipped_cloud: list[Path] = []
+    hard_links:    list[Path] = []
     dup_last = [-1]
 
     def dup_progress(current: int, total: int) -> None:
@@ -552,6 +592,7 @@ def scan_folder(
             deadline=time.monotonic() + max(60.0, scan_timeout * 10),
             log_callback=note,
             skipped_cloud=skipped_cloud,
+            hard_links=hard_links,
         )
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"Duplicate detection error: {exc}")
@@ -563,6 +604,10 @@ def scan_folder(
         result.notes.append(
             f"[SKIP]  {_plural(len(skipped_large), 'file', 'files')} larger than "
             f"{DEFAULT_MAX_HASH_SIZE // (1024 * 1024)} MB not checked for duplicates.")
+    if hard_links:
+        result.notes.append(
+            f"[SKIP]  {_plural(len(hard_links), 'hard link', 'hard links')} to a file already "
+            "checked -- the same file, not a duplicate.")
 
     report(1.0)
     if status_callback:
@@ -608,8 +653,14 @@ def organise_files(
     progress_callback: Callable[[int, int], None] | None = None,
     log_callback:      Callable[[str], None]       | None = None,
     staging:           bool = False,
+    scheduled:         bool = False,
 ) -> list[str]:
-    """Execute planned file moves. Files are NEVER deleted or overwritten."""
+    """Execute planned file moves. Files are NEVER deleted or overwritten.
+
+    scheduled marks the history run as an automatic one; automatic and manual
+    runs are limited separately, so the scheduler cannot push manual runs out
+    of the undo history.
+    """
     _ensure_data_dir()
 
     errors:       list[str]           = []
@@ -644,11 +695,13 @@ def organise_files(
         else:
             run_path = _write_history_run({
                 "timestamp":    timestamp,
+                "scheduled":    scheduled,
                 "moves":        [{"src": m["src"], "dst": m["dst"]} for m in move_log],
                 "created_dirs": created_dirs,
-            }, log_callback, path=run_path)
+            }, log_callback, path=run_path, scheduled=scheduled)
 
     last_flush = time.monotonic()
+    left_in_cloud = 0
 
     for idx, plan in enumerate(actionable, start=1):
         if progress_callback:
@@ -656,6 +709,15 @@ def organise_files(
 
         try:
             if staging:
+                # The staging area is outside the scanned folder. Moving an
+                # online-only cloud file (OneDrive...) out of its sync folder
+                # makes Windows download it first, so such files stay put.
+                if is_cloud_placeholder(plan.source.stat()):
+                    left_in_cloud += 1
+                    if log_callback:
+                        log_callback(f"[SKIP]  {plan.source.name} is online-only (e.g. OneDrive) "
+                                     "-- not staged, so it is not downloaded.")
+                    continue
                 actual_dest = STAGING_DIR / Path(plan.category) / plan.source.name
                 actual_dest.parent.mkdir(parents=True, exist_ok=True)
             else:
@@ -663,12 +725,13 @@ def organise_files(
                 _mkdir_tracked(actual_dest.parent, created_dirs)
 
             safe_dest = resolve_conflict(actual_dest)
-            shutil.move(str(plan.source), str(safe_dest))
+            safe_move(plan.source, safe_dest)
 
             move_log.append({
                 "src":       str(plan.source),
                 "dst":       str(safe_dest),
                 "final_dst": str(plan.destination),
+                "root":      str(plan.root) if plan.root else "",
             })
 
             tag = "[STAGED]" if staging else "[MOVED]"
@@ -680,11 +743,6 @@ def organise_files(
 
         except PermissionError as exc:
             err = f"[ERROR]  Permission denied moving {plan.source.name}: {exc}"
-            errors.append(err)
-            if log_callback:
-                log_callback(err)
-        except shutil.Error as exc:
-            err = f"[ERROR]  shutil error for {plan.source.name}: {exc}"
             errors.append(err)
             if log_callback:
                 log_callback(err)
@@ -700,6 +758,9 @@ def organise_files(
 
     # Only written when at least one file was actually moved / staged.
     write_journal()
+    if left_in_cloud and log_callback:
+        log_callback(f"[WARN]  {_plural(left_in_cloud, 'online-only file was', 'online-only files were')} "
+                     "not staged. Organise without staging mode to sort them without downloading.")
     return errors
 
 
@@ -709,33 +770,96 @@ def organise_files(
 
 # The newest history/run_*.json is "the last run" -- there is no separate
 # last_run.json any more, so "Undo last" and History can never disagree.
+#
+# Since v3.4.4 run files are named run_<sequence>_<UTC time>[_auto].json and
+# ordered by the sequence number, never by the clock: a wrong or jumping system
+# clock (e.g. dual boot) cannot make "Undo last" pick an older run. Files from
+# older versions (run_<UTC time>.json) sort before all numbered ones.
+
+_SEQ_NAME = re.compile(r"^(?:run|undone)_(\d{8})_")
+
+
+def _run_seq(path: Path) -> int | None:
+    match = _SEQ_NAME.match(path.name)
+    return int(match.group(1)) if match else None
+
+
+def _run_sort_key(path: Path) -> tuple[int, int, str]:
+    seq = _run_seq(path)
+    return (1, seq, path.name) if seq is not None else (0, 0, path.name)
+
+
+def _sorted_runs(directory: Path | None = None, prefix: str = "run_") -> list[Path]:
+    """History files in directory (default HISTORY_DIR), oldest first."""
+    directory = directory or HISTORY_DIR
+    return sorted(directory.glob(f"{prefix}*.json"), key=_run_sort_key)
+
+
+def _is_scheduled_run(path: Path) -> bool:
+    return path.stem.endswith("_auto")
+
+
+def _next_seq() -> int:
+    seqs = [_run_seq(f) for f in (*HISTORY_DIR.glob("run_*.json"), *HISTORY_DIR.glob("undone_*.json"),
+                                  *TRIMMED_DIR.glob("run_*.json"))]
+    return max((s for s in seqs if s is not None), default=0) + 1
+
+
+def _trim_runs(log_callback: Callable[[str], None] | None = None) -> None:
+    """Keep the newest MAX_HISTORY manual and MAX_HISTORY scheduled runs undoable.
+
+    Older runs are moved to TRIMMED_DIR rather than deleted, so undoing a
+    remaining run can still follow a file that one of them moved again; only
+    the oldest beyond MAX_TRIMMED are deleted.
+    """
+    runs = _sorted_runs()
+    for scheduled in (False, True):
+        excess = [r for r in runs if _is_scheduled_run(r) == scheduled][:-MAX_HISTORY]
+        for old in excess:
+            try:
+                TRIMMED_DIR.mkdir(parents=True, exist_ok=True)
+                old.replace(TRIMMED_DIR / old.name)
+            except OSError as exc:
+                if log_callback:
+                    log_callback(f"[WARN]  Could not trim old history file: {exc}")
+        if excess and not scheduled and log_callback:
+            log_callback(f"[WARN]  {_plural(len(excess), 'old run', 'old runs')} dropped from the "
+                         f"undo history -- the newest {MAX_HISTORY} manual runs stay undoable.")
+    if TRIMMED_DIR.exists():
+        for old in _sorted_runs(TRIMMED_DIR)[:-MAX_TRIMMED]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
 
 def _write_history_run(
     run_data: dict,
     log_callback: Callable[[str], None] | None = None,
     when: datetime | None = None,
     path: Path | None = None,
+    scheduled: bool = False,
 ) -> Path | None:
     """Write a history run file and return its path.
 
-    Without path a new timestamped file is created and the oldest runs beyond
-    MAX_HISTORY are trimmed; with path that file is rewritten (journal flush).
+    Without path a new numbered file is created and old runs are trimmed; with
+    path that file is rewritten (journal flush). when is only given when a
+    run from an old version is migrated: it keeps the old naming so it sorts
+    among the old runs.
     """
     try:
         HISTORY_DIR.mkdir(parents=True, exist_ok=True)
         new = path is None
         if path is None:
-            ts   = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S_%f")
-            path = resolve_conflict(HISTORY_DIR / f"run_{ts}.json")
+            ts = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S_%f")
+            if when is not None:
+                path = resolve_conflict(HISTORY_DIR / f"run_{ts}.json")
+            else:
+                suffix = "_auto" if scheduled else ""
+                path = resolve_conflict(HISTORY_DIR / f"run_{_next_seq():08d}_{ts}{suffix}.json")
         atomic_write_text(path, json.dumps(run_data, indent=2))
         if new:
-            runs = sorted(HISTORY_DIR.glob("run_*.json"))
-            for old in runs[:-MAX_HISTORY]:
-                try:
-                    old.unlink()
-                except Exception as exc:
-                    if log_callback:
-                        log_callback(f"[WARN]  Could not trim old history file: {exc}")
+            _trim_runs(log_callback)
         return path
     except Exception as exc:
         if log_callback:
@@ -790,7 +914,7 @@ def _migrate_legacy_last_run() -> None:
 
 def _trim_undone_history() -> None:
     """Keep only the newest MAX_HISTORY undone_*.json files."""
-    for old in sorted(HISTORY_DIR.glob("undone_*.json"))[:-MAX_HISTORY]:
+    for old in _sorted_runs(prefix="undone_")[:-MAX_HISTORY]:
         try:
             old.unlink()
         except OSError:
@@ -801,7 +925,7 @@ def _newest_run_file() -> Path | None:
     _migrate_legacy_last_run()
     if not HISTORY_DIR.exists():
         return None
-    runs = sorted(HISTORY_DIR.glob("run_*.json"))
+    runs = _sorted_runs()
     return runs[-1] if runs else None
 
 
@@ -810,25 +934,29 @@ def list_undo_history() -> list[dict]:
     _migrate_legacy_last_run()
     if not HISTORY_DIR.exists():
         return []
-    runs   = sorted(HISTORY_DIR.glob("run_*.json"), reverse=True)
+    runs   = list(reversed(_sorted_runs()))
     result: list[dict] = []
     for f in runs:
         try:
             data  = json.loads(f.read_text(encoding="utf-8"))
             ts    = data.get("timestamp", "")
             count = len(data.get("moves", []))
+            scheduled = _is_scheduled_run(f)
             try:
                 # Stored in UTC; shown in the computer's local time.
                 dt  = datetime.fromisoformat(ts).astimezone()
                 lbl = dt.strftime("%b %d %H:%M") + f"  -  {count} file(s)"
             except Exception:
                 lbl = f"{f.stem}  -  {count} file(s)"
+            if scheduled:
+                lbl += "  -  automatic"
             result.append({
                 "id":         f.stem,
                 "timestamp":  ts,
                 "move_count": count,
                 "file_path":  f,
                 "label":      lbl,
+                "scheduled":  scheduled,
             })
         except Exception:
             pass
@@ -843,9 +971,9 @@ def _later_moves(run_file: Path) -> dict[str, str]:
     file away from where run_file left it.
     """
     later: dict[str, str] = {}
-    for f in sorted(HISTORY_DIR.glob("run_*.json")):
-        if f.name <= run_file.name:
-            continue
+    own_key = _run_sort_key(run_file)
+    newer = [f for f in (*_sorted_runs(), *_sorted_runs(TRIMMED_DIR)) if _run_sort_key(f) > own_key]
+    for f in sorted(newer, key=_run_sort_key):
         try:
             moves = json.loads(f.read_text(encoding="utf-8")).get("moves", [])
         except Exception:  # noqa: BLE001
@@ -918,14 +1046,15 @@ def _undo_run_file(
                 later = _later_moves(run_file)
             current = _follow_moves(dst_path, later)
             if current is None:
-                log(f"[SKIP]  {dst_path.name} not found -- skipping.")
+                log(f"[SKIP]  {dst_path.name} not found at {dst_path.parent} -- it was moved "
+                    "or deleted outside Simple Organizer; skipping.")
                 continue
             dst_path, followed = current, True
 
         try:
             src_path.parent.mkdir(parents=True, exist_ok=True)
             safe_src = resolve_conflict(src_path)
-            shutil.move(str(dst_path), str(safe_src))
+            safe_move(dst_path, safe_src)
             msg = f"[UNDONE]  {dst_path.name}  ->  {safe_src.parent.name}/"
             if safe_src.name != src_path.name:
                 msg += f"  (renamed -> {safe_src.name})"
@@ -935,8 +1064,6 @@ def _undo_run_file(
             continue
         except PermissionError as exc:
             err = f"[ERROR]  Permission denied restoring {dst_path.name}: {exc}"
-        except shutil.Error as exc:
-            err = f"[ERROR]  shutil error restoring {dst_path.name}: {exc}"
         except Exception as exc:  # noqa: BLE001
             err = f"[ERROR]  Unexpected error restoring {dst_path.name}: {exc}"
         errors.append(err)
@@ -956,8 +1083,8 @@ def _undo_run_file(
             log(f"[WARN]  Could not update {run_file.name}: {exc}")
         return errors
 
-    ts_safe     = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
-    undone_path = run_file.parent / f"undone_{ts_safe}.json"
+    # Keeps the run's number, so the sequence never goes backwards.
+    undone_path = resolve_conflict(run_file.with_name("undone_" + run_file.name[len("run_"):]))
     try:
         run_file.rename(undone_path)
     except Exception as exc:  # noqa: BLE001
@@ -1109,10 +1236,20 @@ def commit_staging(
                 log_callback(f"[SKIP]  {staged_path.name} not in staging -- skipping.")
             continue
 
+        root = entry.get("root") if isinstance(entry, dict) else None
+        if root and not Path(root).is_dir():
+            err = (f"[ERROR]  {staged_path.name}: the folder {root} no longer exists "
+                   "(renamed, moved or deleted) -- the file stays staged.")
+            errors.append(err)
+            failed.append(entry)
+            if log_callback:
+                log_callback(err)
+            continue
+
         try:
             _mkdir_tracked(final_dst.parent, created_dirs)
             safe_final = resolve_conflict(final_dst)
-            shutil.move(str(staged_path), str(safe_final))
+            safe_move(staged_path, safe_final)
             move_log.append({"src": original, "dst": str(safe_final)})
             msg = f"[COMMITTED]  {staged_path.name}  ->  {safe_final.parent.name}/"
             if safe_final.name != staged_path.name:
@@ -1121,8 +1258,6 @@ def commit_staging(
                 log_callback(msg)
         except PermissionError as exc:
             err = f"[ERROR]  Permission denied committing {staged_path.name}: {exc}"
-        except shutil.Error as exc:
-            err = f"[ERROR]  shutil error committing {staged_path.name}: {exc}"
         except Exception as exc:  # noqa: BLE001
             err = f"[ERROR]  Unexpected error committing {staged_path.name}: {exc}"
         else:
@@ -1185,10 +1320,20 @@ def revert_staging(
                 log_callback(f"[SKIP]  {staged_path.name} not in staging -- skipping.")
             continue
 
+        root = entry.get("root") if isinstance(entry, dict) else None
+        if root and not Path(root).is_dir():
+            err = (f"[ERROR]  {staged_path.name}: the folder {root} no longer exists "
+                   "(renamed, moved or deleted) -- the file stays staged.")
+            errors.append(err)
+            failed.append(entry)
+            if log_callback:
+                log_callback(err)
+            continue
+
         try:
             original_src.parent.mkdir(parents=True, exist_ok=True)
             safe_src = resolve_conflict(original_src)
-            shutil.move(str(staged_path), str(safe_src))
+            safe_move(staged_path, safe_src)
             msg = f"[REVERTED]  {staged_path.name}  ->  {safe_src.parent}/"
             if safe_src.name != original_src.name:
                 msg += f"  (renamed -> {safe_src.name})"
@@ -1197,8 +1342,6 @@ def revert_staging(
             continue
         except PermissionError as exc:
             err = f"[ERROR]  Permission denied reverting {staged_path.name}: {exc}"
-        except shutil.Error as exc:
-            err = f"[ERROR]  shutil error reverting {staged_path.name}: {exc}"
         except Exception as exc:  # noqa: BLE001
             err = f"[ERROR]  Unexpected error reverting {staged_path.name}: {exc}"
         errors.append(err)
@@ -1327,7 +1470,7 @@ def _trash_into(resolved: Path, trash_dir: Path, original: str) -> None:
                      f"Path={quote(original, safe='/')}\n"
                      f"DeletionDate={datetime.now():%Y-%m-%dT%H:%M:%S}\n")
         try:
-            shutil.move(str(resolved), str(dest))
+            safe_move(resolved, dest)
         except Exception:
             info.unlink(missing_ok=True)
             raise
@@ -1335,11 +1478,13 @@ def _trash_into(resolved: Path, trash_dir: Path, original: str) -> None:
     raise OSError("could not find a free name in the Trash")
 
 
-def _trash_file_platform(path: Path) -> None:
+def _trash_file_platform(path: Path, hwnd: int | None = None) -> None:
     """Move a single file to the system Trash/Recycle Bin.
 
     Uses platform-native methods only — no external packages required.
-    Raises OSError or subprocess.CalledProcessError on failure.
+    hwnd (Windows) owns any dialog Windows shows, e.g. "too big for the
+    Recycle Bin, delete permanently?", so it opens above the app instead of
+    possibly behind it. Raises OSError or subprocess.CalledProcessError on failure.
     """
     if sys.platform == "win32":
         # Windows: SHFileOperation with FOF_ALLOWUNDO sends to Recycle Bin.
@@ -1380,6 +1525,7 @@ def _trash_file_platform(path: Path) -> None:
         # pFrom must be double-null-terminated
         src = str(resolved) + "\0\0"
         op  = SHFILEOPSTRUCTW()
+        op.hwnd   = hwnd
         op.wFunc  = FO_DELETE
         op.pFrom  = src
         # FOF_WANTNUKEWARNING overrides FOF_NOCONFIRMATION when the file would be
@@ -1409,10 +1555,11 @@ def trash_files(
     paths:         list[Path],
     log_callback:  Callable[[str], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    hwnd:          int | None = None,
 ) -> tuple[list[str], int]:
     """Move a list of files to the system Trash/Recycle Bin.
 
-    Files are NEVER permanently deleted.
+    Files are NEVER permanently deleted. hwnd: see _trash_file_platform.
     Returns (errors, trashed_count); files skipped as "not found" count as neither.
     """
     errors: list[str] = []
@@ -1430,7 +1577,7 @@ def trash_files(
             continue
 
         try:
-            _trash_file_platform(path)
+            _trash_file_platform(path, hwnd)
             trashed += 1
             if log_callback:
                 log_callback(f"[TRASHED]  {path.name}  ({path.parent})")
@@ -1471,8 +1618,3 @@ def has_staging() -> bool:
             return True   # unreadable: keep Commit/Revert enabled so the error is shown
         _manifest_cache = (key, entries)
     return any(_staged_file_exists(e) for e in _manifest_cache[1])
-
-
-def has_undo_history() -> bool:
-    """Return True if there is at least one undoable history entry."""
-    return has_last_run()

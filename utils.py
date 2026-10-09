@@ -2,7 +2,9 @@
 utils.py — Shared constants, category mappings, and helper utilities.
 """
 
+import errno
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -12,17 +14,22 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 CATEGORY_MAP: dict[str, list[str]] = {
-    "Images":    ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif",
-                  "svg", "ico", "psd", "xcf", "kra", "raw", "cr2", "nef", "arw", "dng"],
-    "Documents": ["pdf", "docx", "doc", "txt", "odt", "rtf", "xlsx", "xls",
-                  "ods", "pptx", "ppt", "odp", "pps", "ppsx", "csv", "md"],
-    "Archives":  ["zip", "tar", "gz", "rar", "7z", "bz2", "xz", "tgz"],
-    "Videos":    ["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "mpeg", "mpg"],
-    "Music":     ["mp3", "wav", "flac", "aac", "ogg", "wma", "m4a", "opus", "aiff"],
-    "Code":      ["py", "ipynb", "js", "ts", "jsx", "tsx", "html", "htm", "css",
-                  "cpp", "c", "h", "java", "rb", "go", "rs", "php", "sh", "bash",
-                  "json", "yaml", "yml", "toml", "xml", "sql", "r", "swift", "kt", "dart"],
-    "Others":    [],  # catch-all — any extension not matched above
+    "Images":      ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif",
+                    "heic", "heif", "avif", "jxl",
+                    "svg", "ico", "psd", "xcf", "kra", "raw", "cr2", "nef", "arw", "dng"],
+    "Documents":   ["pdf", "docx", "docm", "doc", "txt", "odt", "rtf", "xlsx", "xlsm", "xls",
+                    "ods", "pptx", "pptm", "ppt", "odp", "pps", "ppsx", "csv", "md",
+                    "epub", "mobi", "eml", "msg"],
+    "Archives":    ["zip", "tar", "gz", "rar", "7z", "bz2", "xz", "tgz"],
+    "Videos":      ["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "mpeg", "mpg",
+                    "m2ts", "mts"],
+    "Music":       ["mp3", "wav", "flac", "aac", "ogg", "wma", "m4a", "opus", "aiff"],
+    "Code":        ["py", "ipynb", "js", "ts", "jsx", "tsx", "html", "htm", "css",
+                    "cpp", "c", "h", "java", "rb", "go", "rs", "php", "sh", "bash",
+                    "json", "yaml", "yml", "toml", "xml", "sql", "r", "swift", "kt", "dart"],
+    "Programs":    ["exe", "msi", "dmg", "pkg", "apk", "appimage", "deb", "rpm", "flatpakref"],
+    "Disk Images": ["iso", "img"],
+    "Others":      [],  # catch-all — any extension not matched above
 }
 
 # Build reverse lookup: extension → category
@@ -44,6 +51,7 @@ SUBCATEGORY_MAP: dict[str, dict[str, str]] = {
         # Standard photos / raster
         "jpg":  "Photos", "jpeg": "Photos", "png":  "Photos",
         "webp": "Photos", "bmp":  "Photos", "tiff": "Photos", "tif": "Photos",
+        "heic": "Photos", "heif": "Photos", "avif": "Photos", "jxl": "Photos",
         # Animated
         "gif":  "GIFs",
         # Vector
@@ -58,15 +66,18 @@ SUBCATEGORY_MAP: dict[str, dict[str, str]] = {
     "Documents": {
         "pdf":  "PDFs",
         # Word processing
-        "docx": "Word",  "doc": "Word",  "odt": "Word",  "rtf": "Word",
+        "docx": "Word",  "docm": "Word",  "doc": "Word",  "odt": "Word",  "rtf": "Word",
         # Spreadsheets
-        "xlsx": "Spreadsheets", "xls": "Spreadsheets",
+        "xlsx": "Spreadsheets", "xlsm": "Spreadsheets", "xls": "Spreadsheets",
         "ods":  "Spreadsheets", "csv": "Spreadsheets",
         # Presentations
-        "pptx": "Presentations", "ppt":  "Presentations",
+        "pptx": "Presentations", "pptm": "Presentations", "ppt":  "Presentations",
         "odp":  "Presentations", "pps":  "Presentations", "ppsx": "Presentations",
         # Plain text
         "txt":  "Text", "md": "Text",
+        # E-books and e-mails
+        "epub": "Ebooks", "mobi": "Ebooks",
+        "eml":  "Email",  "msg":  "Email",
     },
     "Archives": {
         "zip": "ZIP",
@@ -83,6 +94,8 @@ SUBCATEGORY_MAP: dict[str, dict[str, str]] = {
         "webm": "WebM",
         "flv":  "FLV",
         "mpeg": "MPEG", "mpg": "MPEG",
+        # Transport streams: TV/screen recordings, camcorders, Blu-ray
+        "ts":   "TS",   "m2ts": "TS",  "mts": "TS",
     },
     "Music": {
         # Lossless
@@ -112,12 +125,56 @@ SUBCATEGORY_MAP: dict[str, dict[str, str]] = {
         "sql":   "SQL",
         "r":     "R",
     },
+    "Programs": {
+        "exe": "Windows", "msi": "Windows",
+        "dmg": "macOS",   "pkg": "macOS",
+        "apk": "Android",
+        "appimage": "Linux", "deb": "Linux", "rpm": "Linux", "flatpakref": "Linux",
+    },
 }
 
-# Flat set of all subcategory folder names (used to avoid re-processing).
-ALL_SUBCATEGORY_NAMES: frozenset[str] = frozenset(
-    sub for subs in SUBCATEGORY_MAP.values() for sub in subs.values()
-)
+
+# Windows attributes of files whose content is not on the disk: OneDrive /
+# Dropbox / iCloud "online-only" placeholders and offline storage. Reading such
+# a file downloads (recalls) it, and so does moving it out of the sync folder.
+_FILE_ATTRIBUTE_OFFLINE               = 0x0000_1000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN        = 0x0004_0000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x0040_0000
+_NOT_LOCAL_ATTRIBUTES = (_FILE_ATTRIBUTE_OFFLINE | _FILE_ATTRIBUTE_RECALL_ON_OPEN
+                         | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+
+def is_cloud_placeholder(st: os.stat_result) -> bool:
+    """True if the file's content is only in the cloud (or offline storage).
+
+    st_file_attributes only exists on Windows; elsewhere this is always False.
+    """
+    return bool(getattr(st, "st_file_attributes", 0) & _NOT_LOCAL_ATTRIBUTES)
+
+
+_TS_PACKET = 188          # MPEG transport stream packet size
+_TS_SYNC   = 0x47         # every packet starts with this byte
+_TS_ONLINE_ONLY_VIDEO_SIZE = 1024 * 1024
+
+
+def is_mpeg_ts(file_path: Path) -> bool:
+    """True if a .ts file is an MPEG transport stream video, not TypeScript.
+
+    A transport stream repeats the sync byte 0x47 every 188 bytes; checking
+    three packets rules out text files that happen to start with "G". Online-
+    only cloud files are not read (that would download them): there the size
+    decides, since source files are small and videos are large.
+    """
+    try:
+        st = file_path.stat()
+        if is_cloud_placeholder(st):
+            return st.st_size >= _TS_ONLINE_ONLY_VIDEO_SIZE
+        with file_path.open("rb") as fh:
+            head = fh.read(2 * _TS_PACKET + 1)
+    except OSError:
+        return False
+    return len(head) == 2 * _TS_PACKET + 1 and all(
+        head[i] == _TS_SYNC for i in (0, _TS_PACKET, 2 * _TS_PACKET))
 
 
 def get_category(file_path: Path) -> str:
@@ -125,6 +182,8 @@ def get_category(file_path: Path) -> str:
     suffix = file_path.suffix.lstrip(".").lower()
     if not suffix:
         return "Others"
+    if suffix == "ts" and is_mpeg_ts(file_path):
+        return "Videos"
     return EXT_TO_CATEGORY.get(suffix, "Others")
 
 
@@ -152,14 +211,68 @@ IN_PROGRESS_SUFFIXES: frozenset[str] = frozenset({
     ".tmp", ".temp", ".!ut", ".!qb",
 })
 
+# Shortcuts and launchers: moving them empties the Desktop / Start menu.
+SHORTCUT_SUFFIXES: frozenset[str] = frozenset({
+    ".lnk", ".url", ".desktop", ".webloc",
+})
+
 
 def is_transient_file(name: str) -> bool:
-    """Return True for files that must be left alone: OS metadata, downloads
-    still in progress, temp files and Office lock files (~$Report.docx)."""
+    """Return True for files that must be left alone: OS metadata, shortcuts,
+    downloads still in progress, temp files and Office lock files (~$Report.docx)."""
     lower = name.lower()
     if lower in ALWAYS_SKIPPED_FILES or lower.startswith("~$"):
         return True
-    return Path(lower).suffix in IN_PROGRESS_SUFFIXES
+    suffix = Path(lower).suffix
+    return suffix in IN_PROGRESS_SUFFIXES or suffix in SHORTCUT_SUFFIXES
+
+
+def _is_cross_device(exc: OSError, src: Path, dst: Path) -> bool:
+    if exc.errno == errno.EXDEV:   # also what Windows' ERROR_NOT_SAME_DEVICE maps to
+        return True
+    try:
+        return src.stat().st_dev != dst.parent.stat().st_dev
+    except OSError:
+        return False
+
+
+def safe_move(src: Path, dst: Path) -> None:
+    """Move the file src to dst, which must not exist yet.
+
+    Never leaves two copies behind: on the same drive this is a rename. Across
+    drives the file is copied (refusing to overwrite an existing dst), then
+    the original is deleted -- and if that delete fails (e.g. the file is open
+    in another program) the copy is removed again and the error is raised.
+    shutil.move would leave the copy behind, untracked by history or staging.
+    """
+    try:
+        os.rename(src, dst)
+        return
+    except OSError as exc:
+        if not _is_cross_device(exc, src, dst):
+            raise
+    created = False
+    try:
+        with open(src, "rb") as fin:
+            with open(dst, "xb") as fout:   # "x": never overwrite an existing file
+                created = True
+                shutil.copyfileobj(fin, fout, 1024 * 1024)
+        shutil.copystat(src, dst)
+    except BaseException:
+        if created:   # only ever remove the copy this call made
+            try:
+                os.unlink(dst)
+            except OSError:
+                pass
+        raise
+    try:
+        os.unlink(src)
+    except OSError:
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        raise
 
 
 def atomic_write_text(path: Path, text: str, retries: int = 5) -> None:
@@ -285,6 +398,58 @@ def protected_dirs() -> list[Path]:
         if d not in dirs:
             dirs.append(d)
     return dirs
+
+
+def acquire_instance_lock() -> object | None:
+    """Take the lock that allows only one running Simple Organizer.
+
+    Returns an object that must be kept alive for the lifetime of the app, or
+    None if another instance holds the lock. Two instances would share the
+    staging manifest and history and overwrite each other's entries. The OS
+    releases the lock when the process ends, even after a crash, so a left-
+    over lock file never blocks a start. If the lock file cannot be created at
+    all (read-only data folder), the start is not blocked.
+    """
+    path = get_data_dir() / "instance.lock"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+b")
+    except OSError:
+        return object()
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+ERROR_LOG_MAX_BYTES = 1_000_000
+
+
+def append_error_log(text: str) -> Path | None:
+    """Append an error report to error.log in the data folder and return its path.
+
+    The windowed exe has no console, so this file is the only lasting trace of
+    an unexpected error. When it grows past ERROR_LOG_MAX_BYTES it is rotated
+    to error.log.1. Never raises.
+    """
+    path = get_data_dir() / "error.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > ERROR_LOG_MAX_BYTES:
+            os.replace(path, path.with_name("error.log.1"))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n{text.rstrip()}\n\n")
+        return path
+    except OSError:
+        return None
 
 
 def protected_files() -> frozenset[str]:

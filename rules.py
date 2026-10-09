@@ -84,7 +84,11 @@ def _rule_from_dict(raw: dict) -> Rule | None:
 
 
 def _backup_corrupt_file() -> None:
-    """Move an unparseable rules.json aside (never overwriting an older backup)."""
+    """Move an unparseable rules.json aside (never overwriting an older backup).
+
+    Raises RulesReadError if that is not possible: returning "no rules" while
+    the corrupt file is still in place would let the next save overwrite it.
+    """
     stamp  = datetime.now().strftime("%Y%m%dT%H%M%S")
     backup = RULES_FILE.with_name(f"rules_corrupt_{stamp}.json")
     counter = 1
@@ -93,8 +97,10 @@ def _backup_corrupt_file() -> None:
         counter += 1
     try:
         RULES_FILE.replace(backup)
-    except OSError:
-        pass
+    except OSError as exc:
+        raise RulesReadError(
+            f"{RULES_FILE} is damaged and could not be backed up ({exc}); "
+            "it is left untouched") from exc
 
 
 def load_rules() -> list[Rule]:
@@ -102,8 +108,9 @@ def load_rules() -> list[Rule]:
 
     If the file is not valid JSON (or not a list) it is backed up to
     rules_corrupt_<time>.json before returning [], so the next save does not
-    silently destroy it. If the file exists but cannot be read, RulesReadError
-    is raised instead -- a temporary lock must never look like "no rules".
+    silently destroy it. If the file exists but cannot be read, or a damaged
+    file cannot be backed up, RulesReadError is raised instead -- that must
+    never look like "no rules".
     """
     if not RULES_FILE.exists():
         return []

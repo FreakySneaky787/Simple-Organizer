@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import filedialog, ttk
 from pathlib import Path
@@ -19,7 +20,6 @@ from organizer import (
     commit_staging,
     has_last_run,
     has_staging,
-    has_undo_history,
     list_undo_history,
     organise_files,
     revert_staging,
@@ -28,7 +28,10 @@ from organizer import (
     undo_last_run,
     undo_specific_run,
 )
-from utils import DARK_THEME, LIGHT_THEME, risky_folder_reason, safe_expanduser
+from utils import (
+    DARK_THEME, LIGHT_THEME, acquire_instance_lock, append_error_log,
+    risky_folder_reason, safe_expanduser,
+)
 from theme import FONTS, apply_ttk_theme, float_key, load_fonts, set_titlebar_theme
 from icons import badge, icon
 from config import DEFAULT_SETTINGS, load_settings, save_settings
@@ -42,7 +45,7 @@ from scheduler import OrganizerScheduler
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.4.3"
+APP_VERSION  = "3.4.4"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -251,6 +254,31 @@ def _chroma_key(window: tk.Toplevel, theme: dict[str, str]) -> None:
         window.attributes("-transparentcolor", key)
 
 
+def _own_window(window: tk.Toplevel, owner: tk.Misc) -> None:
+    """Keep window above owner: owned on Windows, transient elsewhere.
+
+    An owned window always stays above its owner and is minimised with it.
+    Tk's `wm transient` does not set an owner for borderless (overrideredirect)
+    windows on Windows, so the owner is set directly. Call it once the window
+    has been laid out (its frame handle exists after update_idletasks).
+    """
+    if sys.platform != "win32":
+        window.transient(owner)
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+        user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+        window.update_idletasks()
+        GWLP_HWNDPARENT = -8   # on a top-level window: its owner
+        user32.SetWindowLongPtrW(int(window.wm_frame(), 16), GWLP_HWNDPARENT,
+                                 int(owner.wm_frame(), 16))
+    except Exception:  # noqa: BLE001 -- cosmetic, must never break a dialog
+        pass
+
+
 def _set_alpha(window: tk.Toplevel, alpha: float) -> None:
     try:
         window.attributes("-alpha", alpha)
@@ -304,6 +332,9 @@ class _Overlay(tk.Toplevel):
     def show(self, focus: tk.Widget | None = None) -> None:
         self._app._overlays.append(self)
         self.follow()
+        # Owned by the main window, so activating the main window (e.g. from the
+        # taskbar) can never cover the dialog that holds the input grab.
+        _own_window(self, self._app)
         self._grab()
         (focus or self).focus_force()
         self._fade(1)
@@ -394,8 +425,20 @@ class _HistoryDialog(_Overlay):
         if not sel or not self._entries:
             return
         entry = self._entries[int(sel[0])]
+        app = self._app
         self.destroy()
-        self._app._undo_specific(entry["file_path"])
+        when = entry["label"].split("  -  ")[0]
+        if _askyesno(
+            title="Undo this run?",
+            message=(
+                f"Restore the {entry['move_count']} file(s) moved in the run of {when} "
+                "to their original locations?\n\n"
+                "- Nothing will be deleted.\n"
+                "- Name conflicts get a _1, _2 suffix."
+            ),
+            parent=app,
+        ):
+            app._undo_specific(entry["file_path"])
 
 
 class _RuleDialog(_Overlay):
@@ -586,6 +629,7 @@ class _Toast(tk.Toplevel):
         self.update_idletasks()
         self._width = max(self.winfo_reqwidth(), app._px(360))
         self._slide(0)
+        _own_window(self, app)   # stays above the app and is hidden with it when minimised
         self.after(self._SHOW_MS[kind], self._fade_out, 0)
 
     def _place(self, offset: int) -> None:
@@ -662,6 +706,8 @@ class SimpleOrganizerApp(tk.Tk):
         self._task_moves_files: bool = False   # the running task moves files (not a scan)
         self._schedule_notified: set[str] = set()   # folders whose "paused" toast was shown
         self._steppers: dict[str, _Stepper] = {}     # settings key -> its number field
+        self._settings_save_failed: bool = False
+        self._instance_lock: object | None = None   # kept alive while the app runs
 
         self._recursive:      tk.BooleanVar = tk.BooleanVar(
             value=bool(self._settings.get("recursive", False)))
@@ -741,10 +787,19 @@ class SimpleOrganizerApp(tk.Tk):
                 pass
         return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
 
+    def _keeps_position(self) -> bool:
+        """Only Windows reports and restores window positions reliably. X11
+        window managers disagree on whether +x+y means the frame or the client
+        area, so a restored window would creep down by the title bar height on
+        every start; there (and on Wayland) the window manager places it."""
+        return self.tk.call("tk", "windowingsystem") == "win32"
+
     def _restore_geometry(self) -> None:
         """Restore size, position and maximised state, always fitting the screen."""
         s = self._settings
         x, y = s.get("window_x"), s.get("window_y")
+        if not self._keeps_position():
+            x = y = None
         left, top, right, bottom = self._work_area(
             x if x is not None else 0, y if y is not None else 0)
         area_w, area_h = max(1, right - left), max(1, bottom - top)
@@ -797,8 +852,20 @@ class SimpleOrganizerApp(tk.Tk):
         w, h, x, y = (int(v) for v in match.groups())
         if w <= 1 or h <= 1:   # not mapped yet
             return {}
-        return {"window_width": w, "window_height": h, "window_x": x, "window_y": y,
-                "window_maximized": False}
+        values: dict[str, Any] = {"window_width": w, "window_height": h,
+                                  "window_maximized": False}
+        if self._keeps_position():
+            values.update(window_x=x, window_y=y)
+        return values
+
+    def _native_handle(self) -> int | None:
+        """Window handle of the main window's frame (Windows), else None."""
+        if sys.platform != "win32":
+            return None
+        try:
+            return int(self.wm_frame(), 16)
+        except (tk.TclError, ValueError):
+            return None
 
     def _load_window_icon(self) -> None:
         """Use icon.png when it ships with the app, otherwise draw one."""
@@ -819,6 +886,23 @@ class SimpleOrganizerApp(tk.Tk):
                 self.iconphoto(True, self._icon)
             except tk.TclError:
                 pass
+
+    def report_callback_exception(self, exc: type[BaseException], val: BaseException,
+                                  tb: Any) -> None:
+        """Tk calls this for an exception in any callback (click, timer, ...).
+
+        The default prints to sys.stderr, which does not exist in the windowed
+        exe, so the error would vanish without a trace. Write it to error.log,
+        the Log tab and a notification instead.
+        """
+        details = "".join(traceback.format_exception(exc, val, tb))
+        path = append_error_log(f"Simple Organizer v{APP_VERSION} -- unexpected error\n{details}")
+        try:
+            self._log(f"[ERROR]  Unexpected error: {val!r}")
+            where = f"Details were written to {path}." if path else "See the log."
+            self._notify("Something went wrong", where, "error")
+        except Exception:  # noqa: BLE001 -- reporting must never raise
+            pass
 
     def _on_close(self) -> None:
         """Save settings, stop background scheduler, then destroy the window.
@@ -1400,11 +1484,20 @@ class SimpleOrganizerApp(tk.Tk):
     # Keyboard shortcuts & DnD
     # =========================================================================
 
+    def _typing_in_field(self) -> bool:
+        try:
+            return isinstance(self.focus_get(), (tk.Entry, tk.Text))   # ttk.Entry is a tk.Entry
+        except (KeyError, tk.TclError):   # focus in a Tk-internal widget (e.g. a dropdown)
+            return False
+
     def _bind_shortcuts(self) -> None:
-        def shortcut(action: Callable[[], Any]) -> Callable[[Any], str]:
+        def shortcut(action: Callable[[], Any], not_in_fields: bool = False
+                     ) -> Callable[[Any], str | None]:
             # Shortcuts obey the same rules as the buttons: nothing starts while a
             # task is running or a dialog is open.
-            def handler(_event: Any) -> str:
+            def handler(_event: Any) -> str | None:
+                if not_in_fields and self._typing_in_field():
+                    return None   # Ctrl+Z while typing means "undo typing", not "undo run"
                 if not self._busy_flag and not self._modal_open():
                     action()
                 return "break"
@@ -1417,7 +1510,7 @@ class SimpleOrganizerApp(tk.Tk):
         # Both cases: with Caps Lock on, Tk reports Control-R instead of Control-r.
         for key, handler in (("r", shortcut(self._start_scan)),
                              ("o", shortcut(self._confirm_and_organize)),
-                             ("z", shortcut(self._confirm_and_undo)),
+                             ("z", shortcut(self._confirm_and_undo, not_in_fields=True)),
                              ("q", close)):
             self.bind_all(f"<Control-{key}>", handler)
             self.bind_all(f"<Control-{key.upper()}>", handler)
@@ -1519,13 +1612,12 @@ class SimpleOrganizerApp(tk.Tk):
                       self._commit_btn, self._revert_btn, self._trash_btn):
                 w.configure(state="disabled")
             return
-        undo_state    = "normal" if has_last_run()     else "disabled"
-        staging_state = "normal" if has_staging()      else "disabled"
-        history_state = "normal" if has_undo_history() else "disabled"
-        self._undo_btn.configure(state=undo_state)
+        history_state = "normal" if has_last_run() else "disabled"
+        staging_state = "normal" if has_staging()  else "disabled"
+        self._undo_btn.configure(state=history_state)
+        self._history_btn.configure(state=history_state)
         self._commit_btn.configure(state=staging_state)
         self._revert_btn.configure(state=staging_state)
-        self._history_btn.configure(state=history_state)
         self._organize_btn.configure(
             state="normal" if self._actionable_plans() else "disabled")
         self._on_dup_select()
@@ -1554,12 +1646,25 @@ class SimpleOrganizerApp(tk.Tk):
     def _update_schedule_status(self) -> None:
         if not self._schedule_enabled.get():
             self._schedule_status_var.set("Off")
+        elif not self._folder.is_dir():
+            self._schedule_status_var.set(
+                "Paused: the folder was not found (drive unplugged or disconnected?).")
         elif risky_folder_reason(self._folder) and not self._is_approved(self._folder):
             self._schedule_status_var.set(
                 "Paused: this folder needs one manual scan and confirmation first.")
         else:
             mins = self._num(self._schedule_interval, "schedule_interval_minutes")
             self._schedule_status_var.set(f"Active, runs every {mins} min")
+
+    def _schedule_paused(self, kind: str, log_line: str, message: str) -> None:
+        """Report a skipped scheduled run: log line, status card, and one
+        notification per reason and folder until the reason goes away."""
+        self._log(f"[SCHEDULE]  Skipped -- {log_line}")
+        self._update_schedule_status()
+        key = f"{kind}:{os.path.normcase(str(self._folder))}"
+        if key not in self._schedule_notified:
+            self._schedule_notified.add(key)
+            self._notify("Auto-organize paused", message, "warning")
 
     # Unusual folders (see risky_folder_reason) the user agreed to organise.
     # Stored in settings.json, so automatic runs keep working after a restart.
@@ -1598,19 +1703,23 @@ class SimpleOrganizerApp(tk.Tk):
             self.after(2000, self._run_scheduled_organize, True)
             return
 
+        if not self._folder.is_dir():
+            self._schedule_paused(
+                "missing", f"{self._folder} was not found.",
+                "The folder was not found -- is the drive unplugged or disconnected?")
+            return
         reason = risky_folder_reason(self._folder)
         if reason and not self._is_approved(self._folder):
-            self._log(f"[SCHEDULE]  Skipped -- {self._folder} {reason}. "
-                      "Scan it once by hand and confirm to allow automatic runs.")
-            self._update_schedule_status()
-            key = os.path.normcase(str(self._folder))
-            if key not in self._schedule_notified:   # one toast per folder and session
-                self._schedule_notified.add(key)
-                self._notify("Auto-organize paused",
-                             "This folder needs one manual scan and confirmation first.",
-                             "warning")
+            self._schedule_paused(
+                "unusual", f"{self._folder} {reason}. "
+                "Scan it once by hand and confirm to allow automatic runs.",
+                "This folder needs one manual scan and confirmation first.")
             return
 
+        # Running again: a later pause for the same reason is reported anew.
+        folder_key = os.path.normcase(str(self._folder))
+        self._schedule_notified -= {f"missing:{folder_key}", f"unusual:{folder_key}"}
+        self._update_schedule_status()
         self._log(f"[SCHEDULE]  Auto-organize triggered for: {self._folder}")
         self._auto_mode = True
         try:
@@ -1816,7 +1925,8 @@ class SimpleOrganizerApp(tk.Tk):
             try:
                 event = work(progress, log)
             except Exception as exc:  # noqa: BLE001
-                event = {"type": "error", "value": str(exc)}
+                event = {"type": "error", "value": str(exc),
+                         "details": traceback.format_exc()}
             self._event_queue.put(event)
 
         threading.Thread(target=run, daemon=True).start()
@@ -1864,7 +1974,10 @@ class SimpleOrganizerApp(tk.Tk):
             "max_dirs":                  self._num(self._max_dirs, "max_dirs"),
             "scan_timeout":              self._num(self._scan_timeout, "scan_timeout"),
         })
-        if not save_settings(self._settings):
+        if save_settings(self._settings):
+            self._settings_save_failed = False
+        elif not self._settings_save_failed:   # once, not on every resize and click
+            self._settings_save_failed = True
             self._log("[WARN]  Settings could not be saved — check disk space and permissions.")
 
     def _on_configure(self, event: Any) -> None:
@@ -2062,7 +2175,8 @@ class SimpleOrganizerApp(tk.Tk):
         self._render_scan_result()
 
     def _run_auto_organize(self, plans: list[FilePlan]) -> None:
-        self._start_organize(plans, self._use_staging.get(), "Auto-organizing...")
+        self._start_organize(plans, self._use_staging.get(), "Auto-organizing...",
+                             scheduled=True)
 
     # =========================================================================
     # Organise
@@ -2109,13 +2223,15 @@ class SimpleOrganizerApp(tk.Tk):
 
         self._start_organize(actionable, staging, "Organising...")
 
-    def _start_organize(self, plans: list[FilePlan], staging: bool, status: str) -> None:
+    def _start_organize(self, plans: list[FilePlan], staging: bool, status: str,
+                        scheduled: bool = False) -> None:
         self._start_task(
             status,
             lambda progress, log: {
                 "type": "organize_done",
                 "errors": organise_files(plans=list(plans), progress_callback=progress,
-                                         log_callback=log, staging=staging),
+                                         log_callback=log, staging=staging,
+                                         scheduled=scheduled),
                 "staging": staging,
             })
 
@@ -2301,6 +2417,8 @@ class SimpleOrganizerApp(tk.Tk):
                     self._auto_mode = False
                     self._status("Error -- see log.")
                     self._log(f"[ERROR]  {event['value']}")
+                    append_error_log(f"Simple Organizer v{APP_VERSION} -- task failed\n"
+                                     f"{event.get('details') or event['value']}")
                     closing = self._close_requested
                     if self._task_moves_files:
                         # Some files may have moved before the crash: the plan
@@ -2460,8 +2578,13 @@ class SimpleOrganizerApp(tk.Tk):
         if not confirmed or self._busy_flag:
             return
 
+        # Owner for dialogs Windows may show (e.g. "too big for the Recycle Bin"),
+        # read here on the GUI thread so they open above the app, not behind it.
+        hwnd = self._native_handle()
+
         def work(progress: Callable[[int, int], None], log: Callable[[str], None]) -> dict:
-            errors, trashed = trash_files(paths, log_callback=log, progress_callback=progress)
+            errors, trashed = trash_files(paths, log_callback=log, progress_callback=progress,
+                                          hwnd=hwnd)
             return {"type": "trash_done", "errors": errors, "count": trashed}
 
         self._start_task(f"Moving {len(paths)} file(s) to Trash...", work)
@@ -2632,6 +2755,75 @@ def _fmt_size(n: int) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    app = SimpleOrganizerApp()
+def _bring_running_instance_to_front() -> bool:
+    """Show the window of the instance that is already running (Windows only)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        found: list[int] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def visit(hwnd: int, _lparam: int) -> bool:
+            title = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, title, 256)
+            if title.value.startswith(f"{APP_TITLE}  v") and user32.IsWindowVisible(hwnd):
+                found.append(hwnd)
+                return False
+            return True
+
+        user32.EnumWindows(visit, 0)
+        if not found:
+            return False
+        user32.ShowWindow(found[0], 9)          # SW_RESTORE
+        user32.SetForegroundWindow(found[0])
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _message_without_app(title: str, message: str, error: bool = False) -> None:
+    """Native message box for the moments before (or instead of) the main window."""
+    try:
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        (messagebox.showerror if error else messagebox.showinfo)(title, message, parent=root)
+        root.destroy()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def main() -> None:
+    # Only one instance: two would share and overwrite the staging manifest and
+    # the history. The lock is released by the OS when this process ends.
+    lock = acquire_instance_lock()
+    if lock is None:
+        if not _bring_running_instance_to_front():
+            _message_without_app(APP_TITLE, "Simple Organizer is already running.\n\n"
+                                            "Switch to the open window instead.")
+        return
+
+    def thread_crash(args: threading.ExceptHookArgs) -> None:
+        append_error_log(f"Simple Organizer v{APP_VERSION} -- error in thread "
+                         f"{getattr(args.thread, 'name', '?')}\n"
+                         + "".join(traceback.format_exception(
+                             args.exc_type, args.exc_value, args.exc_traceback)))
+    threading.excepthook = thread_crash
+
+    try:
+        app = SimpleOrganizerApp()
+    except Exception:  # noqa: BLE001
+        path = append_error_log(f"Simple Organizer v{APP_VERSION} -- failed to start\n"
+                                + traceback.format_exc())
+        _message_without_app(APP_TITLE, "Simple Organizer could not start."
+                             + (f"\n\nDetails: {path}" if path else ""), error=True)
+        return
+    app._instance_lock = lock
     app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
