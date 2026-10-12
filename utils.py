@@ -5,6 +5,7 @@ utils.py — Shared constants, category mappings, and helper utilities.
 import errno
 import os
 import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -211,6 +212,13 @@ IN_PROGRESS_SUFFIXES: frozenset[str] = frozenset({
     ".tmp", ".temp", ".!ut", ".!qb",
 })
 
+# The part of IN_PROGRESS_SUFFIXES that browsers and download tools append to
+# the final file name ("setup.zip.part"). Firefox also creates an empty file
+# with the final name while the download runs.
+DOWNLOAD_SUFFIXES: frozenset[str] = frozenset({
+    ".crdownload", ".part", ".partial", ".download", ".opdownload", ".!ut", ".!qb",
+})
+
 # Shortcuts and launchers: moving them empties the Desktop / Start menu.
 SHORTCUT_SUFFIXES: frozenset[str] = frozenset({
     ".lnk", ".url", ".desktop", ".webloc",
@@ -219,12 +227,22 @@ SHORTCUT_SUFFIXES: frozenset[str] = frozenset({
 
 def is_transient_file(name: str) -> bool:
     """Return True for files that must be left alone: OS metadata, shortcuts,
-    downloads still in progress, temp files and Office lock files (~$Report.docx)."""
+    downloads still in progress, temp files and the lock files of Microsoft
+    Office (~$Report.docx) and LibreOffice (.~lock.Report.odt#)."""
     lower = name.lower()
     if lower in ALWAYS_SKIPPED_FILES or lower.startswith("~$"):
         return True
+    if lower.startswith(".~lock.") and lower.endswith("#"):
+        return True
     suffix = Path(lower).suffix
     return suffix in IN_PROGRESS_SUFFIXES or suffix in SHORTCUT_SUFFIXES
+
+
+def download_target(path: str) -> str | None:
+    """For a running download (".../setup.zip.part") return the path of the
+    file it will become (".../setup.zip"), else None."""
+    suffix = os.path.splitext(path)[1].lower()
+    return path[:-len(suffix)] if suffix in DOWNLOAD_SUFFIXES else None
 
 
 def _is_cross_device(exc: OSError, src: Path, dst: Path) -> bool:
@@ -236,6 +254,32 @@ def _is_cross_device(exc: OSError, src: Path, dst: Path) -> bool:
         return False
 
 
+def _unlink(path: Path | str) -> None:
+    """os.unlink that also removes files with the Windows read-only attribute.
+
+    A rename moves such files without complaint, so a move across drives must
+    delete them too. If the delete still fails, the attribute is restored.
+    """
+    try:
+        os.unlink(path)
+        return
+    except PermissionError:
+        if sys.platform != "win32":
+            raise
+        mode = os.stat(path).st_mode
+        if mode & stat.S_IWRITE:
+            raise   # not read-only: the file is locked by another program
+    os.chmod(path, mode | stat.S_IWRITE)
+    try:
+        os.unlink(path)
+    except OSError:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+        raise
+
+
 def safe_move(src: Path, dst: Path) -> None:
     """Move the file src to dst, which must not exist yet.
 
@@ -244,6 +288,8 @@ def safe_move(src: Path, dst: Path) -> None:
     the original is deleted -- and if that delete fails (e.g. the file is open
     in another program) the copy is removed again and the error is raised.
     shutil.move would leave the copy behind, untracked by history or staging.
+    Timestamps and attributes are copied on a best-effort basis: drives that
+    cannot store them (FAT, exFAT, network shares) do not make the move fail.
     """
     try:
         os.rename(src, dst)
@@ -257,21 +303,17 @@ def safe_move(src: Path, dst: Path) -> None:
             with open(dst, "xb") as fout:   # "x": never overwrite an existing file
                 created = True
                 shutil.copyfileobj(fin, fout, 1024 * 1024)
-        shutil.copystat(src, dst)
+        try:
+            shutil.copystat(src, dst)
+        except OSError:
+            pass
+        _unlink(src)
     except BaseException:
         if created:   # only ever remove the copy this call made
             try:
-                os.unlink(dst)
+                _unlink(dst)
             except OSError:
                 pass
-        raise
-    try:
-        os.unlink(src)
-    except OSError:
-        try:
-            os.unlink(dst)
-        except OSError:
-            pass
         raise
 
 
@@ -373,6 +415,44 @@ def get_config_dir() -> Path:
     return _xdg_app_dir("XDG_CONFIG_HOME", Path.home() / ".config")
 
 
+def get_downloads_dir() -> Path:
+    """The user's Downloads folder, also when it was moved or has a localised name.
+
+    Windows: the "Downloads" known folder (it can be moved to another drive in
+    its properties). Linux: XDG_DOWNLOAD_DIR from ~/.config/user-dirs.dirs
+    (e.g. ~/Téléchargements). Falls back to ~/Downloads.
+    """
+    fallback = Path.home() / "Downloads"
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import uuid
+            folder_id = uuid.UUID("{374DE290-123F-4565-9164-39C4925E467B}")   # FOLDERID_Downloads
+            guid = (ctypes.c_ubyte * 16).from_buffer_copy(folder_id.bytes_le)
+            out = ctypes.c_wchar_p()
+            shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
+            if shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(out)) == 0:
+                try:
+                    return Path(out.value)
+                finally:
+                    ctypes.windll.ole32.CoTaskMemFree(out)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        return fallback
+    try:
+        config = xdg_base_dir("XDG_CONFIG_HOME", Path.home() / ".config") / "user-dirs.dirs"
+        for line in config.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("XDG_DOWNLOAD_DIR="):
+                value = line.split("=", 1)[1].strip().strip('"')
+                value = value.replace("$HOME", str(Path.home()))
+                if os.path.isabs(value) and Path(value) != Path.home():
+                    return Path(value)
+    except (OSError, ValueError):
+        pass
+    return fallback
+
+
 def protected_dirs() -> list[Path]:
     """Folders that are never organised and never entered by a scan.
 
@@ -424,10 +504,18 @@ def acquire_instance_lock() -> object | None:
         else:
             import fcntl
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        handle.close()
-        return None
+    except OSError as exc:
+        if exc.errno in _LOCK_HELD_ERRNOS:
+            handle.close()
+            return None
+        # The file system cannot lock at all (e.g. NFS without a lock
+        # daemon: ENOLCK). That is no sign of a second instance.
     return handle
+
+
+# What locking reports when another process holds the lock.
+_LOCK_HELD_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK,
+                               getattr(errno, "EDEADLOCK", errno.EDEADLK)})
 
 
 ERROR_LOG_MAX_BYTES = 1_000_000

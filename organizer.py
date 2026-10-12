@@ -20,6 +20,7 @@ from utils import (
     CATEGORY_MAP,
     DEFAULT_EXCLUDED_DIRS,
     atomic_write_text,
+    download_target,
     get_category,
     get_subcategory,
     get_data_dir,
@@ -46,6 +47,9 @@ HISTORY_DIR           = DATA_DIR / "history"
 # Runs dropped from the undo list are kept here for a while, so undoing an
 # older run can still follow a file that one of them moved again.
 TRIMMED_DIR           = HISTORY_DIR / "trimmed"
+# Run files that are no longer valid JSON are moved here, so "Undo last" is
+# not stuck on them.
+DAMAGED_DIR           = HISTORY_DIR / "damaged"
 MAX_HISTORY           = 20    # undoable runs kept -- separately for manual and scheduled runs
 MAX_TRIMMED           = 200
 
@@ -255,16 +259,32 @@ def _is_link(entry: os.DirEntry) -> bool:
     if entry.is_symlink():
         return True
     is_junction = getattr(entry, "is_junction", None)
-    return bool(is_junction and is_junction())
+    if is_junction is not None:
+        return bool(is_junction())
+    if sys.platform == "win32":   # Python 3.11: DirEntry.is_junction is new in 3.12
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            return False
+        return getattr(st, "st_reparse_tag", 0) == stat.IO_REPARSE_TAG_MOUNT_POINT
+    return False
 
 
-def _keep_file(entry: os.DirEntry, include_hidden: bool, counter: list[int]) -> bool:
-    """Decide whether a regular file entry is organised; counts the ones left alone."""
+def _keep_file(entry: os.DirEntry, include_hidden: bool, counter: list[int],
+               downloads: set[str] | None = None) -> bool:
+    """Decide whether a regular file entry is organised; counts the ones left alone.
+
+    downloads collects the (normcase'd) final paths of running downloads: a
+    browser may already have created that file, empty (Firefox does).
+    """
     hidden, system = _entry_flags(entry)
     if hidden and not include_hidden:
         return False
     if system or is_transient_file(entry.name):
         counter[0] += 1
+        target = download_target(entry.path)
+        if target and downloads is not None:
+            downloads.add(os.path.normcase(target))
         return False
     return True
 
@@ -283,6 +303,7 @@ def _iter_files_recursive(
     excluded_abs_paths: frozenset[str]               = frozenset(),
     log_callback:       Callable[[str], None] | None = None,
     left_alone:         list[int] | None             = None,
+    downloads:          set[str] | None              = None,
 ) -> Generator[Path, None, None]:
     """Yield every regular file under root subject to hard safety limits.
 
@@ -346,7 +367,7 @@ def _iter_files_recursive(
                     continue
 
                 if is_file:
-                    if _keep_file(entry, include_hidden, left_alone):
+                    if _keep_file(entry, include_hidden, left_alone, downloads):
                         yield Path(entry.path)
                 elif is_dir:
                     hidden, system = _entry_flags(entry)
@@ -381,6 +402,7 @@ def _iter_files_recursive(
 
 def _iter_files_top_level(
     root: Path, include_hidden: bool, left_alone: list[int],
+    downloads: set[str] | None = None,
 ) -> Generator[Path, None, None]:
     """Yield the regular files directly inside root (no recursion)."""
     with os.scandir(str(root)) as it:
@@ -390,7 +412,7 @@ def _iter_files_top_level(
                     continue
             except OSError:
                 continue
-            if _keep_file(entry, include_hidden, left_alone):
+            if _keep_file(entry, include_hidden, left_alone, downloads):
                 yield Path(entry.path)
 
 
@@ -451,6 +473,11 @@ def scan_folder(
             f"{exc} -- scan stopped so no file is sorted without your rules. "
             "Try again in a moment.")
         return result
+    except Exception as exc:  # noqa: BLE001 -- never sort without the user's rules
+        result.errors.append(
+            f"Rules could not be loaded ({exc}) -- scan stopped so no file is sorted "
+            "without your rules.")
+        return result
 
     def report(fraction: float) -> None:
         if progress_callback:
@@ -465,6 +492,7 @@ def scan_folder(
         status_callback("Collecting files...")
 
     left_alone = [0]
+    downloads: set[str] = set()
     try:
         if recursive:
             all_files: list[Path] = list(
@@ -478,10 +506,11 @@ def scan_folder(
                     excluded_abs_paths=frozenset(str(d) for d in protected),
                     log_callback=note,
                     left_alone=left_alone,
+                    downloads=downloads,
                 )
             )
         else:
-            all_files = list(_iter_files_top_level(root, include_hidden, left_alone))
+            all_files = list(_iter_files_top_level(root, include_hidden, left_alone, downloads))
     except PermissionError as exc:
         result.errors.append(f"Permission denied reading {root}: {exc}")
         return result
@@ -492,6 +521,11 @@ def scan_folder(
     own_files = protected_files()
     if own_files:
         all_files = [f for f in all_files if os.path.normcase(str(f)) not in own_files]
+    if downloads:
+        # The file a running download will become: still empty or incomplete.
+        before = len(all_files)
+        all_files = [f for f in all_files if os.path.normcase(str(f)) not in downloads]
+        left_alone[0] += before - len(all_files)
 
     if left_alone[0]:
         result.notes.append(
@@ -1094,16 +1128,52 @@ def _undo_run_file(
     return errors
 
 
+def _damage(run_file: Path) -> str | None:
+    """Why run_file is not a usable history record, or None.
+
+    A file that merely cannot be opened right now (locked by a virus scanner)
+    is not damaged: undoing it reports the read error and keeps it.
+    """
+    try:
+        data = json.loads(run_file.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    except ValueError as exc:
+        return str(exc)
+    if not isinstance(data, dict) or not isinstance(data.get("moves", []), list):
+        return "not a history record"
+    return None
+
+
 def undo_last_run(
     progress_callback: Callable[[int, int], None] | None = None,
     log_callback:      Callable[[str], None]       | None = None,
 ) -> list[str]:
-    """Reverse every move of the newest history run. Files are NEVER deleted."""
-    run_file = _newest_run_file()
-    if run_file is None:
+    """Reverse every move of the newest history run. Files are NEVER deleted.
+
+    A damaged newest run file (the History dialog does not list it) is moved
+    to history/damaged, and the newest readable run is undone instead.
+    """
+    while True:
+        run_file = _newest_run_file()
+        if run_file is None:
+            if log_callback:
+                log_callback("[WARN]  No last run record found.")
+            return ["No run history found -- nothing to undo."]
+        problem = _damage(run_file)
+        if problem is None:
+            break
+        try:
+            DAMAGED_DIR.mkdir(parents=True, exist_ok=True)
+            run_file.replace(resolve_conflict(DAMAGED_DIR / run_file.name))
+        except OSError as exc:
+            err = f"{run_file.name} is damaged ({problem}) and could not be moved aside: {exc}"
+            if log_callback:
+                log_callback(f"[ERROR]  {err}")
+            return [err]
         if log_callback:
-            log_callback("[WARN]  No last run record found.")
-        return ["No run history found -- nothing to undo."]
+            log_callback(f"[WARN]  {run_file.name} is damaged ({problem}) and was moved to "
+                         f"{DAMAGED_DIR} -- undoing the newest readable run instead.")
     return _undo_run_file(run_file, progress_callback, log_callback)
 
 
@@ -1551,15 +1621,34 @@ def _trash_file_platform(path: Path, hwnd: int | None = None) -> None:
         _trash_xdg(resolved)
 
 
+def _copy_remains(path: Path, others: list[Path]) -> bool:
+    """True if one of others still exists with the same size as path."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    for other in others:
+        try:
+            if other.is_file() and other.stat().st_size == size:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def trash_files(
     paths:         list[Path],
     log_callback:  Callable[[str], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     hwnd:          int | None = None,
+    keep:          dict[Path, list[Path]] | None = None,
 ) -> tuple[list[str], int]:
     """Move a list of files to the system Trash/Recycle Bin.
 
     Files are NEVER permanently deleted. hwnd: see _trash_file_platform.
+    keep maps a duplicate to the copies the user keeps: it is only trashed if
+    one of them still exists, so the last copy is never trashed even if the
+    kept one was deleted or changed after the scan.
     Returns (errors, trashed_count); files skipped as "not found" count as neither.
     """
     errors: list[str] = []
@@ -1574,6 +1663,14 @@ def trash_files(
             msg = f"[SKIP]  {path.name} — not found, already moved or deleted."
             if log_callback:
                 log_callback(msg)
+            continue
+
+        if keep is not None and path in keep and not _copy_remains(path, keep[path]):
+            err = (f"[ERROR]  {path.name} left in place -- the copy you kept no longer exists "
+                   "or has changed since the scan.")
+            errors.append(err)
+            if log_callback:
+                log_callback(err)
             continue
 
         try:

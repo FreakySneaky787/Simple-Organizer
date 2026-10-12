@@ -30,14 +30,14 @@ from organizer import (
 )
 from utils import (
     DARK_THEME, LIGHT_THEME, acquire_instance_lock, append_error_log,
-    risky_folder_reason, safe_expanduser,
+    get_downloads_dir, risky_folder_reason, safe_expanduser,
 )
 from theme import FONTS, apply_ttk_theme, float_key, load_fonts, set_titlebar_theme
 from icons import badge, icon
 from config import DEFAULT_SETTINGS, load_settings, save_settings
 from rules import (
     Rule, CONDITION_TYPES, CONDITION_LABELS, RulesReadError,
-    is_safe_target_folder, load_rules, save_rules,
+    is_safe_target_folder, is_valid_extension, load_rules, normalize_extension, save_rules,
 )
 from scheduler import OrganizerScheduler
 
@@ -45,7 +45,7 @@ from scheduler import OrganizerScheduler
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.4.4"
+APP_VERSION  = "3.4.5"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -369,9 +369,21 @@ class _Overlay(tk.Toplevel):
             self.after(15, self._fade, step + 1)
 
     def destroy(self) -> None:
-        if self in self._app._overlays:
+        was_open = self in self._app._overlays
+        if was_open:
             self._app._overlays.remove(self)
         super().destroy()
+        # Tk keeps only one grab: closing a message shown on top of another
+        # dialog would leave that dialog without one, and the main window
+        # would accept clicks behind it.
+        if was_open and self._app._overlays:
+            under = self._app._overlays[-1]
+            try:
+                if under.winfo_exists():
+                    under._grab()
+                    under.focus_force()
+            except tk.TclError:
+                pass
 
 
 class _HistoryDialog(_Overlay):
@@ -520,6 +532,17 @@ class _RuleDialog(_Overlay):
                 parent=self,
             )
             return
+
+        if ctype == "extension":
+            if not is_valid_extension(value):
+                _showwarning(
+                    "Invalid extension",
+                    f'"{value}" is not a single file extension.\n'
+                    "Enter one extension such as pdf or tar.gz -- one rule per extension.",
+                    parent=self,
+                )
+                return
+            value = normalize_extension(value)
 
         numeric_types = {"min_size_mb", "max_size_mb", "older_than_days", "newer_than_days"}
         if ctype in numeric_types:
@@ -687,7 +710,7 @@ class SimpleOrganizerApp(tk.Tk):
         if _saved_folder and Path(_saved_folder).is_dir():
             self._folder = safe_expanduser(_saved_folder)
         else:
-            self._folder = safe_expanduser("~/Downloads")
+            self._folder = get_downloads_dir().resolve()
 
         self._scan_result:    ScanResult | None = None
         self._dark_mode:      bool              = bool(self._settings["dark_mode"])
@@ -1745,6 +1768,11 @@ class SimpleOrganizerApp(tk.Tk):
             self._notify("Rules not available",
                          "rules.json could not be read. Try again in a moment.", "warning")
             return None
+        except Exception as exc:  # noqa: BLE001 -- a bad rules file must never stop the app
+            self._log(f"[WARN]  rules.json could not be loaded: {exc}")
+            self._notify("Rules not available",
+                         "rules.json could not be loaded. See the log.", "warning")
+            return None
 
     def _refresh_rules_tree(self) -> None:
         rules = self._load_rules_checked()
@@ -2162,15 +2190,19 @@ class SimpleOrganizerApp(tk.Tk):
         self._sync_empty(self._preview_tree, self._preview_empty)
         self._sync_empty(self._dup_tree, self._dup_empty)
 
-    def _prune_scan_result(self) -> None:
-        """Drop files that no longer exist (e.g. just trashed) from the scan
-        result and redraw it, so Organize never works on stale paths."""
+    def _prune_scan_result(self, gone: list[Path]) -> None:
+        """Drop the files in gone (e.g. just trashed) from the scan result and
+        redraw it, so Organize never works on stale paths. gone is worked out
+        by the task thread: checking every file here would freeze the window."""
         result = self._scan_result
-        if result is None:
+        if result is None or not gone:
             return
-        result.plans = [p for p in result.plans if p.source.exists()]
+        gone_keys = {os.path.normcase(str(p)) for p in gone}
+        def kept(p: Path) -> bool:
+            return os.path.normcase(str(p)) not in gone_keys
+        result.plans = [p for p in result.plans if kept(p.source)]
         result.total_bytes = sum(p.size for p in result.plans if not p.skipped)
-        groups = [[f for f in g if f.exists()] for g in result.duplicate_groups]
+        groups = [[f for f in g if kept(f)] for g in result.duplicate_groups]
         result.duplicate_groups = [g for g in groups if len(g) > 1]
         self._render_scan_result()
 
@@ -2410,7 +2442,7 @@ class SimpleOrganizerApp(tk.Tk):
                 elif etype == "revert_done":
                     self._handle_revert_done(event["errors"])
                 elif etype == "trash_done":
-                    self._handle_trash_done(event["errors"], event["count"])
+                    self._handle_trash_done(event["errors"], event["count"], event["gone"])
                 elif etype == "schedule_fire":
                     self._run_scheduled_organize()
                 elif etype == "error":
@@ -2560,6 +2592,15 @@ class SimpleOrganizerApp(tk.Tk):
         paths: list[Path] = [self._dup_paths[iid] for iid in file_iids if iid in self._dup_paths]
         if not paths:
             return
+        # The copies the user keeps, per selected file: trash_files re-checks
+        # that one of them still exists before it trashes anything.
+        selected = set(file_iids)
+        keep: dict[Path, list[Path]] = {}
+        for members in self._dup_groups.values():
+            kept = [self._dup_paths[m] for m in members if m not in selected and m in self._dup_paths]
+            for m in members:
+                if m in selected and m in self._dup_paths:
+                    keep[self._dup_paths[m]] = kept
 
         # Build preview list for the dialog
         preview = "\n".join(f"  • {p.name}  ({p.parent})" for p in paths[:10])
@@ -2584,17 +2625,18 @@ class SimpleOrganizerApp(tk.Tk):
 
         def work(progress: Callable[[int, int], None], log: Callable[[str], None]) -> dict:
             errors, trashed = trash_files(paths, log_callback=log, progress_callback=progress,
-                                          hwnd=hwnd)
-            return {"type": "trash_done", "errors": errors, "count": trashed}
+                                          hwnd=hwnd, keep=keep)
+            gone = [p for p in paths if not p.exists()]
+            return {"type": "trash_done", "errors": errors, "count": trashed, "gone": gone}
 
         self._start_task(f"Moving {len(paths)} file(s) to Trash...", work)
 
-    def _handle_trash_done(self, errors: list[str], count: int) -> None:
+    def _handle_trash_done(self, errors: list[str], count: int, gone: list[Path]) -> None:
         self._set_busy(False)
         self._set_progress(100.0)
         # Trashed files leave the duplicate groups and the organise plan, so
         # Organize never tries to move a file that is in the Trash now.
-        self._prune_scan_result()
+        self._prune_scan_result(gone)
         if errors:
             self._log(f"Trash finished with {len(errors)} error(s). See log.")
             self._status(f"Trash done — {len(errors)} error(s).")

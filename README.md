@@ -37,14 +37,14 @@ All guarantees: [Safety](https://github.com/FreakySneaky787/Simple-Organizer/wik
 
 ### Windows 10 / 11
 
-1. Download `simple_organizer_windows_v3.4.4.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
+1. Download `simple_organizer_windows_v3.4.5.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
 2. Extract it and double-click `simple_organizer.exe` — no installation needed
 3. If SmartScreen warns: right-click → **Properties** → **Unblock** (the exe is not code-signed yet)
 
 The `.sha256` file on the release page is the checksum of the exe:
 
 ```powershell
-Get-FileHash simple_organizer_windows_v3.4.4\simple_organizer.exe -Algorithm SHA256
+Get-FileHash simple_organizer_windows_v3.4.5\simple_organizer.exe -Algorithm SHA256
 ```
 
 ### Linux
@@ -84,19 +84,19 @@ Questions? See the [FAQ and Troubleshooting](https://github.com/FreakySneaky787/
 
 ---
 
-## What's New in v3.4.4
+## What's New in v3.4.5
 
-Bug-fix release — fixes all 23 issues from the third review (#29 – #51):
+Bug-fix release — fixes all 13 issues from the fourth review (#52 – #64):
 
-- Moves across drives never leave stray copies; only one instance runs at a time
-- Manual and automatic runs are kept separately in the undo history; runs are numbered, so a wrong clock cannot reorder them
-- Undo from History asks first and can still follow files moved by older, trimmed runs
-- Shortcuts are never moved; category folders that are links pointing elsewhere are refused
-- Staging mode does not download OneDrive online-only files; Commit/Revert never recreate a deleted folder
-- New file types and the categories **Programs** and **Disk Images**; `.ts` videos are detected by content
-- Unexpected errors are shown and written to `error.log`; dialogs always stay above the main window
+- A `rules.json` saved as ANSI or UTF-16 no longer stops the app from starting; files with a byte order mark are read correctly
+- Read-only files can be moved to another drive and never leave a second copy; FAT / exFAT / network drives no longer make moves fail
+- A damaged history file no longer blocks **Undo last**
+- Trash only removes a duplicate if the copy you keep still exists; no freeze after trashing many files
+- LibreOffice lock files and the empty placeholder of a running Firefox download are left alone
+- Extension rules accept `.pdf` and `*.pdf`; a message on top of a dialog no longer unlocks the main window
+- First start opens the real Downloads folder, also when it was moved or has a localised name
 
-Full notes: [Release v3.4.4](https://github.com/FreakySneaky787/Simple-Organizer/releases/tag/v3.4.4) · All versions: [Changelog](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Changelog)
+Full notes: [Release v3.4.5](https://github.com/FreakySneaky787/Simple-Organizer/releases/tag/v3.4.5) · All versions: [Changelog](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Changelog)
 
 ---
 

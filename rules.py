@@ -106,18 +106,19 @@ def _backup_corrupt_file() -> None:
 def load_rules() -> list[Rule]:
     """Load rules from disk. Invalid entries are skipped one by one.
 
-    If the file is not valid JSON (or not a list) it is backed up to
-    rules_corrupt_<time>.json before returning [], so the next save does not
-    silently destroy it. If the file exists but cannot be read, or a damaged
-    file cannot be backed up, RulesReadError is raised instead -- that must
-    never look like "no rules".
+    The file is read as UTF-8; a byte order mark (Notepad, PowerShell) is
+    accepted. If the file is not valid UTF-8 JSON (or not a list) it is backed
+    up to rules_corrupt_<time>.json before returning [], so the next save does
+    not silently destroy it. If the file exists but cannot be read, or a
+    damaged file cannot be backed up, RulesReadError is raised instead -- that
+    must never look like "no rules".
     """
     if not RULES_FILE.exists():
         return []
-    text: str | None = None
+    raw = b""
     for attempt in range(3):
         try:
-            text = RULES_FILE.read_text(encoding="utf-8")
+            raw = RULES_FILE.read_bytes()
             break
         except FileNotFoundError:
             return []
@@ -126,8 +127,8 @@ def load_rules() -> list[Rule]:
                 raise RulesReadError(f"Could not read {RULES_FILE}: {exc}") from exc
             time.sleep(0.1)
     try:
-        data = json.loads(text or "")
-    except (ValueError, UnicodeDecodeError):
+        data = json.loads(raw.decode("utf-8-sig"))
+    except ValueError:   # also UnicodeDecodeError: e.g. saved as ANSI or UTF-16
         _backup_corrupt_file()
         return []
     if not isinstance(data, list):
@@ -180,6 +181,17 @@ def is_safe_target_folder(target: str) -> bool:
     return True
 
 
+def normalize_extension(value: str) -> str:
+    """"pdf", ".pdf" and "*.pdf" all mean the extension "pdf"."""
+    return value.strip().lstrip("*").lstrip(".").lower()
+
+
+def is_valid_extension(value: str) -> bool:
+    """True for one extension such as "pdf" or "tar.gz" (not "pdf, docx")."""
+    ext = normalize_extension(value)
+    return bool(ext) and not any(c in ext for c in ' ,;/\\*?"<>|') and ".." not in ext
+
+
 # ---------------------------------------------------------------------------
 # Matching
 # ---------------------------------------------------------------------------
@@ -194,7 +206,7 @@ def match_rule(file_path: Path, rule: Rule) -> bool:
 
         if ct == "extension":
             # endswith instead of comparing .suffix, so "tar.gz" works as well as "gz".
-            ext = cv.lstrip(".").lower()
+            ext = normalize_extension(cv)
             return bool(ext) and file_path.name.lower().endswith("." + ext)
 
         elif ct == "name_pattern":

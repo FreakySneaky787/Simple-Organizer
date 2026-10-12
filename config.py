@@ -92,7 +92,8 @@ def load_settings() -> dict:
         path = get_settings_path()
         if not path.exists():
             return merged
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig: a file saved by Notepad or PowerShell may start with a BOM.
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
             return merged
         for key, value in data.items():
