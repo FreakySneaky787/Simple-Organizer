@@ -10,6 +10,7 @@ read-only attributes); the GUI suites open the app window for a moment.
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -20,7 +21,10 @@ def main() -> int:
     wanted = sys.argv[1:]
     scripts = [s for s in sorted(HERE.glob("test_*.py"))
                if not wanted or any(w in s.stem for w in wanted)]
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    # The long form of the temp folder: CI machines use an 8.3 short name
+    # (C:\Users\RUNNER~1\...), which the app resolves to the long one.
+    temp = str(Path(tempfile.gettempdir()).resolve())
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "TEMP": temp, "TMP": temp}
     failed: list[str] = []
     for script in scripts:
         start = time.monotonic()
