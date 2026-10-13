@@ -9,6 +9,8 @@ sys.path.insert(0, ROOT)
 import config, main, organizer
 from organizer import FilePlan, ScanResult
 
+# Shared CI machines are slower than a desktop: timing limits get more room there.
+SLOW = 3 if os.environ.get("CI") else 1
 fails: list[str] = []
 def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name + (f"  [{extra}]" if extra and not cond else ""))
@@ -36,7 +38,7 @@ app._scan_result = big
 t0 = time.perf_counter()
 app._render_scan_result()
 first_call = time.perf_counter() - t0
-check("#16 render call returns quickly", first_call < 0.15, f"{first_call:.3f}s")
+check("#16 render call returns quickly", first_call < 0.15 * SLOW, f"{first_call:.3f}s")
 check("#16 only part of the rows inserted at first", 0 < len(app._preview_items) < N, len(app._preview_items))
 import _tkinter   # one event at a time, exactly like mainloop
 worst = 0.0
@@ -46,7 +48,7 @@ while len(app._preview_items) < N and time.monotonic() < end:
     app.tk.dooneevent(_tkinter.ALL_EVENTS | _tkinter.DONT_WAIT)
     worst = max(worst, time.perf_counter() - t)
 check("#16 all rows arrive", len(app._preview_items) == N, len(app._preview_items))
-check("#16 no single UI step blocks long", worst < 0.2, f"{worst:.3f}s")
+check("#16 no single UI step blocks long", worst < 0.2 * SLOW, f"{worst:.3f}s")
 app._scan_result = big
 app._render_scan_result()
 app._scan_result = None

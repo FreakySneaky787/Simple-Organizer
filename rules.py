@@ -160,11 +160,21 @@ def load_rules() -> list[Rule]:
     return [r for r in rules if r is not None]
 
 
+def _rule_to_dict(rule: Rule) -> dict:
+    """JSON entry for rule. more_conditions is only written when a rule has
+    further conditions: v3.4.0 and older reject unknown keys and would lose
+    every rule, even the simple ones, after going back to such a version."""
+    data = asdict(rule)
+    if not data["more_conditions"]:
+        del data["more_conditions"]
+    return data
+
+
 def save_rules(rules: list[Rule]) -> bool:
     """Persist rules to disk. Returns False on any write error."""
     try:
         RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(RULES_FILE, json.dumps([asdict(r) for r in rules], indent=2))
+        atomic_write_text(RULES_FILE, json.dumps([_rule_to_dict(r) for r in rules], indent=2))
         return True
     except Exception:
         return False

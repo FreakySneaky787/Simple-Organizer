@@ -91,7 +91,7 @@ Questions? See the [FAQ and Troubleshooting](https://github.com/FreakySneaky787/
 
 Feature release — fixes all open issues (#65 – #76) and adds what was on the roadmap (#77 – #80):
 
-- **Don't move** — keep single files out of a run: select them in the Preview and press `Space`, `Delete` or right-click
+- **Don't move** — keep single files where they are: select them in the Preview and press `Space`, `Delete` or right-click; also respected by later scans and automatic runs of the folder
 - **Filter and sort the Preview** — search field (`Ctrl+F`), click a column heading to sort
 - **Rules with several conditions** — a rule matches only if all its conditions match, e.g. *extension `pdf` + older than 365 days → `Archive`*
 - **Export to CSV** — the scan result opens directly in Excel or LibreOffice

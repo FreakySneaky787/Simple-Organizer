@@ -1,7 +1,7 @@
 # Tests
 
-Regression tests for every release since v3.4.2 — one core suite (`test_v*.py`, no window)
-and one GUI suite (`test_gui_v*.py`, drives the real app) per release.
+Regression tests for every release since v3.4.2 — core suites (`test_v*.py`, no window)
+and GUI suites (`test_gui_v*.py`, drive the real app).
 
 ```bat
 py tests\run_all.py

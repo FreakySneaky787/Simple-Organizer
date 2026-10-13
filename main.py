@@ -803,6 +803,9 @@ class SimpleOrganizerApp(tk.Tk):
         self._filter_job:    str | None = None
         self._undo_folder:   str = ""               # folder of the run being undone
         self._plan_outdated: bool = False           # rules changed while a scan was running
+        # Files set to "Don't move" (normcase'd paths). Kept for later scans of
+        # the same folder -- also automatic ones -- until another folder is picked.
+        self._excluded_keys: set[str] = set()
 
         self._recursive:      tk.BooleanVar = tk.BooleanVar(
             value=bool(self._settings.get("recursive", False)))
@@ -1288,7 +1291,7 @@ class SimpleOrganizerApp(tk.Tk):
         self._preview_tree.bind("<Delete>",   self._toggle_excluded)
 
         self._preview_empty = self._with_icon(ttk.Label(
-            tab, text="Pick a folder and press Scan to see what would move.",
+            tab, text=self._PREVIEW_EMPTY,
             style="Empty.TLabel", compound="top"), "folder-dashed", "empty")
         self._sync_empty(self._preview_tree, self._preview_empty)
         ttk.Label(
@@ -1717,6 +1720,7 @@ class SimpleOrganizerApp(tk.Tk):
             return
         self._folder = path.resolve()
         self._folder_var.set(str(self._folder))
+        self._excluded_keys.clear()
         self._scan_result = None
         self._render_scan_result()   # clears Preview and Duplicates of the old folder
         self._log(f"Folder set: {self._folder}")
@@ -1902,6 +1906,10 @@ class SimpleOrganizerApp(tk.Tk):
             self._auto_mode = False
             self._set_busy(False)
             self._log(f"[ERROR]  Scheduled scan failed: {exc}")
+        if not self._busy_flag:
+            # No scan started (e.g. the folder vanished a moment ago): the
+            # next manual scan must not organise without asking.
+            self._auto_mode = False
 
     # =========================================================================
     # Rules UI
@@ -2179,6 +2187,15 @@ class SimpleOrganizerApp(tk.Tk):
         if self._busy_flag:
             return
         folder = self._folder
+        if not folder.is_dir():
+            self._auto_mode = False
+            self._status("Folder not found.")
+            self._log(f"[WARN]  {folder} was not found -- nothing scanned.")
+            if not confirmed:
+                _showwarning("Folder not found",
+                             f"{folder} was not found.\n\nIs the drive connected? "
+                             "Connect it, or pick another folder with Browse.", parent=self)
+            return
         reason = risky_folder_reason(folder)
         if reason and not self._is_approved(folder) and not confirmed:
             if not _askyesno(
@@ -2240,6 +2257,12 @@ class SimpleOrganizerApp(tk.Tk):
                       + (" and the automatic run skipped." if auto_mode else "."))
             return
         self._scan_result = result
+        kept = 0
+        if self._excluded_keys:
+            for plan in result.plans:
+                if not plan.skipped and os.path.normcase(str(plan.source)) in self._excluded_keys:
+                    plan.excluded = True
+                    kept += 1
         self._set_busy(False)
         self._set_progress(100.0)
 
@@ -2254,6 +2277,7 @@ class SimpleOrganizerApp(tk.Tk):
         self._log(
             f"Scan complete -- {result.total_files} file(s) found, "
             f"{len(actionable)} to move, {len(skipped)} already placed."
+            + (f" {kept} file(s) stay where they are (Don't move)." if kept else "")
         )
         self._render_scan_result()
 
@@ -2346,6 +2370,7 @@ class SimpleOrganizerApp(tk.Tk):
     # ---- Preview: filter, sort, "Don't move" (#77, #78) --------------------
 
     _PREVIEW_HEADINGS = {"file": "FILE", "category": "CATEGORY", "destination": "DESTINATION"}
+    _PREVIEW_EMPTY = "Pick a folder and press Scan to see what would move."
 
     def _preview_plans(self) -> list[FilePlan]:
         """Rows of the Preview: every file that is not already in place."""
@@ -2375,6 +2400,13 @@ class SimpleOrganizerApp(tk.Tk):
                            reverse=descending)
         total = len(self._preview_plans())
         self._filter_info_var.set(f"{len(plans)} of {total} shown" if needle else "")
+        if not total:
+            self._preview_empty.configure(
+                text="Nothing to move -- every file is already in its folder."
+                if self._scan_result and self._scan_result.plans else
+                "No files to organise in this folder.")
+        elif not plans:
+            self._preview_empty.configure(text="No file matches the search.")
 
         def rows() -> Iterator[None]:
             for plan in plans:
@@ -2442,10 +2474,16 @@ class SimpleOrganizerApp(tk.Tk):
         exclude = not all(p.excluded for p in plans)
         for iid, plan in zip(iids, plans):
             plan.excluded = exclude
+            key = os.path.normcase(str(plan.source))
+            if exclude:
+                self._excluded_keys.add(key)
+            else:
+                self._excluded_keys.discard(key)
             self._preview_tree.item(iid, values=self._preview_values(plan),
                                     tags=("excluded",) if exclude else ())
         self._update_plan_counts()
-        excluded = sum(1 for p in self._scan_result.plans if p.excluded and not p.skipped)             if self._scan_result else 0
+        excluded = (sum(1 for p in self._scan_result.plans if p.excluded and not p.skipped)
+                    if self._scan_result else 0)
         self._status(f"Ready -- {len(self._actionable_plans())} file(s) to organise"
                      + (f", {excluded} set to Don't move." if excluded else "."))
         return "break"
@@ -2488,7 +2526,7 @@ class SimpleOrganizerApp(tk.Tk):
                 writer = csv.writer(fh, delimiter=csv_delimiter())
                 writer.writerow(["Status", "File", "Category", "Source folder",
                                  "Destination folder", "Size (bytes)"])
-                writer.writerows(rows)
+                writer.writerows([[_csv_text(c) for c in r] for r in rows])
         except OSError as exc:
             _showerror("Export failed", f"Could not write {target}:\n{exc.strerror or exc}", parent=self)
             return
@@ -2658,7 +2696,7 @@ class SimpleOrganizerApp(tk.Tk):
             return False
         current = os.path.normcase(str(self._folder))
         run = os.path.normcase(folder.split(" (+")[0])
-        return run == current or run.startswith(current + os.sep)
+        return run == current or run.startswith(os.path.join(current, ""))
 
     def _offer_schedule_pause(self) -> None:
         """Auto-organize would sort the restored files again at its next run (#75)."""
@@ -2822,7 +2860,7 @@ class SimpleOrganizerApp(tk.Tk):
             self._scan_btn, self._browse_btn, self._recursive_cb,
             self._hidden_cb, self._staging_cb, self._subcats_cb,
             self._max_depth_spin, self._max_dirs_spin, self._timeout_spin,
-            self._sched_cb, self._sched_spin,
+            self._sched_cb, self._sched_spin, self._export_btn,
         ):
             w.configure(state=state)
         self.configure(cursor="watch" if busy else "")
@@ -2856,6 +2894,7 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _clear_preview(self) -> None:
         self._preview_gen += 1
+        self._preview_empty.configure(text=self._PREVIEW_EMPTY)
         self._preview_tree.delete(*self._preview_tree.get_children())
         self._preview_items = {}
         self._set_tab_count(self._preview_tab_idx, 0)
@@ -3133,6 +3172,15 @@ class SimpleOrganizerApp(tk.Tk):
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+def _csv_text(value: str) -> str:
+    """A CSV cell that Excel and LibreOffice show as text, never run as a formula.
+
+    A file may be called "=1+1.txt" or "-draft.docx"; a cell that starts with
+    = + - or @ would be evaluated (CSV injection), so it gets a leading '.
+    """
+    return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+
 
 def _human_size(path: Path) -> str:
     try:
