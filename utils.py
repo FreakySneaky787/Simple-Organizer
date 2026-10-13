@@ -360,6 +360,21 @@ def resolve_conflict(destination: Path, max_retries: int = 1000) -> Path:
     )
 
 
+def csv_delimiter() -> str:
+    """The list separator Excel expects on this computer (";" in many European
+    locales, "," elsewhere). Read from the Windows regional settings."""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\International") as key:
+                sep = winreg.QueryValueEx(key, "sList")[0]
+            if isinstance(sep, str) and len(sep) == 1 and sep not in '"\r\n':
+                return sep
+        except OSError:
+            pass
+    return ","
+
+
 def safe_expanduser(path_str: str) -> Path:
     """Expand ~ and return an absolute Path."""
     return Path(path_str).expanduser().resolve()

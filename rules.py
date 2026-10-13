@@ -13,7 +13,7 @@ import fnmatch
 import json
 import re
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -55,21 +55,42 @@ class Rule:
     condition_type:  str   # one of CONDITION_TYPES
     condition_value: str   # string representation of threshold / pattern
     target_folder:   str   # destination subfolder name
+    # Further conditions as {"type": ..., "value": ...}; a rule matches only
+    # if ALL its conditions match. Kept separate from the first condition so
+    # rules.json stays readable for older versions.
+    more_conditions: list[dict[str, str]] = field(default_factory=list)
+
+    def conditions(self) -> list[tuple[str, str]]:
+        """All conditions of the rule as (type, value) pairs, first one first."""
+        return [(self.condition_type, self.condition_value)] + [
+            (c["type"], c["value"]) for c in self.more_conditions]
+
+    def describe(self) -> str:
+        """The conditions as text for the Rules tab, e.g. "extension pdf + older_than_days 365"."""
+        return "  +  ".join(f"{t} {v}" for t, v in self.conditions())
 
 
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
-_RULE_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(Rule))
+_RULE_FIELDS: tuple[str, ...] = (
+    "name", "enabled", "condition_type", "condition_value", "target_folder")
 
 
 def _rule_from_dict(raw: dict) -> Rule | None:
     """Build a Rule from one JSON entry, or None if the entry is invalid.
 
-    Unknown keys are ignored; missing keys make the entry invalid.
+    Unknown keys are ignored; missing keys make the entry invalid. A damaged
+    more_conditions list also makes the entry invalid: dropping a condition
+    would make the rule match more files than the user wanted.
     """
     if not all(k in raw for k in _RULE_FIELDS):
+        return None
+    more = raw.get("more_conditions", [])
+    if not isinstance(more, list) or not all(
+            isinstance(c, dict) and isinstance(c.get("type"), str) and isinstance(c.get("value"), str)
+            for c in more):
         return None
     try:
         return Rule(
@@ -78,6 +99,7 @@ def _rule_from_dict(raw: dict) -> Rule | None:
             condition_type=str(raw["condition_type"]),
             condition_value=str(raw["condition_value"]),
             target_folder=str(raw["target_folder"]),
+            more_conditions=[{"type": c["type"], "value": c["value"]} for c in more],
         )
     except Exception:
         return None
@@ -192,17 +214,48 @@ def is_valid_extension(value: str) -> bool:
     return bool(ext) and not any(c in ext for c in ' ,;/\\*?"<>|') and ".." not in ext
 
 
+NUMERIC_CONDITIONS = frozenset({"min_size_mb", "max_size_mb", "older_than_days", "newer_than_days"})
+
+
+def condition_problem(ctype: str, value: str) -> str | None:
+    """Why value is not valid for the condition ctype, or None if it is."""
+    value = value.strip()
+    if ctype not in CONDITION_LABELS:
+        return f'"{ctype}" is not a known condition.'
+    if not value:
+        return f'"{ctype}" needs a value.'
+    if ctype == "extension" and not is_valid_extension(value):
+        return (f'"{value}" is not a single file extension. Enter one extension such as '
+                "pdf or tar.gz -- use one condition per extension.")
+    if ctype in NUMERIC_CONDITIONS:
+        try:
+            number = float(value)
+        except ValueError:
+            number = float("nan")
+        if not (number >= 0 and number != float("inf")):
+            return f'"{value}" is not a valid number for "{ctype}". Enter zero or a positive number (e.g. 100).'
+    return None
+
+
+def normalize_condition_value(ctype: str, value: str) -> str:
+    value = value.strip()
+    return normalize_extension(value) if ctype == "extension" else value
+
+
 # ---------------------------------------------------------------------------
 # Matching
 # ---------------------------------------------------------------------------
 
 def match_rule(file_path: Path, rule: Rule) -> bool:
-    """Return True if file_path satisfies rule's condition."""
+    """Return True if file_path satisfies every condition of rule."""
     if not rule.enabled:
         return False
+    return all(_match_condition(file_path, ct, cv) for ct, cv in rule.conditions())
+
+
+def _match_condition(file_path: Path, ct: str, cv: str) -> bool:
     try:
-        ct = rule.condition_type
-        cv = rule.condition_value.strip()
+        cv = cv.strip()
 
         if ct == "extension":
             # endswith instead of comparing .suffix, so "tar.gz" works as well as "gz".

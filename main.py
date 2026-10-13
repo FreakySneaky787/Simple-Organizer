@@ -1,5 +1,6 @@
 # main.py
 
+import csv
 import math
 import os
 import queue
@@ -29,15 +30,15 @@ from organizer import (
     undo_specific_run,
 )
 from utils import (
-    DARK_THEME, LIGHT_THEME, acquire_instance_lock, append_error_log,
+    DARK_THEME, LIGHT_THEME, acquire_instance_lock, append_error_log, csv_delimiter,
     get_downloads_dir, risky_folder_reason, safe_expanduser,
 )
 from theme import FONTS, apply_ttk_theme, float_key, load_fonts, set_titlebar_theme
 from icons import badge, icon
 from config import DEFAULT_SETTINGS, load_settings, save_settings
 from rules import (
-    Rule, CONDITION_TYPES, CONDITION_LABELS, RulesReadError,
-    is_safe_target_folder, is_valid_extension, load_rules, normalize_extension, save_rules,
+    Rule, CONDITION_TYPES, CONDITION_LABELS, RulesReadError, condition_problem,
+    is_safe_target_folder, load_rules, normalize_condition_value, save_rules,
 )
 from scheduler import OrganizerScheduler
 
@@ -45,7 +46,7 @@ from scheduler import OrganizerScheduler
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.4.5"
+APP_VERSION  = "3.5.0"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -401,8 +402,13 @@ class _HistoryDialog(_Overlay):
         box = ttk.Frame(f, style="Panel.TFrame")
         box.pack(fill="both", expand=True)
         box.columnconfigure(0, weight=1)
-        self._tree = ttk.Treeview(box, show="tree", selectmode="browse", height=9)
-        self._tree.column("#0", width=420)
+        self._tree = ttk.Treeview(box, columns=("when", "files", "folder"), show="headings",
+                                  selectmode="browse", height=9)
+        for col, text, width, anchor in (("when", "WHEN", 170, "w"), ("files", "FILES", 60, "e"),
+                                         ("folder", "FOLDER", 380, "w")):
+            self._tree.heading(col, text=text, anchor=anchor)
+            self._tree.column(col, width=self._app._px(width), anchor=anchor,
+                              stretch=col == "folder")
         sb = _AutoScrollbar(box, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=sb.set)
         self._tree.grid(row=0, column=0, sticky="nsew")
@@ -413,51 +419,59 @@ class _HistoryDialog(_Overlay):
 
         ttk.Label(
             f,
-            text="Files that a newer run moved again are followed and restored too.",
+            text="All folders share one history. Files that a newer run moved again are "
+                 "followed and restored too.",
             style="CardHint.TLabel",
         ).pack(anchor="w", pady=(10, 0))
 
         self.button("Close", self.destroy)
         self._undo_btn = self.button("Undo selected", self._on_undo, primary=True)
+        self._open_btn = self.button("Open folder", self._on_open)
 
     def _load(self) -> None:
         self._entries = list_undo_history()
         self._tree.delete(*self._tree.get_children())
         if not self._entries:
-            self._tree.insert("", "end", text="No history available.", tags=("empty",))
+            self._tree.insert("", "end", values=("No history available.", "", ""), tags=("empty",))
             self._undo_btn.configure(state="disabled")
+            self._open_btn.configure(state="disabled")
             return
         for i, e in enumerate(self._entries):
-            self._tree.insert("", "end", iid=str(i), text=e["label"])
+            when = e["label"].split("  -  ")[0] + ("  · automatic" if e["scheduled"] else "")
+            self._tree.insert("", "end", iid=str(i),
+                              values=(when, str(e["move_count"]), e["folder"] or "?"))
         self._tree.selection_set("0")
         self._tree.focus("0")
 
-    def _on_undo(self) -> None:
+    def _selected(self) -> dict | None:
         sel = self._tree.selection()
-        if not sel or not self._entries:
+        if not sel or not self._entries or not sel[0].isdigit():
+            return None
+        return self._entries[int(sel[0])]
+
+    def _on_open(self) -> None:
+        entry = self._selected()
+        if entry and entry["folder"]:
+            self._app._open_folder(entry["folder"].split(" (+")[0])
+
+    def _on_undo(self) -> None:
+        entry = self._selected()
+        if entry is None:
             return
-        entry = self._entries[int(sel[0])]
         app = self._app
         self.destroy()
-        when = entry["label"].split("  -  ")[0]
-        if _askyesno(
-            title="Undo this run?",
-            message=(
-                f"Restore the {entry['move_count']} file(s) moved in the run of {when} "
-                "to their original locations?\n\n"
-                "- Nothing will be deleted.\n"
-                "- Name conflicts get a _1, _2 suffix."
-            ),
-            parent=app,
-        ):
-            app._undo_specific(entry["file_path"])
+        if _askyesno(title="Undo this run?", message=_undo_question(entry), parent=app):
+            app._undo_specific(entry["file_path"], entry["folder"])
 
 
 class _RuleDialog(_Overlay):
+    _MAX_CONDITIONS = 5
+
     def __init__(self, parent: "SimpleOrganizerApp", rule: Rule | None = None) -> None:
         super().__init__(parent, "Edit rule" if rule else "New rule")
         self._rule  = rule
         self.result: Rule | None = None
+        self._rows: list[dict[str, Any]] = []
         name_entry = self._build(rule)
         self.show(name_entry)
 
@@ -469,57 +483,102 @@ class _RuleDialog(_Overlay):
             ttk.Label(f, text=text, style="CardDim.TLabel").grid(
                 row=r, column=0, sticky="w", pady=(0 if r == 0 else 10, 3))
 
-        def hint(r: int, text: str | None = None, var: tk.StringVar | None = None) -> None:
-            ttk.Label(f, text=text or "", textvariable=var or "", style="CardHint.TLabel").grid(
-                row=r, column=0, sticky="w", pady=(3, 0))
-
         label(0, "Name")
         self._name_var = tk.StringVar(value=rule.name if rule else "")
         name_entry = ttk.Entry(f, textvariable=self._name_var, width=38, style="Card.TEntry")
         name_entry.grid(row=1, column=0, sticky="ew")
 
-        label(2, "Condition")
-        self._ctype_var = tk.StringVar(value=rule.condition_type if rule else CONDITION_TYPES[0])
-        cb = ttk.Combobox(f, textvariable=self._ctype_var, values=CONDITION_TYPES,
-                          state="readonly", width=36, style="Card.TCombobox")
-        cb.grid(row=3, column=0, sticky="ew")
-        cb.bind("<<ComboboxSelected>>", self._update_hint)
+        label(2, "Conditions — all must match")
+        self._cond_box = ttk.Frame(f, style="Panel.TFrame")
+        self._cond_box.grid(row=3, column=0, sticky="ew")
+        self._cond_box.columnconfigure(1, weight=1)
+        for ctype, value in (rule.conditions() if rule else [(CONDITION_TYPES[0], "")]):
+            self._add_row(ctype, value)
+        self._add_btn = ttk.Button(f, text="Add condition", style="Card.TButton",
+                                   command=self._add_condition)
+        self._add_btn.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self._layout_rows()
 
-        label(4, "Value")
-        self._val_var = tk.StringVar(value=rule.condition_value if rule else "")
-        ttk.Entry(f, textvariable=self._val_var, width=38, style="Card.TEntry").grid(
-            row=5, column=0, sticky="ew")
-        self._hint_var = tk.StringVar()
-        hint(6, var=self._hint_var)
-        self._update_hint()
-
-        label(7, "Target folder")
+        label(5, "Target folder")
         self._folder_var = tk.StringVar(value=rule.target_folder if rule else "")
         ttk.Entry(f, textvariable=self._folder_var, width=38, style="Card.TEntry").grid(
-            row=8, column=0, sticky="ew")
-        hint(9, "Subfolder name inside the scanned folder.")
+            row=6, column=0, sticky="ew")
+        ttk.Label(f, text="Subfolder name inside the scanned folder.",
+                  style="CardHint.TLabel").grid(row=7, column=0, sticky="w", pady=(3, 0))
 
         self._enabled_var = tk.BooleanVar(value=rule.enabled if rule else True)
         ttk.Checkbutton(f, text="Enabled", variable=self._enabled_var,
-                        style="Card.TCheckbutton").grid(row=10, column=0, sticky="w", pady=(14, 0))
+                        style="Card.TCheckbutton").grid(row=8, column=0, sticky="w", pady=(14, 0))
 
         self.button("Cancel", self.destroy)
         self.button("Save", self._ok, primary=True)
         self.bind("<Return>", lambda _e: self._ok())
+        # The first condition, also used by older code and tests.
+        self._ctype_var = self._rows[0]["type"]
+        self._val_var   = self._rows[0]["value"]
         return name_entry
 
-    def _update_hint(self, _event: Any = None) -> None:
-        self._hint_var.set(CONDITION_LABELS.get(self._ctype_var.get(), ""))
+    def _add_row(self, ctype: str, value: str) -> ttk.Entry:
+        app, box = self._app, self._cond_box
+        row: dict[str, Any] = {
+            "type":  tk.StringVar(value=ctype if ctype in CONDITION_TYPES else CONDITION_TYPES[0]),
+            "value": tk.StringVar(value=value),
+            "hint":  tk.StringVar(),
+        }
+        row["combo"] = ttk.Combobox(box, textvariable=row["type"], values=CONDITION_TYPES,
+                                    state="readonly", width=17, style="Card.TCombobox")
+        row["entry"] = ttk.Entry(box, textvariable=row["value"], width=18, style="Card.TEntry")
+        row["remove"] = ttk.Button(
+            box, style="Card.Ghost.TButton", command=lambda: self._remove_row(row),
+            image=(icon(self, "x", app._px(12), app._theme["fg_dim"]),
+                   "active", icon(self, "x", app._px(12), app._theme["fg"])))
+        row["label"] = ttk.Label(box, textvariable=row["hint"], style="CardHint.TLabel")
+        row["combo"].bind("<<ComboboxSelected>>", lambda _e: self._update_hint(row))
+        self._rows.append(row)
+        self._update_hint(row)
+        return row["entry"]
+
+    def _layout_rows(self) -> None:
+        several = len(self._rows) > 1
+        for i, row in enumerate(self._rows):
+            top = 0 if i == 0 else 8
+            row["combo"].grid(row=2 * i, column=0, sticky="w", pady=(top, 0))
+            row["entry"].grid(row=2 * i, column=1, sticky="ew", padx=(8, 0), pady=(top, 0))
+            if several:
+                row["remove"].grid(row=2 * i, column=2, padx=(4, 0), pady=(top, 0))
+            else:
+                row["remove"].grid_remove()
+            row["label"].grid(row=2 * i + 1, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        if hasattr(self, "_add_btn"):
+            self._add_btn.configure(
+                state="normal" if len(self._rows) < self._MAX_CONDITIONS else "disabled")
+        if self.winfo_ismapped():
+            self.follow()
+
+    def _add_condition(self) -> None:
+        if len(self._rows) >= self._MAX_CONDITIONS:
+            return
+        entry = self._add_row(CONDITION_TYPES[0], "")
+        self._layout_rows()
+        entry.focus_set()
+
+    def _remove_row(self, row: dict[str, Any]) -> None:
+        if len(self._rows) <= 1:
+            return
+        for key in ("combo", "entry", "remove", "label"):
+            row[key].destroy()
+        self._rows.remove(row)
+        self._layout_rows()
+
+    def _update_hint(self, row: dict[str, Any]) -> None:
+        row["hint"].set(CONDITION_LABELS.get(row["type"].get(), ""))
 
     def _ok(self) -> None:
         name   = self._name_var.get().strip()
         folder = self._folder_var.get().strip()
-        value  = self._val_var.get().strip()
-        ctype  = self._ctype_var.get()
 
-        if not name or not folder or not value:
-            _showwarning("Incomplete",
-                         "Name, Value, and Target Folder are required.", parent=self)
+        if not name or not folder:
+            _showwarning("Incomplete", "Name and Target folder are required.", parent=self)
             return
 
         if not is_safe_target_folder(folder):
@@ -533,37 +592,24 @@ class _RuleDialog(_Overlay):
             )
             return
 
-        if ctype == "extension":
-            if not is_valid_extension(value):
-                _showwarning(
-                    "Invalid extension",
-                    f'"{value}" is not a single file extension.\n'
-                    "Enter one extension such as pdf or tar.gz -- one rule per extension.",
-                    parent=self,
-                )
+        conditions: list[tuple[str, str]] = []
+        for row in self._rows:
+            ctype, value = row["type"].get(), row["value"].get()
+            problem = condition_problem(ctype, value)
+            if problem:
+                _showwarning("Invalid condition", problem, parent=self)
+                row["entry"].focus_set()
                 return
-            value = normalize_extension(value)
+            conditions.append((ctype, normalize_condition_value(ctype, value)))
 
-        numeric_types = {"min_size_mb", "max_size_mb", "older_than_days", "newer_than_days"}
-        if ctype in numeric_types:
-            try:
-                parsed = float(value)
-                if parsed < 0 or not math.isfinite(parsed):
-                    raise ValueError("negative or not finite")
-            except ValueError:
-                _showwarning(
-                    "Invalid value",
-                    f'"{value}" is not a valid number for "{ctype}".\nPlease enter a positive number (e.g. 100).',
-                    parent=self,
-                )
-                return
-
+        (first_type, first_value), *more = conditions
         self.result = Rule(
             name=name,
             enabled=self._enabled_var.get(),
-            condition_type=ctype,
-            condition_value=value,
+            condition_type=first_type,
+            condition_value=first_value,
             target_folder=folder,
+            more_conditions=[{"type": t, "value": v} for t, v in more],
         )
         self.destroy()
 
@@ -577,7 +623,8 @@ class _MessageDialog(_Overlay):
         "error":    ("x-circle", "danger"),
     }
 
-    def __init__(self, parent: tk.Misc, title: str, message: str, kind: str) -> None:
+    def __init__(self, parent: tk.Misc, title: str, message: str, kind: str,
+                 yes: str = "Continue", no: str = "Cancel") -> None:
         super().__init__(parent, title)
         self.result = False
         app = self._app
@@ -590,8 +637,8 @@ class _MessageDialog(_Overlay):
                   justify="left").grid(row=0, column=1, sticky="w")
 
         if kind == "question":
-            self.button("Cancel", self.destroy)
-            default = self.button("Continue", self._accept, primary=True)
+            self.button(no, self.destroy)
+            default = self.button(yes, self._accept, primary=True)
         else:
             default = self.button("OK", self._accept, primary=True)
 
@@ -604,8 +651,22 @@ class _MessageDialog(_Overlay):
         self.destroy()
 
 
-def _askyesno(title: str, message: str, parent: tk.Misc) -> bool:
-    return _MessageDialog(parent, title, message, "question").result
+def _askyesno(title: str, message: str, parent: tk.Misc,
+              yes: str = "Continue", no: str = "Cancel") -> bool:
+    return _MessageDialog(parent, title, message, "question", yes, no).result
+
+
+def _undo_question(entry: dict) -> str:
+    """Confirmation text naming exactly the run that will be undone."""
+    when = entry["label"].split("  -  ")[0]
+    kind = "automatic run" if entry.get("scheduled") else "run"
+    return (
+        f"Restore the {entry['move_count']} file(s) moved in the {kind} of {when} "
+        "to their original locations?\n\n"
+        f"Folder: {entry.get('folder') or 'unknown'}\n\n"
+        "- Nothing will be deleted.\n"
+        "- Name conflicts get a _1, _2 suffix."
+    )
 
 
 def _showinfo(title: str, message: str, parent: tk.Misc) -> None:
@@ -706,9 +767,15 @@ class SimpleOrganizerApp(tk.Tk):
         self._restore_geometry()
 
         # ── State ─────────────────────────────────────────────────────────────
+        # A saved folder is kept even if it is not reachable right now (drive
+        # unplugged): falling back to Downloads would let Auto-organize sort a
+        # folder the user never chose, and forget the real one on close.
         _saved_folder = self._settings.get("last_folder", "")
-        if _saved_folder and Path(_saved_folder).is_dir():
-            self._folder = safe_expanduser(_saved_folder)
+        if _saved_folder:
+            try:
+                self._folder = safe_expanduser(_saved_folder)
+            except (OSError, RuntimeError, ValueError):
+                self._folder = Path(_saved_folder)
         else:
             self._folder = get_downloads_dir().resolve()
 
@@ -731,6 +798,11 @@ class SimpleOrganizerApp(tk.Tk):
         self._steppers: dict[str, _Stepper] = {}     # settings key -> its number field
         self._settings_save_failed: bool = False
         self._instance_lock: object | None = None   # kept alive while the app runs
+        self._preview_gen:   int = 0                # bumped to cancel an unfinished Preview fill
+        self._preview_sort:  tuple[str, bool] = ("", False)   # column, descending
+        self._filter_job:    str | None = None
+        self._undo_folder:   str = ""               # folder of the run being undone
+        self._plan_outdated: bool = False           # rules changed while a scan was running
 
         self._recursive:      tk.BooleanVar = tk.BooleanVar(
             value=bool(self._settings.get("recursive", False)))
@@ -776,6 +848,9 @@ class SimpleOrganizerApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Configure>", self._on_configure)
         self._poll_queue()
+        if not self._folder.is_dir():
+            self._log(f"[WARN]  The last folder {self._folder} is not available right now "
+                      "(drive unplugged or disconnected?).")
 
     # =========================================================================
     # Window geometry
@@ -1007,12 +1082,12 @@ class SimpleOrganizerApp(tk.Tk):
 
         self._recursive_cb = ttk.Checkbutton(
             scan, text="Scan subdirectories", variable=self._recursive,
-            style="Card.TCheckbutton", command=self._save_settings)
+            style="Card.TCheckbutton", command=self._on_scan_option_changed)
         self._recursive_cb.pack(anchor="w")
 
         self._hidden_cb = ttk.Checkbutton(
             scan, text="Include hidden files", variable=self._include_hidden,
-            style="Card.TCheckbutton", command=self._save_settings)
+            style="Card.TCheckbutton", command=self._on_scan_option_changed)
         self._hidden_cb.pack(anchor="w")
 
         self._subcats_cb = ttk.Checkbutton(
@@ -1108,7 +1183,7 @@ class SimpleOrganizerApp(tk.Tk):
                    step: float) -> _Stepper:
         ttk.Label(parent, text=text, style="CardDim.TLabel").grid(
             row=row, column=0, sticky="w", pady=3)
-        stepper = _Stepper(parent, var, low, high, step)
+        stepper = _Stepper(parent, var, low, high, step, command=self._on_limit_changed)
         stepper.grid(row=row, column=1, sticky="e", pady=3)
         return stepper
 
@@ -1146,7 +1221,7 @@ class SimpleOrganizerApp(tk.Tk):
         _Tooltip(self._scan_btn,     "Scan the selected folder and preview planned moves. (Ctrl+R)")
         _Tooltip(self._organize_btn, "Move files into category subfolders. Shows total size first. (Ctrl+O)")
         _Tooltip(self._undo_btn,     "Restore all files moved in the last organise run. (Ctrl+Z)")
-        _Tooltip(self._history_btn,  "Browse and undo any of the last 20 organise runs.")
+        _Tooltip(self._history_btn,  "Browse and undo any of the last 20 manual and 20 automatic runs.")
 
         panel = ttk.Frame(work, style="Card.TFrame", padding=3)
         panel.grid(row=1, column=0, sticky="nsew")
@@ -1173,22 +1248,55 @@ class SimpleOrganizerApp(tk.Tk):
     def _build_preview_tab(self) -> None:
         tab = ttk.Frame(self._notebook, style="Panel.TFrame")
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(0, weight=1)
+        tab.rowconfigure(2, weight=1)
         self._preview_tab_idx = self._add_tab(tab, "Preview", "eye")
 
-        self._preview_tree = self._make_table(tab, ("file", "category", "destination"))
-        self._preview_tree.heading("file",        text="FILE",        anchor="w")
-        self._preview_tree.heading("category",    text="CATEGORY",    anchor="w")
-        self._preview_tree.heading("destination", text="DESTINATION", anchor="w")
+        bar = ttk.Frame(tab, style="Panel.TFrame", padding=(12, 8))
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self._with_icon(ttk.Label(bar, style="Card.TLabel"), "magnifying-glass").pack(
+            side="left", padx=(0, 6))
+        self._filter_var = tk.StringVar()
+        self._filter_entry = ttk.Entry(bar, textvariable=self._filter_var, width=34,
+                                       style="Card.TEntry")
+        self._filter_entry.pack(side="left")
+        self._filter_entry.bind("<Escape>", self._on_filter_escape)
+        self._filter_var.trace_add("write", self._on_filter_changed)
+        _Tooltip(self._filter_entry, "Show only files whose name, category or destination "
+                                     "contains this text. (Ctrl+F, Esc to clear)\n"
+                                     "Organize still moves every file that is not set to "
+                                     "\u201cDon't move\u201d.")
+        self._filter_info_var = tk.StringVar()
+        ttk.Label(bar, textvariable=self._filter_info_var, style="CardHint.TLabel").pack(
+            side="left", padx=(10, 0))
+        self._export_btn = self._with_icon(ttk.Button(
+            bar, text="Export CSV…", style="Card.TButton", command=self._export_csv),
+            "arrow-down")
+        self._export_btn.pack(side="right")
+        _Tooltip(self._export_btn, "Save the scan result as a CSV file (opens in Excel or LibreOffice).")
+        ttk.Frame(tab, style="Rule.TFrame", height=1).grid(row=1, column=0, columnspan=2, sticky="ew")
+
+        self._preview_tree = self._make_table(tab, ("file", "category", "destination"), row=2,
+                                              selectmode="extended")
+        for col, text in self._PREVIEW_HEADINGS.items():
+            self._preview_tree.heading(col, text=text, anchor="w",
+                                       command=lambda c=col: self._sort_preview(c))
         self._preview_tree.column("file",        width=260, anchor="w", stretch=True)
         self._preview_tree.column("category",    width=130, anchor="w", stretch=False)
         self._preview_tree.column("destination", width=320, anchor="w", stretch=True)
         self._preview_tree.bind("<Button-3>", self._on_preview_context)
+        self._preview_tree.bind("<space>",    self._toggle_excluded)
+        self._preview_tree.bind("<Delete>",   self._toggle_excluded)
 
         self._preview_empty = self._with_icon(ttk.Label(
             tab, text="Pick a folder and press Scan to see what would move.",
             style="Empty.TLabel", compound="top"), "folder-dashed", "empty")
         self._sync_empty(self._preview_tree, self._preview_empty)
+        ttk.Label(
+            tab,
+            text="Right-click, Space or Delete: don't move the selected files. "
+                 "Click a column heading to sort.",
+            style="CardHint.TLabel", padding=(12, 8),
+        ).grid(row=4, column=0, columnspan=2, sticky="w")
 
     def _build_duplicates_tab(self) -> None:
         tab = ttk.Frame(self._notebook, style="Panel.TFrame")
@@ -1291,18 +1399,16 @@ class SimpleOrganizerApp(tk.Tk):
         ttk.Frame(tab, style="Rule.TFrame", height=1).grid(
             row=1, column=0, columnspan=2, sticky="ew")
 
-        cols = ("enabled", "name", "condition", "value", "target")
+        cols = ("enabled", "name", "conditions", "target")
         self._rules_tree = self._make_table(tab, cols, row=2)
-        self._rules_tree.heading("enabled",   text="")
-        self._rules_tree.heading("name",      text="NAME",          anchor="w")
-        self._rules_tree.heading("condition", text="CONDITION",     anchor="w")
-        self._rules_tree.heading("value",     text="VALUE",         anchor="w")
-        self._rules_tree.heading("target",    text="TARGET FOLDER", anchor="w")
-        self._rules_tree.column("enabled",   width=40,  anchor="center", stretch=False)
-        self._rules_tree.column("name",      width=160, anchor="w",      stretch=True)
-        self._rules_tree.column("condition", width=140, anchor="w",      stretch=False)
-        self._rules_tree.column("value",     width=120, anchor="w",      stretch=False)
-        self._rules_tree.column("target",    width=160, anchor="w",      stretch=True)
+        self._rules_tree.heading("enabled",    text="")
+        self._rules_tree.heading("name",       text="NAME",                          anchor="w")
+        self._rules_tree.heading("conditions", text="CONDITIONS (ALL MUST MATCH)",   anchor="w")
+        self._rules_tree.heading("target",     text="TARGET FOLDER",                 anchor="w")
+        self._rules_tree.column("enabled",    width=40,  anchor="center", stretch=False)
+        self._rules_tree.column("name",       width=160, anchor="w",      stretch=True)
+        self._rules_tree.column("conditions", width=280, anchor="w",      stretch=True)
+        self._rules_tree.column("target",     width=160, anchor="w",      stretch=True)
         self._rules_tree.bind("<Button-1>", self._on_rules_click)
         self._rules_tree.bind("<Double-1>", self._on_rules_double_click)
         self._rules_tree.bind("<space>",    lambda _e: self._toggle_selected_rule())
@@ -1315,8 +1421,8 @@ class SimpleOrganizerApp(tk.Tk):
             row=4, column=0, columnspan=2, sticky="ew")
         ttk.Label(
             tab,
-            text="Rules run before extension-based categorisation. First match wins. "
-                 "Click the dot to turn a rule on or off.",
+            text="Rules run before extension-based categorisation. First match wins; a rule "
+                 "matches when all its conditions match. Click the dot to turn a rule on or off.",
             style="CardHint.TLabel", padding=(12, 10),
         ).grid(row=5, column=0, columnspan=2, sticky="w")
 
@@ -1350,7 +1456,7 @@ class SimpleOrganizerApp(tk.Tk):
 
         ttk.Label(
             bar,
-            text="Ctrl+R scan   Ctrl+O organize   Ctrl+Z undo   Ctrl+Q quit",
+            text="Ctrl+R scan   Ctrl+O organize   Ctrl+Z undo   Ctrl+1-4 tabs   Ctrl+Q quit",
             style="BarMuted.TLabel",
         ).grid(row=0, column=5, padx=(20, 0))
 
@@ -1442,6 +1548,7 @@ class SimpleOrganizerApp(tk.Tk):
         self._dup_tree.tag_configure("group", background=t["surface_alt"],
                                      foreground=t["fg_dim"], font=FONTS["caption"])
         self._rules_tree.tag_configure("off", foreground=t["fg_muted"])
+        self._preview_tree.tag_configure("excluded", foreground=t["fg_muted"])
 
         self._apply_icons()
         glyph = "sun" if self._dark_mode else "moon"
@@ -1530,13 +1637,31 @@ class SimpleOrganizerApp(tk.Tk):
             self._on_close()
             return "break"
 
+        def select_tab(index: int) -> Callable[[Any], str]:
+            def handler(_event: Any) -> str:
+                if not self._modal_open():
+                    self._notebook.select(index)
+                return "break"
+            return handler
+
+        def find(_event: Any) -> str:
+            if not self._modal_open():
+                self._notebook.select(self._preview_tab_idx)
+                self._filter_entry.focus_set()
+                self._filter_entry.select_range(0, "end")
+            return "break"
+
         # Both cases: with Caps Lock on, Tk reports Control-R instead of Control-r.
         for key, handler in (("r", shortcut(self._start_scan)),
                              ("o", shortcut(self._confirm_and_organize)),
                              ("z", shortcut(self._confirm_and_undo, not_in_fields=True)),
+                             ("f", find),
                              ("q", close)):
             self.bind_all(f"<Control-{key}>", handler)
             self.bind_all(f"<Control-{key.upper()}>", handler)
+        self.bind_all("<F5>", shortcut(self._start_scan))
+        for number in range(1, len(self._tabs) + 1):
+            self.bind_all(f"<Control-Key-{number}>", select_tab(number - 1))
 
     def _modal_open(self) -> bool:
         return bool(self._overlays) or self._native_dialog
@@ -1625,7 +1750,32 @@ class SimpleOrganizerApp(tk.Tk):
         self._save_settings()
 
     def _on_subcats_toggle(self) -> None:
+        self._on_scan_option_changed()
+
+    def _on_scan_option_changed(self) -> None:
         self._save_settings()
+        self._invalidate_plan("The scan options changed")
+
+    def _on_limit_changed(self) -> None:
+        # The limits only matter for recursive scans.
+        if self._recursive.get():
+            self._invalidate_plan("The scan limits changed")
+
+    def _invalidate_plan(self, why: str) -> None:
+        """Drop a plan that no longer matches the options or rules (#73):
+        Organize must never move files according to an outdated preview."""
+        if self._busy_flag:
+            # The Rules tab stays usable during a scan: its result is based on
+            # the old rules and is discarded when it arrives.
+            if not self._task_moves_files:
+                self._plan_outdated = True
+            return
+        if self._scan_result is None:
+            return
+        self._scan_result = None
+        self._render_scan_result()
+        self._status(f"{why} -- press Scan to update the preview.")
+        self._log(f"[WARN]  {why} -- the preview was cleared. Scan again before organizing.")
 
     def _refresh_persistent_buttons(self) -> None:
         """Set every action button from the current state. While a task runs
@@ -1648,7 +1798,7 @@ class SimpleOrganizerApp(tk.Tk):
     def _actionable_plans(self) -> list[FilePlan]:
         if not self._scan_result:
             return []
-        return [p for p in self._scan_result.plans if not p.skipped]
+        return [p for p in self._scan_result.plans if not p.skipped and not p.excluded]
 
     # =========================================================================
     # Schedule
@@ -1782,8 +1932,7 @@ class SimpleOrganizerApp(tk.Tk):
         for rule in rules:
             self._rules_tree.insert("", "end", values=(
                 "●" if rule.enabled else "○",
-                rule.name, rule.condition_type,
-                rule.condition_value, rule.target_folder,
+                rule.name, rule.describe(), rule.target_folder,
             ), tags=() if rule.enabled else ("off",))
         self._sync_empty(self._rules_tree, self._rules_empty)
 
@@ -1792,6 +1941,8 @@ class SimpleOrganizerApp(tk.Tk):
             self._log("[WARN]  Rules could not be saved — check disk space and permissions.")
             self._notify("Rules not saved",
                          "Your rule changes could not be written to disk.", "warning")
+            return
+        self._invalidate_plan("The rules changed")
 
     def _selected_rule_index(self) -> int | None:
         sel = self._rules_tree.selection()
@@ -1903,9 +2054,10 @@ class SimpleOrganizerApp(tk.Tk):
             return
         _HistoryDialog(self)
 
-    def _undo_specific(self, run_file: Path) -> None:
+    def _undo_specific(self, run_file: Path, folder: str = "") -> None:
         if self._busy_flag:
             return
+        self._undo_folder = folder
         self._start_task(
             f"Undoing {run_file.stem}...",
             lambda progress, log: {
@@ -2044,6 +2196,7 @@ class SimpleOrganizerApp(tk.Tk):
             self._approve(folder)
 
         self._save_settings()   # persist current scan options before running
+        self._plan_outdated = False
         self._scan_result = None
         self._render_scan_result()   # also cancels a tree fill that is still running
 
@@ -2076,6 +2229,16 @@ class SimpleOrganizerApp(tk.Tk):
     def _handle_scan_done(self, result: ScanResult) -> None:
         # Consume the auto-mode flag first so it can never leak into a manual scan.
         auto_mode, self._auto_mode = self._auto_mode, False
+        if self._plan_outdated:
+            self._plan_outdated = False
+            self._set_busy(False)
+            self._set_progress(100.0)
+            self._scan_result = None
+            self._render_scan_result()
+            self._status("The rules changed during the scan -- press Scan again.")
+            self._log("[WARN]  The rules changed while scanning -- the result was discarded"
+                      + (" and the automatic run skipped." if auto_mode else "."))
+            return
         self._scan_result = result
         self._set_busy(False)
         self._set_progress(100.0)
@@ -2136,26 +2299,12 @@ class SimpleOrganizerApp(tk.Tk):
             self._refresh_persistent_buttons()
             return
 
-        actionable = self._actionable_plans()
-        skipped    = len(result.plans) - len(actionable)
-        self._set_tab_count(self._preview_tab_idx, len(actionable))
         self._set_tab_count(self._dup_tab_idx, len(result.duplicate_groups))
-        self._fill_trees(self._render_gen, self._tree_rows(result, actionable))
+        self._fill_trees(self._render_gen, self._dup_rows(result))
+        self._render_preview()
 
-        summary = f"{len(actionable)} to move  ·  {skipped} in place"
-        if result.duplicate_groups:
-            summary += f"  ·  {len(result.duplicate_groups)} duplicate groups"
-        self._summary_var.set(summary)
-        self._refresh_persistent_buttons()
-
-    def _tree_rows(self, result: ScanResult, actionable: list[FilePlan]) -> Iterator[None]:
-        """Insert the Preview and Duplicates rows one by one, yielding after each."""
-        for plan in actionable:
-            iid = self._preview_tree.insert("", "end",
-                values=(plan.source.name, plan.category, str(plan.destination.parent)))
-            self._preview_items[iid] = plan
-            yield
-
+    def _dup_rows(self, result: ScanResult) -> Iterator[None]:
+        """Insert the Duplicates rows one by one, yielding after each."""
         # _dup_groups: group_node_iid -> list of file iids in that group
         for group_idx, group in enumerate(result.duplicate_groups, start=1):
             node = self._dup_tree.insert("", "end", text=f"Group {group_idx}",
@@ -2176,19 +2325,175 @@ class SimpleOrganizerApp(tk.Tk):
                 file_iids.append(iid)
                 yield
 
-    def _fill_trees(self, gen: int, rows: Iterator[None]) -> None:
-        """Insert rows for at most _RENDER_BUDGET_S, then continue on the next tick."""
-        if gen != self._render_gen:
-            return   # a newer result replaced this one
+    def _fill_trees(self, gen: int, rows: Iterator[None], preview: bool = False) -> None:
+        """Insert rows for at most _RENDER_BUDGET_S, then continue on the next tick.
+
+        Preview and Duplicates are filled separately (preview=True/False), so
+        filtering the Preview never cancels a Duplicates fill.
+        """
+        if gen != (self._preview_gen if preview else self._render_gen):
+            return   # a newer result or filter replaced this one
         deadline = time.monotonic() + _RENDER_BUDGET_S
         for _ in rows:
             if time.monotonic() >= deadline:
                 # The gap lets Tk redraw: a timer that is already due would
                 # always run before the (idle) redraw and starve it.
-                self.after(_YIELD_MS, self._fill_trees, gen, rows)
+                self.after(_YIELD_MS, self._fill_trees, gen, rows, preview)
                 break
         self._sync_empty(self._preview_tree, self._preview_empty)
         self._sync_empty(self._dup_tree, self._dup_empty)
+
+    # ---- Preview: filter, sort, "Don't move" (#77, #78) --------------------
+
+    _PREVIEW_HEADINGS = {"file": "FILE", "category": "CATEGORY", "destination": "DESTINATION"}
+
+    def _preview_plans(self) -> list[FilePlan]:
+        """Rows of the Preview: every file that is not already in place."""
+        if not self._scan_result:
+            return []
+        return [p for p in self._scan_result.plans if not p.skipped]
+
+    def _preview_values(self, plan: FilePlan) -> tuple[str, str, str]:
+        if plan.excluded:
+            return (plan.source.name, plan.category, "—  not moved")
+        return (plan.source.name, plan.category, str(plan.destination.parent))
+
+    def _render_preview(self) -> None:
+        """Fill the Preview from the plan, applying the filter and the sort order."""
+        self._preview_gen += 1
+        self._preview_tree.delete(*self._preview_tree.get_children())
+        self._preview_items = {}
+        plans = self._preview_plans()
+        needle = self._filter_var.get().strip().lower()
+        if needle:
+            plans = [p for p in plans if needle in p.source.name.lower()
+                     or needle in p.category.lower() or needle in str(p.destination.parent).lower()]
+        column, descending = self._preview_sort
+        if column:
+            index = ("file", "category", "destination").index(column)
+            plans = sorted(plans, key=lambda p: self._preview_values(p)[index].lower(),
+                           reverse=descending)
+        total = len(self._preview_plans())
+        self._filter_info_var.set(f"{len(plans)} of {total} shown" if needle else "")
+
+        def rows() -> Iterator[None]:
+            for plan in plans:
+                iid = self._preview_tree.insert("", "end", values=self._preview_values(plan),
+                                                tags=("excluded",) if plan.excluded else ())
+                self._preview_items[iid] = plan
+                yield
+        self._fill_trees(self._preview_gen, rows(), preview=True)
+        self._update_plan_counts()
+
+    def _update_plan_counts(self) -> None:
+        result = self._scan_result
+        if result is None:
+            self._summary_var.set("")
+            self._set_tab_count(self._preview_tab_idx, 0)
+            self._refresh_persistent_buttons()
+            return
+        actionable = self._actionable_plans()
+        excluded   = sum(1 for p in result.plans if p.excluded and not p.skipped)
+        in_place   = sum(1 for p in result.plans if p.skipped)
+        summary = f"{len(actionable)} to move"
+        if excluded:
+            summary += f"  ·  {excluded} not moved"
+        summary += f"  ·  {in_place} in place"
+        if result.duplicate_groups:
+            summary += f"  ·  {len(result.duplicate_groups)} duplicate groups"
+        self._summary_var.set(summary)
+        self._set_tab_count(self._preview_tab_idx, len(actionable))
+        self._refresh_persistent_buttons()
+
+    def _on_filter_changed(self, *_args: Any) -> None:
+        if self._filter_job:
+            self.after_cancel(self._filter_job)
+        self._filter_job = self.after(150, self._apply_filter)
+
+    def _apply_filter(self) -> None:
+        self._filter_job = None
+        if self._scan_result is not None:
+            self._render_preview()
+
+    def _on_filter_escape(self, _event: Any = None) -> str:
+        self._filter_var.set("")
+        self._preview_tree.focus_set()
+        return "break"
+
+    def _sort_preview(self, column: str) -> None:
+        current, descending = self._preview_sort
+        self._preview_sort = (column, not descending if current == column else False)
+        for col, text in self._PREVIEW_HEADINGS.items():
+            arrow = ""
+            if col == column:
+                arrow = "  ▼" if self._preview_sort[1] else "  ▲"
+            self._preview_tree.heading(col, text=text + arrow)
+        if self._scan_result is not None:
+            self._render_preview()
+
+    def _toggle_excluded(self, _event: Any = None) -> str | None:
+        """Don't move / move again the selected Preview rows."""
+        if self._busy_flag:
+            return "break"
+        iids = [i for i in self._preview_tree.selection() if i in self._preview_items]
+        if not iids:
+            return None
+        plans = [self._preview_items[i] for i in iids]
+        exclude = not all(p.excluded for p in plans)
+        for iid, plan in zip(iids, plans):
+            plan.excluded = exclude
+            self._preview_tree.item(iid, values=self._preview_values(plan),
+                                    tags=("excluded",) if exclude else ())
+        self._update_plan_counts()
+        excluded = sum(1 for p in self._scan_result.plans if p.excluded and not p.skipped)             if self._scan_result else 0
+        self._status(f"Ready -- {len(self._actionable_plans())} file(s) to organise"
+                     + (f", {excluded} set to Don't move." if excluded else "."))
+        return "break"
+
+    def _export_csv(self) -> None:
+        """Save the scan result as CSV (#80)."""
+        if self._busy_flag or self._modal_open():
+            return
+        result = self._scan_result
+        if result is None:
+            _showinfo("Nothing to export", "Scan a folder first.", parent=self)
+            return
+        start = Path.home() / "Documents"
+        name = f"simple_organizer_{self._folder.name or 'scan'}_{time.strftime('%Y-%m-%d_%H%M')}.csv"
+        self._native_dialog = True
+        try:
+            target = filedialog.asksaveasfilename(
+                parent=self, title="Export scan result", defaultextension=".csv",
+                initialdir=str(start if start.is_dir() else Path.home()), initialfile=name,
+                filetypes=[("CSV file", "*.csv"), ("All files", "*.*")])
+        finally:
+            self._native_dialog = False
+        if not target:
+            return
+        rows: list[list[str]] = []
+        for p in result.plans:
+            status = ("already in place" if p.skipped else "don't move" if p.excluded else "move")
+            rows.append([status, p.source.name, p.category, str(p.source.parent),
+                         "" if p.skipped or p.excluded else str(p.destination.parent), str(p.size)])
+        for number, group in enumerate(result.duplicate_groups, start=1):
+            for path in group:
+                try:
+                    size = str(path.stat().st_size)
+                except OSError:
+                    size = ""
+                rows.append([f"duplicate (group {number})", path.name, "", str(path.parent), "", size])
+        try:
+            # utf-8-sig and the system's list separator: Excel opens it correctly.
+            with open(target, "w", encoding="utf-8-sig", newline="") as fh:
+                writer = csv.writer(fh, delimiter=csv_delimiter())
+                writer.writerow(["Status", "File", "Category", "Source folder",
+                                 "Destination folder", "Size (bytes)"])
+                writer.writerows(rows)
+        except OSError as exc:
+            _showerror("Export failed", f"Could not write {target}:\n{exc.strerror or exc}", parent=self)
+            return
+        self._log(f"Scan result exported to {target} ({len(rows)} rows).")
+        self._notify("Exported", f"{Path(target).name} -- {len(rows)} rows.", "success")
 
     def _prune_scan_result(self, gone: list[Path]) -> None:
         """Drop the files in gone (e.g. just trashed) from the scan result and
@@ -2223,10 +2528,13 @@ class SimpleOrganizerApp(tk.Tk):
 
         actionable = self._actionable_plans()
         if not actionable:
-            _showinfo("Nothing to do", "All files are already organised.", parent=self)
+            if any(p.excluded for p in result.plans):
+                _showinfo("Nothing to do", "Every file is set to \u201cDon't move\u201d.", parent=self)
+            else:
+                _showinfo("Nothing to do", "All files are already organised.", parent=self)
             return
 
-        size_str = _fmt_size(result.total_bytes)   # summed by the scan thread
+        size_str = _fmt_size(sum(p.size for p in actionable))
 
         staging = self._use_staging.get()
         dest_label = (
@@ -2297,6 +2605,15 @@ class SimpleOrganizerApp(tk.Tk):
         if not has_last_run():
             self._notify("Nothing to undo", "There is no organise run in the history.", "info")
             return
+        entries = list_undo_history(limit=1)
+        if entries:
+            # Name the run in the question and undo exactly that run.
+            entry = entries[0]
+            if _askyesno(title="Undo Last Organize", message=_undo_question(entry),
+                         parent=self) and not self._busy_flag:
+                self._undo_specific(entry["file_path"], entry["folder"])
+            return
+        self._undo_folder = ""
         confirmed = _askyesno(
             title="Undo Last Organize",
             message=(
@@ -2331,6 +2648,32 @@ class SimpleOrganizerApp(tk.Tk):
             self._log("Undo complete -- files restored to original locations.")
             self._status("Undo complete.")
             self._notify("Undo complete", "Files are back where they were.")
+        folder, self._undo_folder = self._undo_folder, ""
+        if self._schedule_enabled.get() and self._is_current_folder(folder):
+            # Outside the queue handler: the question runs its own event loop.
+            self.after_idle(self._offer_schedule_pause)
+
+    def _is_current_folder(self, folder: str) -> bool:
+        if not folder:
+            return False
+        current = os.path.normcase(str(self._folder))
+        run = os.path.normcase(folder.split(" (+")[0])
+        return run == current or run.startswith(current + os.sep)
+
+    def _offer_schedule_pause(self) -> None:
+        """Auto-organize would sort the restored files again at its next run (#75)."""
+        if not self._schedule_enabled.get() or self._busy_flag or self._close_requested:
+            return
+        if _askyesno(
+            title="Pause Auto-organize?",
+            message=("Auto-organize is on for this folder and would sort the restored files "
+                     "again at its next run.\n\nPause it? You can turn it on again in the "
+                     "sidebar at any time."),
+            parent=self, yes="Pause", no="Keep running",
+        ):
+            self._schedule_enabled.set(False)
+            self._on_schedule_toggle()
+            self._log("[SCHEDULE]  Auto-organize paused after an undo.")
 
     # =========================================================================
     # Staging commit / revert
@@ -2345,7 +2688,7 @@ class SimpleOrganizerApp(tk.Tk):
                 "Move all staged files to their final category folders?\n\n"
                 "- Files are MOVED, not copied.\n"
                 "- Nothing will be deleted.\n"
-                "- This action can be undone with Undo Last Run."
+                "- This can be undone with Undo last or History."
             ),
             parent=self,
         )
@@ -2512,10 +2855,12 @@ class SimpleOrganizerApp(tk.Tk):
         self._log_box.configure(state="disabled")
 
     def _clear_preview(self) -> None:
+        self._preview_gen += 1
         self._preview_tree.delete(*self._preview_tree.get_children())
         self._preview_items = {}
         self._set_tab_count(self._preview_tab_idx, 0)
         self._summary_var.set("")
+        self._filter_info_var.set("")
         self._sync_empty(self._preview_tree, self._preview_empty)
 
     def _clear_duplicates(self) -> None:
@@ -2676,7 +3021,8 @@ class SimpleOrganizerApp(tk.Tk):
         item = self._preview_tree.identify_row(event.y)
         if not item:
             return
-        self._preview_tree.selection_set(item)
+        if item not in self._preview_tree.selection():
+            self._preview_tree.selection_set(item)
 
         plan = self._preview_items.get(item)
         if plan is None:
@@ -2685,6 +3031,16 @@ class SimpleOrganizerApp(tk.Tk):
         dest_folder  = str(plan.destination.parent)
 
         menu = self._menu()
+        selected = [self._preview_items[i] for i in self._preview_tree.selection()
+                    if i in self._preview_items]
+        count = f" ({len(selected)} files)" if len(selected) > 1 else ""
+        if all(p.excluded for p in selected):
+            menu.add_command(label="Move again" + count, command=self._toggle_excluded)
+        else:
+            menu.add_command(label="Don't move" + count, command=self._toggle_excluded)
+        if self._busy_flag:
+            menu.entryconfigure(0, state="disabled")
+        menu.add_separator()
         has_open  = False
         has_copy  = False
 
@@ -2694,7 +3050,8 @@ class SimpleOrganizerApp(tk.Tk):
                 command=lambda: self._open_folder(str(source_path.parent))
             )
             has_open = True
-        if dest_folder:
+        # Before Organize the category folder usually does not exist yet.
+        if dest_folder and Path(dest_folder).is_dir():
             menu.add_command(
                 label="Open destination folder",
                 command=lambda: self._open_folder(dest_folder)

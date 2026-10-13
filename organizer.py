@@ -107,6 +107,17 @@ def _target_problem(root: Path, target_dir: Path) -> str | None:
     return None
 
 
+def _reason(exc: BaseException) -> str:
+    """Short reason for a failed file operation, e.g. "Access is denied".
+
+    str(OSError) repeats both paths with doubled backslashes; the file name
+    is already part of every message, so only the reason is shown.
+    """
+    if isinstance(exc, OSError) and exc.strerror:
+        return exc.strerror
+    return str(exc) or type(exc).__name__
+
+
 def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -219,6 +230,7 @@ class FilePlan:
     skipped:     bool = False
     size:        int  = 0
     root:        Path | None = None   # the scanned folder the plan belongs to
+    excluded:    bool = False         # the user chose "Don't move" in the Preview
 
 
 @dataclass
@@ -698,11 +710,13 @@ def organise_files(
     _ensure_data_dir()
 
     errors:       list[str]           = []
-    actionable                        = [p for p in plans if not p.skipped]
+    actionable                        = [p for p in plans if not p.skipped and not p.excluded]
     total                             = len(actionable)
     timestamp                         = _now_iso()
     move_log:     list[dict[str, str]] = []
     created_dirs: list[str]           = []
+    # The scanned folder(s), shown in History so runs of different folders can be told apart.
+    folders = sorted({str(p.root) for p in actionable if p.root})
 
     # Journal: written every JOURNAL_FLUSH_SECONDS and at the end.
     run_path: Path | None = None
@@ -730,18 +744,27 @@ def organise_files(
             run_path = _write_history_run({
                 "timestamp":    timestamp,
                 "scheduled":    scheduled,
+                "folders":      folders,
                 "moves":        [{"src": m["src"], "dst": m["dst"]} for m in move_log],
                 "created_dirs": created_dirs,
             }, log_callback, path=run_path, scheduled=scheduled)
 
     last_flush = time.monotonic()
     left_in_cloud = 0
+    missing = 0
 
     for idx, plan in enumerate(actionable, start=1):
         if progress_callback:
             progress_callback(idx, total)
 
         try:
+            if not plan.source.exists():
+                # Deleted or moved away since the scan: nothing went wrong.
+                missing += 1
+                if log_callback:
+                    log_callback(f"[SKIP]  {plan.source.name} no longer exists -- it was moved "
+                                 "or deleted after the scan.")
+                continue
             if staging:
                 # The staging area is outside the scanned folder. Moving an
                 # online-only cloud file (OneDrive...) out of its sync folder
@@ -776,12 +799,12 @@ def organise_files(
                 log_callback(msg)
 
         except PermissionError as exc:
-            err = f"[ERROR]  Permission denied moving {plan.source.name}: {exc}"
+            err = f"[ERROR]  Permission denied moving {plan.source.name}: {_reason(exc)}"
             errors.append(err)
             if log_callback:
                 log_callback(err)
         except Exception as exc:  # noqa: BLE001
-            err = f"[ERROR]  Unexpected error for {plan.source.name}: {exc}"
+            err = f"[ERROR]  Could not move {plan.source.name}: {_reason(exc)}"
             errors.append(err)
             if log_callback:
                 log_callback(err)
@@ -790,8 +813,20 @@ def organise_files(
             write_journal()
             last_flush = time.monotonic()
 
+    # Folders created for files that could then not be moved are empty:
+    # remove them now instead of leaving them behind (or until an undo).
+    for d in sorted(created_dirs, key=len, reverse=True):
+        try:
+            os.rmdir(d)
+        except OSError:
+            continue
+        created_dirs.remove(d)
+
     # Only written when at least one file was actually moved / staged.
     write_journal()
+    if missing and log_callback:
+        log_callback(f"[WARN]  {_plural(missing, 'file was', 'files were')} no longer there "
+                     "and skipped -- scan again to see the current state.")
     if left_in_cloud and log_callback:
         log_callback(f"[WARN]  {_plural(left_in_cloud, 'online-only file was', 'online-only files were')} "
                      "not staged. Organise without staging mode to sort them without downloading.")
@@ -963,8 +998,30 @@ def _newest_run_file() -> Path | None:
     return runs[-1] if runs else None
 
 
-def list_undo_history() -> list[dict]:
-    """Return metadata for all undoable runs, newest first."""
+def _run_folder(data: dict) -> str:
+    """The folder a history run organised (older runs: the common folder of its files)."""
+    folders = data.get("folders")
+    if isinstance(folders, list) and folders and all(isinstance(f, str) for f in folders):
+        return folders[0] if len(folders) == 1 else f"{folders[0]} (+{len(folders) - 1} more)"
+    parents: list[str] = []
+    for m in data.get("moves", []):
+        try:
+            parents.append(os.path.dirname(str(m["src"])))
+        except (KeyError, TypeError):
+            continue
+    if not parents:
+        return ""
+    try:
+        return os.path.commonpath(parents)
+    except ValueError:   # files on different drives
+        return parents[0]
+
+
+def list_undo_history(limit: int | None = None) -> list[dict]:
+    """Return metadata for the undoable runs, newest first (at most limit).
+
+    limit=1 reads only as many files as needed to find the newest readable run.
+    """
     _migrate_legacy_last_run()
     if not HISTORY_DIR.exists():
         return []
@@ -991,9 +1048,12 @@ def list_undo_history() -> list[dict]:
                 "file_path":  f,
                 "label":      lbl,
                 "scheduled":  scheduled,
+                "folder":     _run_folder(data),
             })
         except Exception:
             pass
+        if limit is not None and len(result) >= limit:
+            break
     return result
 
 
@@ -1097,9 +1157,9 @@ def _undo_run_file(
             log(msg)
             continue
         except PermissionError as exc:
-            err = f"[ERROR]  Permission denied restoring {dst_path.name}: {exc}"
+            err = f"[ERROR]  Permission denied restoring {dst_path.name}: {_reason(exc)}"
         except Exception as exc:  # noqa: BLE001
-            err = f"[ERROR]  Unexpected error restoring {dst_path.name}: {exc}"
+            err = f"[ERROR]  Unexpected error restoring {dst_path.name}: {_reason(exc)}"
         errors.append(err)
         failed.append(entry)
         log(err)
@@ -1281,11 +1341,14 @@ def commit_staging(
     run_path:     Path | None          = None
     last_flush   = time.monotonic()
 
+    folders = sorted({str(e["root"]) for e in entries if isinstance(e, dict) and e.get("root")})
+
     def write_journal() -> None:
         nonlocal run_path
         if move_log:
             run_path = _write_history_run(
-                {"timestamp": timestamp, "moves": move_log, "created_dirs": created_dirs},
+                {"timestamp": timestamp, "folders": folders, "moves": move_log,
+                 "created_dirs": created_dirs},
                 log_callback, path=run_path)
 
     for idx, entry in enumerate(entries, start=1):
@@ -1327,9 +1390,9 @@ def commit_staging(
             if log_callback:
                 log_callback(msg)
         except PermissionError as exc:
-            err = f"[ERROR]  Permission denied committing {staged_path.name}: {exc}"
+            err = f"[ERROR]  Permission denied committing {staged_path.name}: {_reason(exc)}"
         except Exception as exc:  # noqa: BLE001
-            err = f"[ERROR]  Unexpected error committing {staged_path.name}: {exc}"
+            err = f"[ERROR]  Unexpected error committing {staged_path.name}: {_reason(exc)}"
         else:
             err = ""
         if err:
@@ -1341,6 +1404,14 @@ def commit_staging(
         if time.monotonic() - last_flush >= JOURNAL_FLUSH_SECONDS:
             write_journal()
             last_flush = time.monotonic()
+
+    # Folders created for files that then failed to commit would stay empty.
+    for d in sorted(created_dirs, key=len, reverse=True):
+        try:
+            os.rmdir(d)
+        except OSError:
+            continue
+        created_dirs.remove(d)
 
     # Only written when at least one file was actually moved.
     write_journal()
@@ -1411,9 +1482,9 @@ def revert_staging(
                 log_callback(msg)
             continue
         except PermissionError as exc:
-            err = f"[ERROR]  Permission denied reverting {staged_path.name}: {exc}"
+            err = f"[ERROR]  Permission denied reverting {staged_path.name}: {_reason(exc)}"
         except Exception as exc:  # noqa: BLE001
-            err = f"[ERROR]  Unexpected error reverting {staged_path.name}: {exc}"
+            err = f"[ERROR]  Unexpected error reverting {staged_path.name}: {_reason(exc)}"
         errors.append(err)
         failed.append(entry)
         if log_callback:
@@ -1679,7 +1750,7 @@ def trash_files(
             if log_callback:
                 log_callback(f"[TRASHED]  {path.name}  ({path.parent})")
         except Exception as exc:  # noqa: BLE001
-            err = f"[ERROR]  Could not trash {path.name}: {exc}"
+            err = f"[ERROR]  Could not trash {path.name}: {_reason(exc)}"
             errors.append(err)
             if log_callback:
                 log_callback(err)

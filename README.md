@@ -11,9 +11,9 @@ Nothing is ever deleted or overwritten, and every run can be undone. No internet
 ## Features
 
 - **Sorts by file type** into Images, Documents, Archives, Videos, Music, Code, Programs, Disk Images and Others — optionally into sub-folders like `Images/Photos` or `Documents/PDFs` → [Categories](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Categories-and-File-Types)
-- **Preview first** — a scan only plans; nothing moves until you press Organize → [Getting Started](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Getting-Started)
-- **Multi-level undo** — undo the last run or any of the last 20 manual and 20 automatic runs, in any order → [Undo and History](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Undo-and-History)
-- **Rules** — your own sorting by extension, name pattern, size or age → [Rules](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Rules)
+- **Preview first** — a scan only plans; nothing moves until you press Organize. Filter and sort the preview, keep single files with **Don't move**, export it as CSV → [Getting Started](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Getting-Started)
+- **Multi-level undo** — undo the last run or any of the last 20 manual and 20 automatic runs, in any order; History shows the folder of every run → [Undo and History](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Undo-and-History)
+- **Rules** — your own sorting by extension, name pattern, size or age, with several conditions per rule (e.g. *PDF **and** older than a year*) → [Rules](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Rules)
 - **Staging mode** — stage moves, then Commit or Revert → [Staging Mode](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Staging-Mode)
 - **Auto-organize** on a schedule while the app is open → [Auto-Organize](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Auto-Organize)
 - **Duplicate finder** — byte-identical files, moved to the Recycle Bin / Trash on request → [Duplicates](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Duplicates)
@@ -37,14 +37,14 @@ All guarantees: [Safety](https://github.com/FreakySneaky787/Simple-Organizer/wik
 
 ### Windows 10 / 11
 
-1. Download `simple_organizer_windows_v3.4.5.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
+1. Download `simple_organizer_windows_v3.5.0.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
 2. Extract it and double-click `simple_organizer.exe` — no installation needed
 3. If SmartScreen warns: right-click → **Properties** → **Unblock** (the exe is not code-signed yet)
 
 The `.sha256` file on the release page is the checksum of the exe:
 
 ```powershell
-Get-FileHash simple_organizer_windows_v3.4.5\simple_organizer.exe -Algorithm SHA256
+Get-FileHash simple_organizer_windows_v3.5.0\simple_organizer.exe -Algorithm SHA256
 ```
 
 ### Linux
@@ -75,28 +75,33 @@ macOS is not supported.
 
 | Shortcut | Action |
 |---|---|
-| `Ctrl+R` | Scan |
+| `Ctrl+R` / `F5` | Scan |
 | `Ctrl+O` | Organize |
 | `Ctrl+Z` | Undo last run |
+| `Ctrl+F` | Filter the preview |
+| `Ctrl+1` … `Ctrl+4` | Preview, Duplicates, Log, Rules |
+| `Space` / `Delete` | Don't move the selected files (Preview) |
 | `Ctrl+Q` | Quit (waits for a running task) |
 
 Questions? See the [FAQ and Troubleshooting](https://github.com/FreakySneaky787/Simple-Organizer/wiki/FAQ-and-Troubleshooting).
 
 ---
 
-## What's New in v3.4.5
+## What's New in v3.5.0
 
-Bug-fix release — fixes all 13 issues from the fourth review (#52 – #64):
+Feature release — fixes all open issues (#65 – #76) and adds what was on the roadmap (#77 – #80):
 
-- A `rules.json` saved as ANSI or UTF-16 no longer stops the app from starting; files with a byte order mark are read correctly
-- Read-only files can be moved to another drive and never leave a second copy; FAT / exFAT / network drives no longer make moves fail
-- A damaged history file no longer blocks **Undo last**
-- Trash only removes a duplicate if the copy you keep still exists; no freeze after trashing many files
-- LibreOffice lock files and the empty placeholder of a running Firefox download are left alone
-- Extension rules accept `.pdf` and `*.pdf`; a message on top of a dialog no longer unlocks the main window
-- First start opens the real Downloads folder, also when it was moved or has a localised name
+- **Don't move** — keep single files out of a run: select them in the Preview and press `Space`, `Delete` or right-click
+- **Filter and sort the Preview** — search field (`Ctrl+F`), click a column heading to sort
+- **Rules with several conditions** — a rule matches only if all its conditions match, e.g. *extension `pdf` + older than 365 days → `Archive`*
+- **Export to CSV** — the scan result opens directly in Excel or LibreOffice
+- **History shows the folder** of every run, and Undo last says exactly which run it undoes; after an undo, Auto-organize can be paused so it does not sort the files again
+- **Safer Auto-organize** — an unplugged drive no longer makes it switch to the Downloads folder
+- Changing a scan option or a rule clears an outdated preview; files removed after the scan are skipped instead of reported as errors
+- Starts about twice as fast; `Ctrl+1`–`Ctrl+4` switch tabs, `F5` scans
+- Regression tests are now part of the repository and run on GitHub Actions
 
-Full notes: [Release v3.4.5](https://github.com/FreakySneaky787/Simple-Organizer/releases/tag/v3.4.5) · All versions: [Changelog](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Changelog)
+Full notes: [Release v3.5.0](https://github.com/FreakySneaky787/Simple-Organizer/releases/tag/v3.5.0) · All versions: [Changelog](https://github.com/FreakySneaky787/Simple-Organizer/wiki/Changelog)
 
 ---
 
@@ -110,12 +115,10 @@ When reporting a bug, please attach `error.log` if there is one.
 
 ## Roadmap
 
-- Filter / search bar in the Preview tab
-- CSV / HTML export of scan results
 - Watch mode — live folder monitoring
 - Flatpak / AppImage packaging for Linux
 - Code-signed Windows executable
-- Automated test suite with pytest
+- Run the test suites on Linux in GitHub Actions
 
 ---
 

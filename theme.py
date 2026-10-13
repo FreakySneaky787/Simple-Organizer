@@ -97,6 +97,7 @@ def _round_rect(x0: float, y0: float, x1: float, y1: float, r: float) -> Shape:
         cx = min(max(px, x0 + r), x1 - r)
         cy = min(max(py, y0 + r), y1 - r)
         return (px - cx) ** 2 + (py - cy) ** 2 <= r * r
+    hit.key = ("round_rect", x0, y0, x1, y1, r)  # type: ignore[attr-defined]
     return hit
 
 
@@ -111,7 +112,28 @@ def _stroke(points: list[tuple[float, float]], width: float) -> Shape:
             if (px - ax - t * dx) ** 2 + (py - ay - t * dy) ** 2 <= limit:
                 return True
         return False
+    hit.key = ("stroke", tuple(points), width)  # type: ignore[attr-defined]
     return hit
+
+
+# Supersampled coverage per (shape, image size): every rounded box exists in
+# many colours (normal, hover, pressed, focus ... in two themes), but its
+# shape only has to be sampled once.
+_COVERAGE: dict[tuple, list[float]] = {}
+
+
+def _shape_coverage(shape: Shape, width: int, height: int, samples: int) -> list[float]:
+    key = getattr(shape, "key", None)
+    cache_key = (key, width, height, samples) if key is not None else None
+    if cache_key is not None and cache_key in _COVERAGE:
+        return _COVERAGE[cache_key]
+    offsets = [(i + 0.5) / samples for i in range(samples)]
+    total   = samples * samples
+    coverage = [sum(shape(x + ox, y + oy) for ox in offsets for oy in offsets) / total
+                for y in range(height) for x in range(width)]
+    if cache_key is not None:
+        _COVERAGE[cache_key] = coverage
+    return coverage
 
 
 def _render(root: tk.Misc, width: int, height: int, layers: list[tuple[Shape, str]],
@@ -122,16 +144,15 @@ def _render(root: tk.Misc, width: int, height: int, layers: list[tuple[Shape, st
     the centre of a 9-sliced image, so a tiny centre means thousands of alpha blits
     per redraw; a large one keeps big cards cheap to paint.
     """
-    offsets = [(i + 0.5) / samples for i in range(samples)]
-    total   = samples * samples
-    colours = [(shape, _rgb(colour)) for shape, colour in layers]
+    colours = [(_shape_coverage(shape, width, height, samples), _rgb(colour))
+               for shape, colour in layers]
     rows: list[bytes] = []
     for y in range(height):
         row = bytearray()
         for x in range(width):
             r = g = b = a = 0.0
-            for shape, (cr, cg, cb) in colours:
-                cov = sum(shape(x + ox, y + oy) for ox in offsets for oy in offsets) / total
+            for coverage, (cr, cg, cb) in colours:
+                cov = coverage[y * width + x]
                 if cov:
                     r = cr * cov + r * (1 - cov)
                     g = cg * cov + g * (1 - cov)
