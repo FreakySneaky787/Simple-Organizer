@@ -1,0 +1,34 @@
+name: Debian package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attach the package to a release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: python3 packaging/build_deb.py
+      - name: Test in Debian 12 (lintian, install, start, organize, undo, remove)
+        run: docker run --rm -v "$PWD:/src" -w /src debian:bookworm sh packaging/test_deb.sh dist/simple-organizer_*_all.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/*.deb
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          deb=$(ls dist/simple-organizer_*_all.deb)
+          case "$deb" in *"_${GITHUB_REF_NAME#v}_all.deb") ;; *) echo "version of $deb does not match $GITHUB_REF_NAME"; exit 1 ;; esac
+          sha256sum "$deb" | cut -d' ' -f1 > "$deb.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$deb" "$deb.sha256" --clobber

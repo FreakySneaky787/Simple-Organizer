@@ -49,11 +49,16 @@ Get-FileHash simple_organizer_windows_v3.5.0\simple_organizer.exe -Algorithm SHA
 
 ### Linux
 
-No prebuilt binary on GitHub at the moment — run it from source (Python 3.11+ with Tkinter):
+**Debian 12+, Ubuntu, Simple OS:** download `simple-organizer_3.5.0_all.deb` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest) and install it — it appears in the app menu:
+
+```bash
+sudo apt install ./simple-organizer_3.5.0_all.deb
+```
+
+**Other distributions** — run it from source (Python 3.10+ with Tkinter):
 
 ```bash
 sudo dnf install python3-tkinter      # Fedora / Bazzite
-sudo apt install python3-tk           # Debian / Ubuntu
 
 git clone https://github.com/FreakySneaky787/Simple-Organizer.git
 cd Simple-Organizer
