@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest something new or better for Simple Organizer
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why would it help?
+    validations:
+      required: true

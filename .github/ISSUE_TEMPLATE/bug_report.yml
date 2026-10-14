@@ -1,0 +1,45 @@
+name: Bug report
+description: Something does not work in Simple Organizer
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Simple Organizer version
+      description: Shown in the title bar of the window.
+      placeholder: e.g. 3.5.0
+    validations:
+      required: true
+  - type: dropdown
+    id: system
+    attributes:
+      label: System
+      options:
+        - Windows (exe)
+        - Linux (.deb package)
+        - Linux / other (from source)
+        - Windows (from source)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Which folder (type, e.g. Downloads or a USB stick), which options (recursive, staging, rules...)?
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: error.log (optional)
+      description: "If it exists: Windows `%APPDATA%\simple_organizer\error.log`, Linux `~/.local/share/simple_organizer/error.log`. The Log tab can help too."
+      render: text

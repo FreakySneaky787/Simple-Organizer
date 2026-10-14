@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/FreakySneaky787/Simple-Organizer/discussions
+    about: Ask a question or talk about an idea.
+  - name: Wiki
+    url: https://github.com/FreakySneaky787/Simple-Organizer/wiki
+    about: How to use Simple Organizer.
