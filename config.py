@@ -38,6 +38,7 @@ DEFAULT_SETTINGS: dict = {
     "max_depth":                 5,       # max recursion depth
     "max_dirs":                  10000,   # max directories before abort
     "scan_timeout":              30.0,    # scan wall-clock timeout in seconds
+    "excluded_files":            [],      # files of last_folder set to "Don't move" (normcase'd)
 }
 
 

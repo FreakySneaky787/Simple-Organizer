@@ -82,19 +82,28 @@ def _is_safe_rule_target(root_resolved: Path, target: str) -> bool:
     return resolved != root_resolved and root_resolved in resolved.parents
 
 
-def _target_problem(root: Path, target_dir: Path) -> str | None:
+def _target_problem(root: Path, target_dir: Path,
+                    movable: frozenset[str] = frozenset(),
+                    in_the_way: dict[Path, Path] | None = None) -> str | None:
     """Why files must not be moved into target_dir (a folder below root), or None.
 
     Checks every folder between root and target_dir: a *file* with a folder's
     name makes creating the folder fail for every single file, and a link or
     junction that leads outside root would move the files out of the scanned
-    folder -- possibly onto another drive.
+    folder -- possibly onto another drive. A file that is itself part of the
+    scan (movable: normcase'd paths) does not block: organise_files moves it
+    first. It is recorded in in_the_way (target_dir -> file) so the scan can
+    check that it really gets moved.
     """
     rel = target_dir.relative_to(root)
     current = root
     for part in rel.parts:
         current = current / part
         if current.exists() and not current.is_dir():
+            if os.path.normcase(str(current)) in movable:
+                if in_the_way is not None:
+                    in_the_way[target_dir] = current
+                continue
             return (f"a file named '{current.name}' blocks the folder '{rel.as_posix()}' "
                     "-- rename or move that file")
     try:
@@ -491,6 +500,13 @@ def scan_folder(
             "without your rules.")
         return result
 
+    # Folders the rules sort into hold files that are already organised: a
+    # recursive scan skips them like the category folders (#85).
+    rule_dirs: frozenset[str] = frozenset(
+        os.path.normpath(str(root / r.target_folder.strip()))
+        for r in active_rules
+        if r.enabled and _is_safe_rule_target(root, r.target_folder))
+
     def report(fraction: float) -> None:
         if progress_callback:
             progress_callback(round(fraction * 1000), 1000)
@@ -515,7 +531,7 @@ def scan_folder(
                     max_dirs=max_dirs,
                     scan_timeout=scan_timeout,
                     excluded_dirs=excluded_dirs,
-                    excluded_abs_paths=frozenset(str(d) for d in protected),
+                    excluded_abs_paths=frozenset(str(d) for d in protected) | rule_dirs,
                     log_callback=note,
                     left_alone=left_alone,
                     downloads=downloads,
@@ -551,6 +567,11 @@ def scan_folder(
     unsafe_targets: set[str] = set()
     # target folder -> problem (None = fine); checked once per folder, not per file
     target_problems: dict[Path, str | None] = {}
+    movable = frozenset(os.path.normcase(str(f)) for f in all_files)
+    in_the_way: dict[Path, Path] = {}   # target folder -> scanned file at its place
+    # Scanning a folder that is itself named like a category (Downloads/Images):
+    # its files are already in place, not planned to Images/Images (#84).
+    root_key = os.path.normcase(root.name)
     blocked: dict[Path, int] = defaultdict(int)
     last_pct = -1
 
@@ -572,21 +593,23 @@ def scan_folder(
                         f"scanned folder -- rule ignored.")
                 rule_category = None
             category = rule_category if rule_category else get_category(file_path)
+            category_dir = (root if not rule_category and os.path.normcase(category) == root_key
+                            else root / category)
 
             if use_subcategories and not rule_category:
                 sub = get_subcategory(file_path, category)
                 if sub:
-                    target_dir  = root / category / sub
+                    target_dir  = category_dir / sub
                     display_cat = f"{category}/{sub}"
                 else:
-                    target_dir  = root / category
+                    target_dir  = category_dir
                     display_cat = category
             else:
-                target_dir  = root / category
+                target_dir  = category_dir
                 display_cat = category
 
             if target_dir not in target_problems:
-                target_problems[target_dir] = _target_problem(root, target_dir)
+                target_problems[target_dir] = _target_problem(root, target_dir, movable, in_the_way)
             if target_problems[target_dir]:
                 blocked[target_dir] += 1
                 continue
@@ -610,6 +633,27 @@ def scan_folder(
             ))
         except Exception as exc:  # noqa: BLE001
             result.errors.append(f"Error processing {file_path.name}: {exc}")
+
+    # A file in the way of a folder is only no problem if it really moves away
+    # (it may itself be blocked or already in place).
+    if in_the_way:
+        leaving = {os.path.normcase(str(p.source)) for p in result.plans if not p.skipped}
+        still_blocked = {d for d, f in in_the_way.items()
+                         if os.path.normcase(str(f)) not in leaving}
+        if still_blocked:
+            kept: list[FilePlan] = []
+            for p in result.plans:
+                d = p.destination.parent
+                if d in still_blocked:
+                    blocked[d] += 1
+                    target_problems[d] = (
+                        f"a file named '{in_the_way[d].name}' blocks the folder "
+                        f"'{d.relative_to(root).as_posix()}' -- rename or move that file")
+                    if not p.skipped:
+                        result.total_bytes -= p.size
+                else:
+                    kept.append(p)
+            result.plans = kept
 
     for target_dir, count in blocked.items():
         result.errors.append(
@@ -694,6 +738,22 @@ def _remove_created_dirs(dirs: object) -> None:
             pass
 
 
+def _blockers_first(plans: list[FilePlan]) -> list[FilePlan]:
+    """Order plans so a file that sits where a destination folder must be
+    created ("Documents" without extension) is moved before the files that go
+    into that folder (#81). Otherwise the order is kept."""
+    folders: set[Path] = set()
+    for p in plans:
+        for parent in p.destination.parents:
+            if p.root is None or parent == p.root:
+                break
+            folders.add(parent)
+    first = [p for p in plans if p.source in folders]
+    if not first:
+        return plans
+    return first + [p for p in plans if p.source not in folders]
+
+
 def organise_files(
     plans:             list[FilePlan],
     progress_callback: Callable[[int, int], None] | None = None,
@@ -710,7 +770,8 @@ def organise_files(
     _ensure_data_dir()
 
     errors:       list[str]           = []
-    actionable                        = [p for p in plans if not p.skipped and not p.excluded]
+    actionable                        = _blockers_first(
+        [p for p in plans if not p.skipped and not p.excluded])
     total                             = len(actionable)
     timestamp                         = _now_iso()
     move_log:     list[dict[str, str]] = []
@@ -779,10 +840,25 @@ def organise_files(
                 actual_dest.parent.mkdir(parents=True, exist_ok=True)
             else:
                 actual_dest = plan.destination
-                _mkdir_tracked(actual_dest.parent, created_dirs)
 
-            safe_dest = resolve_conflict(actual_dest)
-            safe_move(plan.source, safe_dest)
+            source = plan.source
+            if not staging and source in actual_dest.parents:
+                # The file has the name of its own destination folder ("Others"
+                # -> Others/Others): rename it out of the way first (#81).
+                source = resolve_conflict(plan.source.with_name(plan.source.name + ".organizing"))
+                plan.source.rename(source)
+            try:
+                if not staging:
+                    _mkdir_tracked(actual_dest.parent, created_dirs)
+                safe_dest = resolve_conflict(actual_dest)
+                safe_move(source, safe_dest)
+            except BaseException:
+                if source != plan.source:
+                    try:
+                        source.rename(plan.source)
+                    except OSError:
+                        pass
+                raise
 
             move_log.append({
                 "src":       str(plan.source),
@@ -1147,6 +1223,17 @@ def _undo_run_file(
 
         try:
             src_path.parent.mkdir(parents=True, exist_ok=True)
+            if src_path.is_dir() and str(src_path) in (data.get("created_dirs") or []):
+                # The file had the name of a folder this run created (#81),
+                # possibly the one it sits in itself ("Others/Others").
+                if dst_path.parent == src_path and os.listdir(src_path) == [dst_path.name]:
+                    parked = resolve_conflict(src_path.with_name(src_path.name + ".organizing"))
+                    dst_path.rename(parked)
+                    dst_path = parked
+                try:
+                    os.rmdir(src_path)
+                except OSError:
+                    pass
             safe_src = resolve_conflict(src_path)
             safe_move(dst_path, safe_src)
             msg = f"[UNDONE]  {dst_path.name}  ->  {safe_src.parent.name}/"
@@ -1693,17 +1780,30 @@ def _trash_file_platform(path: Path, hwnd: int | None = None) -> None:
 
 
 def _copy_remains(path: Path, others: list[Path]) -> bool:
-    """True if one of others still exists with the same size as path."""
+    """True if one of others still exists with the same content as path.
+
+    Compares the size first, then the SHA-256: a kept copy that was edited
+    after the scan but kept its size is not a copy any more.
+    """
     try:
         size = path.stat().st_size
     except OSError:
         return False
+    digest: str | None = None
     for other in others:
         try:
-            if other.is_file() and other.stat().st_size == size:
-                return True
+            if not other.is_file() or other.stat().st_size != size:
+                continue
+            if os.path.samefile(other, path):   # a hard link is not a second copy
+                continue
         except OSError:
             continue
+        if digest is None:
+            digest = _sha256(path)
+            if digest is None:
+                return False
+        if _sha256(other) == digest:
+            return True
     return False
 
 

@@ -35,7 +35,7 @@ from rules import Rule
 app = main.SimpleOrganizerApp()
 app.update()
 startup = time.perf_counter() - t0
-check("title shows v3.5.0", app.title().endswith("v3.5.0"))
+check("title shows the version", app.title().endswith(f"v{main.APP_VERSION}"))
 check("#72 start (import + window) under 5 s", startup < 5 * SLOW, f"{startup:.2f}s")
 check("#65 saved folder kept although missing", str(app._folder) == missing, app._folder)
 check("#65 schedule shows paused", app._schedule_status_var.get().startswith("Paused: the folder was not found"),

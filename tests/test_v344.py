@@ -146,7 +146,12 @@ check("#35 works again once the folder is back", not commit_staging() and (s / "
 f37 = fresh("x37")
 (f37 / "Documents").write_text("I am a file")
 (f37 / "a.pdf").write_text("a"); (f37 / "b.pdf").write_text("b"); (f37 / "c.jpg").write_bytes(b"c")
+# Since v3.5.1 (#81) a scanned file in the way moves first; one that stays put still blocks.
+(f37 / "Documents.part").write_text("download in progress")   # left alone by the scan
+import rules
+rules.save_rules([rules.Rule("keep", True, "name_pattern", "Documents", "Documents.part")])
 r = scan_folder(f37)
+rules.save_rules([])
 planned = sorted(p.source.name for p in r.plans)
 check("#37 PDFs not planned while a file blocks 'Documents'", "a.pdf" not in planned and "c.jpg" in planned, planned)
 check("#37 reported once with the cause", sum("blocks the folder 'Documents'" in e for e in r.errors) == 1, r.errors)

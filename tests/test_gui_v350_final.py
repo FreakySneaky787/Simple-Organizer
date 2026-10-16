@@ -122,18 +122,13 @@ app._set_folder(empty)
 scan()
 check("empty text for a folder without files", "No files" in app._preview_empty.cget("text"),
       app._preview_empty.cget("text"))
-placed = APPDATA / "placed"; (placed / "Invoices").mkdir(parents=True)
-(placed / "Invoices" / "x.pdf").write_text("x")
-from rules import Rule
-import rules
-app._persist_rules([Rule("inv", True, "extension", "pdf", "Invoices")])
-app._recursive.set(True)
+# A folder named like the category of its files: already in place (#84 in v3.5.1).
+placed = APPDATA / "Documents"; placed.mkdir()
+(placed / "x.pdf").write_text("x")
 app._set_folder(placed)
 scan()
-rules.RULES_FILE.unlink()
 check("empty text when everything is in place", "already in its folder" in app._preview_empty.cget("text"),
       app._preview_empty.cget("text"))
-app._recursive.set(False)
 
 # ---------- CSV: file names are never formulas ----------
 inj = APPDATA / "inj"; inj.mkdir()

@@ -317,17 +317,39 @@ def safe_move(src: Path, dst: Path) -> None:
         raise
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Flush a directory entry (a rename) to disk. Not possible on Windows."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def atomic_write_text(path: Path, text: str, retries: int = 5) -> None:
     """Write text so readers see either the old or the new file, never half of it.
 
     Retries the final rename briefly: on Windows a virus scanner or sync client
-    can hold the target open for a moment.
+    can hold the target open for a moment. The data is flushed to disk before
+    the rename, and the directory after it, so a power cut cannot leave an
+    empty file behind (NTFS, and ext4 for newly created files).
     """
     tmp = path.with_name(f"{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
     for attempt in range(retries):
         try:
             os.replace(tmp, path)
+            _fsync_dir(path.parent)
             return
         except PermissionError:
             if attempt == retries - 1:

@@ -46,7 +46,7 @@ from scheduler import OrganizerScheduler
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.5.0"
+APP_VERSION  = "3.5.1"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -804,8 +804,12 @@ class SimpleOrganizerApp(tk.Tk):
         self._undo_folder:   str = ""               # folder of the run being undone
         self._plan_outdated: bool = False           # rules changed while a scan was running
         # Files set to "Don't move" (normcase'd paths). Kept for later scans of
-        # the same folder -- also automatic ones -- until another folder is picked.
-        self._excluded_keys: set[str] = set()
+        # the same folder -- also automatic ones, and after a restart -- until
+        # another folder is picked. Saved paths outside the folder are dropped.
+        _folder_prefix = os.path.join(os.path.normcase(str(self._folder)), "")
+        self._excluded_keys: set[str] = {
+            k for k in self._settings.get("excluded_files", [])
+            if k.startswith(_folder_prefix)}
 
         self._recursive:      tk.BooleanVar = tk.BooleanVar(
             value=bool(self._settings.get("recursive", False)))
@@ -2161,6 +2165,7 @@ class SimpleOrganizerApp(tk.Tk):
             "max_depth":                 self._num(self._max_depth, "max_depth"),
             "max_dirs":                  self._num(self._max_dirs, "max_dirs"),
             "scan_timeout":              self._num(self._scan_timeout, "scan_timeout"),
+            "excluded_files":            sorted(self._excluded_keys),
         })
         if save_settings(self._settings):
             self._settings_save_failed = False
@@ -2481,6 +2486,7 @@ class SimpleOrganizerApp(tk.Tk):
                 self._excluded_keys.discard(key)
             self._preview_tree.item(iid, values=self._preview_values(plan),
                                     tags=("excluded",) if exclude else ())
+        self._save_settings()   # kept after a restart, also for automatic runs (#82)
         self._update_plan_counts()
         excluded = (sum(1 for p in self._scan_result.plans if p.excluded and not p.skipped)
                     if self._scan_result else 0)

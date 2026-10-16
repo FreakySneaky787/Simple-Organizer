@@ -37,22 +37,22 @@ All guarantees: [Safety](https://github.com/FreakySneaky787/Simple-Organizer/wik
 
 ### Windows 10 / 11
 
-1. Download `simple_organizer_windows_v3.5.0.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
+1. Download `simple_organizer_windows_v3.5.1.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
 2. Extract it and double-click `simple_organizer.exe` — no installation needed
 3. If SmartScreen warns: right-click → **Properties** → **Unblock** (the exe is not code-signed yet)
 
 The `.sha256` file on the release page is the checksum of the exe:
 
 ```powershell
-Get-FileHash simple_organizer_windows_v3.5.0\simple_organizer.exe -Algorithm SHA256
+Get-FileHash simple_organizer_windows_v3.5.1\simple_organizer.exe -Algorithm SHA256
 ```
 
 ### Linux
 
-**Debian 12+, Ubuntu, Simple OS:** download `simple-organizer_3.5.0_all.deb` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest) and install it — it appears in the app menu:
+**Debian 12+, Ubuntu, Simple OS:** download `simple-organizer_3.5.1_all.deb` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest) and install it — it appears in the app menu:
 
 ```bash
-sudo apt install ./simple-organizer_3.5.0_all.deb
+sudo apt install ./simple-organizer_3.5.1_all.deb
 ```
 
 **Other distributions** — run it from source (Python 3.10+ with Tkinter):
@@ -91,6 +91,19 @@ macOS is not supported.
 Questions? See the [FAQ and Troubleshooting](https://github.com/FreakySneaky787/Simple-Organizer/wiki/FAQ-and-Troubleshooting).
 
 ---
+
+## What's New in v3.5.1
+
+Bug-fix release (#81 – #86):
+
+- **Don't move** is now kept after a restart, so automatic runs no longer move those files (#82)
+- **Duplicates:** a copy is only trashed if the kept copy still has the same content, not just the same size (#86)
+- History and settings are flushed to disk before they replace the old file, so a power cut cannot leave them empty (#83)
+- A file without extension named like a category folder (`Others`, `Documents`) no longer blocks that whole category (#81)
+- Scanning a folder that is itself named like a category (`Downloads/Images`) no longer creates `Images/Images` (#84)
+- Recursive scans skip the target folders of your rules, like the category folders (#85)
+
+Full notes: [Release v3.5.1](https://github.com/FreakySneaky787/Simple-Organizer/releases/tag/v3.5.1)
 
 ## What's New in v3.5.0
 
