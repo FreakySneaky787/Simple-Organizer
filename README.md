@@ -37,22 +37,22 @@ All guarantees: [Safety](https://github.com/FreakySneaky787/Simple-Organizer/wik
 
 ### Windows 10 / 11
 
-1. Download `simple_organizer_windows_v3.5.1.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
+1. Download `simple_organizer_windows_v3.5.2.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
 2. Extract it and double-click `simple_organizer.exe` — no installation needed
 3. If SmartScreen warns: right-click → **Properties** → **Unblock** (the exe is not code-signed yet)
 
 The `.sha256` file on the release page is the checksum of the exe:
 
 ```powershell
-Get-FileHash simple_organizer_windows_v3.5.1\simple_organizer.exe -Algorithm SHA256
+Get-FileHash simple_organizer_windows_v3.5.2\simple_organizer.exe -Algorithm SHA256
 ```
 
 ### Linux
 
-**Debian 12+, Ubuntu, Simple OS:** download `simple-organizer_3.5.1_all.deb` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest) and install it — it appears in the app menu:
+**Debian 12+, Ubuntu, Simple OS:** download `simple-organizer_3.5.2_all.deb` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest) and install it — it appears in the app menu:
 
 ```bash
-sudo apt install ./simple-organizer_3.5.1_all.deb
+sudo apt install ./simple-organizer_3.5.2_all.deb
 ```
 
 **Other distributions** — run it from source (Python 3.10+ with Tkinter):
@@ -91,6 +91,20 @@ macOS is not supported.
 Questions? See the [FAQ and Troubleshooting](https://github.com/FreakySneaky787/Simple-Organizer/wiki/FAQ-and-Troubleshooting).
 
 ---
+
+## What's New in v3.5.2
+
+Bug-fix release (#91 – #99):
+
+- Several files named like category folders (`Documents`, `Others`) are now moved in the right order (#91); one set to **Don't move** gives a clear message instead of an error per file (#92)
+- Scanning a folder named like a rule's target folder no longer creates `New/New` (#93)
+- Windows: recursive scans recognise category folders in any case, e.g. `images` (#94)
+- Name conflicts keep compressed tar extensions: `backup_1.tar.gz` instead of `backup.tar_1.gz` (#95)
+- Filename patterns: only `*` and `?` are wildcards, so `[Draft]*` matches `[Draft] report.docx` (#96)
+- Linux: file names that are not valid UTF-8 no longer break **Export CSV** or the built-in Trash (#97, #98)
+- Undo keeps track of a file named like its own folder (`Others/Others`) even if moving it back fails (#99)
+
+Full notes: [Release v3.5.2](https://github.com/FreakySneaky787/Simple-Organizer/releases/tag/v3.5.2)
 
 ## What's New in v3.5.1
 

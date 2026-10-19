@@ -31,6 +31,7 @@ from utils import (
     protected_files,
     resolve_conflict,
     safe_move,
+    split_name,
     xdg_base_dir,
 )
 from rules import RulesReadError, load_rules, apply_rules, is_safe_target_folder
@@ -63,6 +64,20 @@ JOURNAL_FLUSH_SECONDS = 2.0
 # (Photos, PDFs, Python...) live inside those and are therefore never reached,
 # and a user's own "Projects/Images" or "Code/Python" folder is still scanned.
 _CATEGORY_NAMES: frozenset[str] = frozenset(CATEGORY_MAP.keys())
+# Compared with os.path.normcase: on Windows "images" is the Images folder (#94).
+_CATEGORY_KEYS: frozenset[str] = frozenset(os.path.normcase(n) for n in _CATEGORY_NAMES)
+
+
+def _names_root(root: Path, target: str) -> bool:
+    """True if the scanned folder itself is the target folder: it is named like
+    a category ("Downloads/Images", #84) or ends with a rule's target path
+    ("Downloads/New" for the rule target "New", #93). Its files are then
+    already in place instead of being planned to Images/Images or New/New."""
+    parts = [p for p in Path(target.strip()).parts if p not in ("", ".")]
+    if not parts or len(parts) >= len(root.parts):
+        return False
+    tail = root.parts[-len(parts):]
+    return all(os.path.normcase(a) == os.path.normcase(b) for a, b in zip(tail, parts))
 
 _ALWAYS_EXCLUDED_ABS: frozenset[str] = frozenset({"/proc", "/sys"})
 
@@ -399,7 +414,7 @@ def _iter_files_recursive(
                         continue
                     if entry.name in excluded_dirs:
                         continue
-                    if depth == 0 and entry.name in _CATEGORY_NAMES:
+                    if depth == 0 and os.path.normcase(entry.name) in _CATEGORY_KEYS:
                         continue
                     if os.path.normcase(entry.path) in abs_excluded:
                         continue
@@ -569,9 +584,6 @@ def scan_folder(
     target_problems: dict[Path, str | None] = {}
     movable = frozenset(os.path.normcase(str(f)) for f in all_files)
     in_the_way: dict[Path, Path] = {}   # target folder -> scanned file at its place
-    # Scanning a folder that is itself named like a category (Downloads/Images):
-    # its files are already in place, not planned to Images/Images (#84).
-    root_key = os.path.normcase(root.name)
     blocked: dict[Path, int] = defaultdict(int)
     last_pct = -1
 
@@ -593,8 +605,7 @@ def scan_folder(
                         f"scanned folder -- rule ignored.")
                 rule_category = None
             category = rule_category if rule_category else get_category(file_path)
-            category_dir = (root if not rule_category and os.path.normcase(category) == root_key
-                            else root / category)
+            category_dir = root if _names_root(root, category) else root / category
 
             if use_subcategories and not rule_category:
                 sub = get_subcategory(file_path, category)
@@ -741,17 +752,65 @@ def _remove_created_dirs(dirs: object) -> None:
 def _blockers_first(plans: list[FilePlan]) -> list[FilePlan]:
     """Order plans so a file that sits where a destination folder must be
     created ("Documents" without extension) is moved before the files that go
-    into that folder (#81). Otherwise the order is kept."""
-    folders: set[Path] = set()
-    for p in plans:
+    into that folder (#81). Otherwise the order is kept.
+
+    A blocker can itself be blocked by another one ("Documents" goes to
+    Others/, where the file "Others" is in the way): blockers are ordered so
+    that every blocker comes after the ones in the way of its own
+    destination (#91). A file in the way of its own destination ("Others" ->
+    Others/Others) is parked by organise_files and does not wait for itself.
+    """
+    def folders_of(p: FilePlan) -> set[Path]:
+        found: set[Path] = set()
         for parent in p.destination.parents:
             if p.root is None or parent == p.root:
                 break
-            folders.add(parent)
-    first = [p for p in plans if p.source in folders]
-    if not first:
+            found.add(parent)
+        return found
+
+    needs = {id(p): folders_of(p) for p in plans}
+    folders: set[Path] = set().union(*needs.values()) if needs else set()
+    waiting = [p for p in plans if p.source in folders]
+    if not waiting:
         return plans
+    first: list[FilePlan] = []
+    while waiting:
+        pending = {p.source for p in waiting}
+        ready = [p for p in waiting if not (needs[id(p)] & (pending - {p.source}))]
+        if not ready:   # blockers that wait for each other: keep their order
+            ready = waiting
+        first += ready
+        ready_ids = {id(p) for p in ready}
+        waiting = [p for p in waiting if id(p) not in ready_ids]
     return first + [p for p in plans if p.source not in folders]
+
+
+def _file_in_the_way(root: Path | None, folder: Path, own: Path) -> Path | None:
+    """The file that sits where folder (or a folder above it, up to root) must
+    be created, or None. own -- the file being moved -- does not count: it is
+    parked before its folder is created."""
+    if root is None:
+        return None
+    try:
+        rel = folder.relative_to(root)
+    except ValueError:
+        return None
+    current = root
+    for part in rel.parts:
+        current = current / part
+        if current.exists() and not current.is_dir():
+            return None if current == own else current
+    return None
+
+
+def _blocked_message(root: Path, folder: Path, blocker: Path, count: int) -> str:
+    try:
+        rel = folder.relative_to(root).as_posix()
+    except ValueError:
+        rel = str(folder)
+    return (f"[ERROR]  {_plural(count, 'file', 'files')} not moved: a file named "
+            f"'{blocker.name}' blocks the folder '{rel}' -- rename or move that file, "
+            "or set it back to Move.")
 
 
 def organise_files(
@@ -813,6 +872,7 @@ def organise_files(
     last_flush = time.monotonic()
     left_in_cloud = 0
     missing = 0
+    blocked: dict[Path, tuple] = {}   # folder -> (root, file in the way, count)
 
     for idx, plan in enumerate(actionable, start=1):
         if progress_callback:
@@ -840,6 +900,13 @@ def organise_files(
                 actual_dest.parent.mkdir(parents=True, exist_ok=True)
             else:
                 actual_dest = plan.destination
+                # A file in the way that is not moved itself, e.g. set to
+                # "Don't move" after the scan (#92): report it once per folder.
+                blocker = _file_in_the_way(plan.root, actual_dest.parent, plan.source)
+                if blocker is not None:
+                    _root, _blocker, count = blocked.get(actual_dest.parent, (plan.root, blocker, 0))
+                    blocked[actual_dest.parent] = (_root, _blocker, count + 1)
+                    continue
 
             source = plan.source
             if not staging and source in actual_dest.parents:
@@ -900,6 +967,11 @@ def organise_files(
 
     # Only written when at least one file was actually moved / staged.
     write_journal()
+    for folder, (root, blocker, count) in blocked.items():
+        err = _blocked_message(root, folder, blocker, count)
+        errors.append(err)
+        if log_callback:
+            log_callback(err)
     if missing and log_callback:
         log_callback(f"[WARN]  {_plural(missing, 'file was', 'files were')} no longer there "
                      "and skipped -- scan again to see the current state.")
@@ -1211,6 +1283,7 @@ def _undo_run_file(
             continue
 
         followed = False
+        parked_from: Path | None = None   # set while a file is renamed out of its own folder
         if not dst_path.exists():
             if later is None:
                 later = _later_moves(run_file)
@@ -1229,7 +1302,7 @@ def _undo_run_file(
                 if dst_path.parent == src_path and os.listdir(src_path) == [dst_path.name]:
                     parked = resolve_conflict(src_path.with_name(src_path.name + ".organizing"))
                     dst_path.rename(parked)
-                    dst_path = parked
+                    parked_from, dst_path = dst_path, parked
                 try:
                     os.rmdir(src_path)
                 except OSError:
@@ -1247,6 +1320,14 @@ def _undo_run_file(
             err = f"[ERROR]  Permission denied restoring {dst_path.name}: {_reason(exc)}"
         except Exception as exc:  # noqa: BLE001
             err = f"[ERROR]  Unexpected error restoring {dst_path.name}: {_reason(exc)}"
+        if parked_from is not None:
+            # Put the parked file back where the history expects it, or else
+            # record where it is now, so the next undo still finds it (#99).
+            try:
+                parked_from.parent.mkdir(exist_ok=True)
+                dst_path.rename(parked_from)
+            except OSError:
+                entry = {**entry, "dst": str(dst_path)}
         errors.append(err)
         failed.append(entry)
         log(err)
@@ -1466,6 +1547,16 @@ def commit_staging(
                 log_callback(err)
             continue
 
+        blocker = _file_in_the_way(Path(root) if root else None, final_dst.parent, final_dst)
+        if blocker is not None:   # #92: stays staged with a clear message
+            err = _blocked_message(Path(root), final_dst.parent, blocker, 1).replace(
+                "1 file not moved", f"{staged_path.name} not committed")
+            errors.append(err)
+            failed.append(entry)
+            if log_callback:
+                log_callback(err)
+            continue
+
         try:
             _mkdir_tracked(final_dst.parent, created_dirs)
             safe_final = resolve_conflict(final_dst)
@@ -1677,10 +1768,18 @@ def _trash_xdg(resolved: Path) -> None:
     raise OSError(f"no usable Trash folder: {last_error}")
 
 
+def _trash_path(original: str) -> str:
+    """Path= value of a .trashinfo file: the raw bytes of the path, percent-
+    encoded. os.fsencode turns a name that is not valid UTF-8 (Latin-1 from an
+    old archive, shown by Python as "caf\\udce9.txt") back into its bytes
+    instead of failing (#98)."""
+    return quote(os.fsencode(original), safe=b"/")
+
+
 def _trash_into(resolved: Path, trash_dir: Path, original: str) -> None:
     files_dir = trash_dir / "files"
     info_dir  = trash_dir / "info"
-    stem, suffix = resolved.stem, resolved.suffix
+    stem, suffix = split_name(resolved.name)
     for counter in range(1000):
         name = resolved.name if counter == 0 else f"{stem}_{counter}{suffix}"
         info = info_dir / f"{name}.trashinfo"
@@ -1695,7 +1794,7 @@ def _trash_into(resolved: Path, trash_dir: Path, original: str) -> None:
             continue
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write("[Trash Info]\n"
-                     f"Path={quote(original, safe='/')}\n"
+                     f"Path={_trash_path(original)}\n"
                      f"DeletionDate={datetime.now():%Y-%m-%dT%H:%M:%S}\n")
         try:
             safe_move(resolved, dest)

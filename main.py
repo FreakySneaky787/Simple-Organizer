@@ -46,7 +46,7 @@ from scheduler import OrganizerScheduler
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.5.1"
+APP_VERSION  = "3.5.2"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -2537,6 +2537,10 @@ class SimpleOrganizerApp(tk.Tk):
             _showerror("Export failed", f"Could not write {target}:\n{exc.strerror or exc}", parent=self)
             return
         self._log(f"Scan result exported to {target} ({len(rows)} rows).")
+        replaced = sum(1 for r in rows if _printable(r[1]) != r[1])
+        if replaced:
+            self._log(f"[WARN]  {replaced} file name(s) are not valid UTF-8 -- "
+                      "shown with � in the CSV file.")
         self._notify("Exported", f"{Path(target).name} -- {len(rows)} rows.", "success")
 
     def _prune_scan_result(self, gone: list[Path]) -> None:
@@ -3184,8 +3188,24 @@ def _csv_text(value: str) -> str:
 
     A file may be called "=1+1.txt" or "-draft.docx"; a cell that starts with
     = + - or @ would be evaluated (CSV injection), so it gets a leading '.
+    A name that is not valid UTF-8 (Linux: "caf\\udce9.txt") cannot be written
+    to a UTF-8 file; its bad bytes become the replacement character (#97).
     """
+    value = _printable(value)
     return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+
+
+def _printable(value: str) -> str:
+    """value with the undecodable bytes of a file name replaced by U+FFFD."""
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        pass
+    try:   # Linux: undecodable bytes
+        return value.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    except UnicodeEncodeError:   # Windows: a lone UTF-16 surrogate in the name
+        return value.encode("utf-8", "replace").decode("utf-8")
 
 
 def _human_size(path: Path) -> str:

@@ -9,7 +9,6 @@ Storage:
   Windows     : %APPDATA%/simple_organizer/rules.json
 """
 
-import fnmatch
 import json
 import re
 import time
@@ -256,6 +255,14 @@ def normalize_condition_value(ctype: str, value: str) -> str:
 # Matching
 # ---------------------------------------------------------------------------
 
+def name_pattern_matches(name: str, pattern: str) -> bool:
+    """Filename pattern match, ignoring case. Only * (any text) and ? (one
+    character) are wildcards; everything else -- also [ and ] -- matches
+    itself, so "[Draft]*" finds "[Draft] report.docx" (#96)."""
+    regex = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern)
+    return re.fullmatch(regex, name, re.IGNORECASE | re.DOTALL) is not None
+
+
 def match_rule(file_path: Path, rule: Rule) -> bool:
     """Return True if file_path satisfies every condition of rule."""
     if not rule.enabled:
@@ -273,7 +280,7 @@ def _match_condition(file_path: Path, ct: str, cv: str) -> bool:
             return bool(ext) and file_path.name.lower().endswith("." + ext)
 
         elif ct == "name_pattern":
-            return fnmatch.fnmatch(file_path.name.lower(), cv.lower())
+            return name_pattern_matches(file_path.name, cv)
 
         elif ct in ("min_size_mb", "max_size_mb"):
             size_mb = file_path.stat().st_size / (1024 * 1024)

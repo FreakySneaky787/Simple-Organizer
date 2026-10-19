@@ -358,6 +358,16 @@ def atomic_write_text(path: Path, text: str, retries: int = 5) -> None:
             time.sleep(0.05 * (attempt + 1))
 
 
+def split_name(name: str) -> tuple[str, str]:
+    """Split a file name into (stem, extension), keeping ".tar.gz" and the
+    other compressed tar extensions together (#95): "a.tar.gz" -> ("a", ".tar.gz")."""
+    stem, suffix = os.path.splitext(name)
+    inner_stem, inner = os.path.splitext(stem)
+    if inner.lower() == ".tar" and inner_stem:
+        return inner_stem, inner + suffix
+    return stem, suffix
+
+
 def resolve_conflict(destination: Path, max_retries: int = 1000) -> Path:
     """If destination already exists, append _1, _2 … until a free name is found.
 
@@ -367,9 +377,8 @@ def resolve_conflict(destination: Path, max_retries: int = 1000) -> Path:
     if not destination.exists():
         return destination
 
-    stem    = destination.stem
-    suffix  = destination.suffix
-    parent  = destination.parent
+    stem, suffix = split_name(destination.name)
+    parent       = destination.parent
 
     for counter in range(1, max_retries + 1):
         candidate = parent / f"{stem}_{counter}{suffix}"
