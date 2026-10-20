@@ -6,6 +6,8 @@ Nothing is ever deleted or overwritten, and every run can be undone. No internet
 
 **[⬇ Download](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)** · **[📖 Wiki](https://github.com/FreakySneaky787/Simple-Organizer/wiki)** · **[🐞 Report a bug](https://github.com/FreakySneaky787/Simple-Organizer/issues)**
 
+> **Project status:** Simple Organizer is stable and nearly feature-complete. Development is mostly paused while I focus on [Simple OS](https://github.com/FreakySneaky787/Simple-OS) – the remaining planned work is tracked in the [v3.5.3](https://github.com/FreakySneaky787/Simple-Organizer/milestone/1) and [v3.6.0](https://github.com/FreakySneaky787/Simple-Organizer/milestone/2) milestones. Bug reports and pull requests are still very welcome; answers may just take a little longer.
+
 ---
 
 ## Features
