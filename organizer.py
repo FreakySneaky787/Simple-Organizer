@@ -921,10 +921,22 @@ def organise_files(
                 safe_move(source, safe_dest)
             except BaseException:
                 if source != plan.source:
+                    # The folder created for this move (e.g. "Others/" for the
+                    # file "Others") is in the way of the rename back: remove it
+                    # first if this run created it and it is empty (#100).
+                    parent = str(actual_dest.parent)
+                    if parent in created_dirs and not any(actual_dest.parent.iterdir()):
+                        try:
+                            actual_dest.parent.rmdir()
+                            created_dirs.remove(parent)
+                        except OSError:
+                            pass
                     try:
                         source.rename(plan.source)
-                    except OSError:
-                        pass
+                    except OSError as back_exc:
+                        if log_callback:
+                            log_callback(f"[ERROR]  Could not restore {plan.source.name}: "
+                                         f"it is still named {source.name} ({_reason(back_exc)}).")
                 raise
 
             move_log.append({
