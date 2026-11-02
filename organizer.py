@@ -921,16 +921,18 @@ def organise_files(
                 safe_move(source, safe_dest)
             except BaseException:
                 if source != plan.source:
-                    # The folder created for this move (e.g. "Others/" for the
-                    # file "Others") is in the way of the rename back: remove it
-                    # first if this run created it and it is empty (#100).
-                    parent = str(actual_dest.parent)
-                    if parent in created_dirs and not any(actual_dest.parent.iterdir()):
+                    # The folders created for this move (e.g. "Others/" for the
+                    # file "Others", or "Work/Archive/" for the file "Work") are
+                    # in the way of the rename back: remove them first, deepest
+                    # first, if this run created them and they are empty (#100, #104).
+                    folder = actual_dest.parent
+                    while folder != plan.source.parent and str(folder) in created_dirs:
                         try:
-                            actual_dest.parent.rmdir()
-                            created_dirs.remove(parent)
+                            folder.rmdir()
                         except OSError:
-                            pass
+                            break
+                        created_dirs.remove(str(folder))
+                        folder = folder.parent
                     try:
                         source.rename(plan.source)
                     except OSError as back_exc:
@@ -1196,7 +1198,8 @@ def list_undo_history(limit: int | None = None) -> list[dict]:
             try:
                 # Stored in UTC; shown in the computer's local time.
                 dt  = datetime.fromisoformat(ts).astimezone()
-                lbl = dt.strftime("%b %d %H:%M") + f"  -  {count} file(s)"
+                fmt = "%b %d %H:%M" if dt.year == datetime.now().year else "%b %d %Y %H:%M"
+                lbl = dt.strftime(fmt) + f"  -  {count} file(s)"   # year only if not this year (#90)
             except Exception:
                 lbl = f"{f.stem}  -  {count} file(s)"
             if scheduled:
@@ -1251,6 +1254,23 @@ def _follow_moves(path: Path, later: dict[str, str]) -> Path | None:
         seen.add(key)
         current = Path(later[key])
     return current
+
+
+def _only_path_to(folder: Path, file: Path, created: set[str]) -> list[Path]:
+    """The folders from file's parent up to folder, deepest first, if file is
+    the only thing inside folder and every one of them was created by the run
+    (created: normcase'd paths). Otherwise an empty list."""
+    chain: list[Path] = []
+    child = file
+    while True:
+        parent = child.parent
+        if (parent == child or os.path.normcase(str(parent)) not in created
+                or os.listdir(parent) != [child.name]):
+            return []
+        chain.append(parent)
+        if parent == folder:
+            return chain
+        child = parent
 
 
 def _undo_run_file(
@@ -1308,17 +1328,22 @@ def _undo_run_file(
 
         try:
             src_path.parent.mkdir(parents=True, exist_ok=True)
-            if src_path.is_dir() and str(src_path) in (data.get("created_dirs") or []):
+            created = {os.path.normcase(str(d)) for d in data.get("created_dirs") or []}
+            if src_path.is_dir() and os.path.normcase(str(src_path)) in created:
                 # The file had the name of a folder this run created (#81),
-                # possibly the one it sits in itself ("Others/Others").
-                if dst_path.parent == src_path and os.listdir(src_path) == [dst_path.name]:
+                # possibly the one it sits in itself ("Others/Others", or
+                # "Work/Archive/Work" for a nested rule target, #104). On
+                # Windows "others" is the folder "Others" too (#102).
+                chain = _only_path_to(src_path, dst_path, created)
+                if chain:
                     parked = resolve_conflict(src_path.with_name(src_path.name + ".organizing"))
                     dst_path.rename(parked)
                     parked_from, dst_path = dst_path, parked
-                try:
-                    os.rmdir(src_path)
-                except OSError:
-                    pass
+                for folder in chain or [src_path]:
+                    try:
+                        os.rmdir(folder)
+                    except OSError:
+                        break
             safe_src = resolve_conflict(src_path)
             safe_move(dst_path, safe_src)
             msg = f"[UNDONE]  {dst_path.name}  ->  {safe_src.parent.name}/"
@@ -1336,7 +1361,7 @@ def _undo_run_file(
             # Put the parked file back where the history expects it, or else
             # record where it is now, so the next undo still finds it (#99).
             try:
-                parked_from.parent.mkdir(exist_ok=True)
+                parked_from.parent.mkdir(parents=True, exist_ok=True)
                 dst_path.rename(parked_from)
             except OSError:
                 entry = {**entry, "dst": str(dst_path)}

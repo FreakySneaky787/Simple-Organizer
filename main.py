@@ -46,7 +46,7 @@ from scheduler import OrganizerScheduler
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.5.2"
+APP_VERSION  = "3.5.3"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -803,13 +803,12 @@ class SimpleOrganizerApp(tk.Tk):
         self._filter_job:    str | None = None
         self._undo_folder:   str = ""               # folder of the run being undone
         self._plan_outdated: bool = False           # rules changed while a scan was running
-        # Files set to "Don't move" (normcase'd paths). Kept for later scans of
-        # the same folder -- also automatic ones, and after a restart -- until
-        # another folder is picked. Saved paths outside the folder are dropped.
-        _folder_prefix = os.path.join(os.path.normcase(str(self._folder)), "")
+        # Files set to "Don't move" (normcase'd full paths, so they apply per
+        # folder). Kept for later scans -- also automatic ones, after a restart
+        # and after picking another folder and back (#101). Entries of files
+        # that are gone are dropped when their folder is scanned.
         self._excluded_keys: set[str] = {
-            k for k in self._settings.get("excluded_files", [])
-            if k.startswith(_folder_prefix)}
+            k for k in self._settings.get("excluded_files", []) if isinstance(k, str)}
 
         self._recursive:      tk.BooleanVar = tk.BooleanVar(
             value=bool(self._settings.get("recursive", False)))
@@ -1724,7 +1723,6 @@ class SimpleOrganizerApp(tk.Tk):
             return
         self._folder = path.resolve()
         self._folder_var.set(str(self._folder))
-        self._excluded_keys.clear()
         self._scan_result = None
         self._render_scan_result()   # clears Preview and Duplicates of the old folder
         self._log(f"Folder set: {self._folder}")
@@ -1895,6 +1893,14 @@ class SimpleOrganizerApp(tk.Tk):
                 "unusual", f"{self._folder} {reason}. "
                 "Scan it once by hand and confirm to allow automatic runs.",
                 "This folder needs one manual scan and confirmation first.")
+            return
+
+        if self._scan_result is not None and self._actionable_plans():
+            # A manual scan result is still shown and not organised yet: an
+            # automatic scan would replace it under the user (#105). Skip this
+            # run; the next interval tries again.
+            self._log("[SCHEDULE]  Skipped -- the Preview still shows a scan that "
+                      "was not organised. Organise it or scan again.")
             return
 
         # Running again: a later pause for the same reason is reported anew.
@@ -2263,6 +2269,11 @@ class SimpleOrganizerApp(tk.Tk):
             return
         self._scan_result = result
         kept = 0
+        prefix = os.path.join(os.path.normcase(str(self._folder)), "")
+        gone = {k for k in self._excluded_keys if k.startswith(prefix) and not os.path.exists(k)}
+        if gone:
+            self._excluded_keys -= gone   # deleted or renamed since (#101)
+            self._save_settings()
         if self._excluded_keys:
             for plan in result.plans:
                 if not plan.skipped and os.path.normcase(str(plan.source)) in self._excluded_keys:
@@ -2300,12 +2311,14 @@ class SimpleOrganizerApp(tk.Tk):
         else:
             self._log("No duplicate files detected.")
 
+        # Automatic runs leave the selected tab alone (#105).
         if actionable:
             self._status(f"Ready -- {len(actionable)} file(s) to organise.{dup_msg}")
-            self._notebook.select(self._preview_tab_idx)
+            if not auto_mode:
+                self._notebook.select(self._preview_tab_idx)
         else:
             self._status(f"Nothing to organise.{dup_msg}")
-            if result.duplicate_groups:
+            if result.duplicate_groups and not auto_mode:
                 self._notebook.select(self._dup_tab_idx)
 
         if auto_mode and not self._close_requested:
@@ -2621,7 +2634,8 @@ class SimpleOrganizerApp(tk.Tk):
                                          log_callback=log, staging=staging,
                                          scheduled=scheduled),
                 "staging": staging,
-            })
+            },
+            log_tab=not scheduled)   # an automatic run keeps the user's tab (#105)
 
     def _handle_organize_done(self, errors: list[str], staging: bool) -> None:
         self._scan_result = None   # listed paths are stale once files have moved

@@ -105,6 +105,8 @@ check("vanished file pruned from plan", all(p.source.name != "b.jpg" for p in ap
 check("duplicate group dissolved", app._scan_result.duplicate_groups == [] and not app._dup_paths)
 
 # scheduled run waits for an open dialog
+app._scan_result = None   # a shown manual scan makes the run skip (#105)
+app._render_scan_result()
 app._schedule_enabled.set(True)
 app._overlays.append(object())   # pretend a dialog is open
 app._run_scheduled_organize()

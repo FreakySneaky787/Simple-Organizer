@@ -39,22 +39,22 @@ All guarantees: [Safety](https://github.com/FreakySneaky787/Simple-Organizer/wik
 
 ### Windows 10 / 11
 
-1. Download `simple_organizer_windows_v3.5.2.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
+1. Download `simple_organizer_windows_v3.5.3.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
 2. Extract it and double-click `simple_organizer.exe` — no installation needed
 3. If SmartScreen warns: right-click → **Properties** → **Unblock** (the exe is not code-signed yet)
 
 The `.sha256` file on the release page is the checksum of the exe:
 
 ```powershell
-Get-FileHash simple_organizer_windows_v3.5.2\simple_organizer.exe -Algorithm SHA256
+Get-FileHash simple_organizer_windows_v3.5.3\simple_organizer.exe -Algorithm SHA256
 ```
 
 ### Linux
 
-**Debian 12+, Ubuntu, Simple OS:** download `simple-organizer_3.5.2_all.deb` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest) and install it — it appears in the app menu:
+**Debian 12+, Ubuntu, Simple OS:** download `simple-organizer_3.5.3_all.deb` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest) and install it — it appears in the app menu:
 
 ```bash
-sudo apt install ./simple-organizer_3.5.2_all.deb
+sudo apt install ./simple-organizer_3.5.3_all.deb
 ```
 
 **Other distributions** — run it from source (Python 3.10+ with Tkinter):
@@ -93,6 +93,18 @@ macOS is not supported.
 Questions? See the [FAQ and Troubleshooting](https://github.com/FreakySneaky787/Simple-Organizer/wiki/FAQ-and-Troubleshooting).
 
 ---
+
+## What's New in v3.5.3
+
+Bug-fix release (#90, #101, #102, #104, #105):
+
+- **Don't move** is kept per folder: picking the same folder again, or another folder and back, no longer clears it. Entries of deleted files are dropped (#101)
+- Automatic runs no longer switch to the Preview and Log tabs, and they skip a run while a manual scan that was not organised yet is shown (#105)
+- A file named like the first folder of a nested rule target (`Work` → `Work/Archive`) is no longer left as `Work.organizing` when the move fails, and Undo gives it its own name back (#104)
+- Windows: Undo gives a file named like a category folder in another case (`others`) its own name back instead of `others_1` (#102)
+- The History shows the year for runs from an earlier year (#90)
+
+Full notes: [Release v3.5.3](https://github.com/FreakySneaky787/Simple-Organizer/releases/tag/v3.5.3)
 
 ## What's New in v3.5.2
 
