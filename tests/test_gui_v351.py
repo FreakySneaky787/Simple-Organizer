@@ -71,7 +71,9 @@ else:
     other = (APPDATA / "other").resolve(); other.mkdir()
     app._set_folder(other)
     saved = json.loads((DATA / "settings.json").read_text(encoding="utf-8"))
-    check("#82 list cleared for another folder", saved.get("excluded_files") == [],
+    # Since 3.5.3 the list is kept per folder (#101).
+    check("#101 list kept for another folder",
+          saved.get("excluded_files") == [os.path.normcase(str(folder / "a.pdf"))],
           saved.get("excluded_files"))
     app.destroy()
 

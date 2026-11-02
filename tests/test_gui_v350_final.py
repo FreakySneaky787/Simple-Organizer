@@ -85,6 +85,8 @@ check("rescan logs the kept file", "1 file(s) stay where they are" in app._log_b
 # An automatic run must not move the file either.
 app._approve(folder)   # the test folder is below AppData, which needs one approval
 app._schedule_enabled.set(True)
+app._scan_result = None   # a shown manual scan makes the run skip (#105)
+app._render_scan_result()
 app._run_scheduled_organize()
 pump(app, 30, lambda: (folder / "Documents" / "a.pdf").exists() and not app._busy_flag)
 pump(app, 0.5)
@@ -105,8 +107,8 @@ other = APPDATA / "other"; other.mkdir()
 (other / "keep.pdf").write_text("x")
 app._set_folder(other)
 scan()
-check("another folder starts without Don't move", len(app._actionable_plans()) == 1
-      and not app._excluded_keys)
+# The list is kept per folder since 3.5.3 (#101): it does not apply here.
+check("another folder starts without Don't move", len(app._actionable_plans()) == 1)
 
 # ---------- empty Preview explains itself ----------
 app._set_folder(folder)
