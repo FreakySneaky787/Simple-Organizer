@@ -65,7 +65,7 @@ print('functions OK')
 PY"
 
 echo "== start at login and tray"
-su tester -c "python3 - <<'PY'
+su tester -c "xvfb-run -a python3 - <<'PY'
 import sys
 sys.path.insert(0, '/usr/lib/simple-organizer')
 import autostart, tray

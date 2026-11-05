@@ -24,14 +24,27 @@ from typing import Any, Callable
 
 _ICON_PNG = Path(__file__).resolve().with_name("icon.png")
 _import_error: str = ""
+pystray: Any = None
+Image:   Any = None
 
-try:
-    from PIL import Image
-    import pystray
-except Exception as exc:  # noqa: BLE001 -- ImportError, or no display backend on Linux
-    pystray = None    # type: ignore[assignment]
-    Image   = None    # type: ignore[assignment]
-    _import_error = str(exc) or exc.__class__.__name__
+
+def _load() -> bool:
+    """Import pystray when it is first needed, not at program start.
+
+    On Linux pystray connects to the display while it is imported: started
+    too early (no DISPLAY yet) it fails, so a failed attempt is retried.
+    """
+    global pystray, Image, _import_error
+    if pystray is not None:
+        return True
+    try:
+        from PIL import Image as _image_module
+        import pystray as _pystray
+    except Exception as exc:  # noqa: BLE001 -- ImportError, or no display backend on Linux
+        _import_error = str(exc) or exc.__class__.__name__
+        return False
+    pystray, Image, _import_error = _pystray, _image_module, ""
+    return True
 
 
 def _resource(name: str) -> Path:
@@ -40,16 +53,16 @@ def _resource(name: str) -> Path:
 
 
 def is_available() -> bool:
-    return pystray is not None
+    return _load()
 
 
 def unavailable_reason() -> str:
-    if pystray is not None:
+    if _load():
         return ""
-    if sys.platform.startswith("linux"):
+    if "No module named" in _import_error and sys.platform.startswith("linux"):
         return ("The tray needs python3-pystray (sudo apt install python3-pystray "
-                f"gir1.2-ayatanaappindicator3-0.1). Details: {_import_error}")
-    return f"The tray module could not be loaded ({_import_error})."
+                "gir1.2-ayatanaappindicator3-0.1).")
+    return f"The tray could not be started ({_import_error})."
 
 
 def _image() -> Any:
@@ -86,7 +99,7 @@ class TrayIcon:
 
     def start(self) -> bool:
         """Show the icon. Returns False if no tray could be created."""
-        if pystray is None:
+        if not _load():
             return False
         with self._lock:
             if self._icon is not None:
