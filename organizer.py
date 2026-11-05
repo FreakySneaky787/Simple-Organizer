@@ -7,6 +7,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -179,6 +180,7 @@ def find_duplicates(
     log_callback: Callable[[str], None] | None = None,
     skipped_cloud: list[Path] | None = None,
     hard_links: list[Path] | None = None,
+    cancel: threading.Event | None = None,
 ) -> list[list[Path]]:
     """Return groups of byte-identical files (2+ members each).
 
@@ -227,6 +229,8 @@ def find_duplicates(
     total = len(candidates)
 
     for current, (sz, f) in enumerate(candidates, start=1):
+        if cancel is not None and cancel.is_set():
+            break
         if deadline is not None and time.monotonic() >= deadline:
             if log_callback:
                 log_callback(f"[TIMEOUT]  Duplicate check stopped after {current - 1} of "
@@ -265,6 +269,7 @@ class ScanResult:
     notes:            list[str]        = field(default_factory=list)  # tagged info lines for the log
     total_files:      int              = 0
     total_bytes:      int              = 0   # size of all files that would move
+    cancelled:        bool             = False   # the user pressed Cancel (#89)
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +345,7 @@ def _iter_files_recursive(
     log_callback:       Callable[[str], None] | None = None,
     left_alone:         list[int] | None             = None,
     downloads:          set[str] | None              = None,
+    cancel:             threading.Event | None       = None,
 ) -> Generator[Path, None, None]:
     """Yield every regular file under root subject to hard safety limits.
 
@@ -369,6 +375,8 @@ def _iter_files_recursive(
 
     try:
         while stack:
+            if cancel is not None and cancel.is_set():
+                return
             if time.monotonic() >= deadline:
                 log(f"[TIMEOUT]  Scan stopped after {scan_timeout:.0f}s -- "
                     f"{_plural(dirs_visited, 'folder', 'folders')} scanned. "
@@ -456,6 +464,53 @@ def _iter_files_top_level(
 # Scanning
 # ---------------------------------------------------------------------------
 
+SORTED_DUP_MAX_FILES = 50_000   # upper bound for the files read from sorted folders
+
+
+def _files_in_sorted_folders(
+    root: Path, rule_dirs: frozenset[str], include_hidden: bool,
+    protected: object, cancel: threading.Event | None = None,
+) -> list[Path]:
+    """The files already sorted into category and rule folders of root (#88).
+
+    Only existing category folders directly in root and rule target folders
+    are read, with the same safety limits as a recursive scan.
+    """
+    folders: list[Path] = []
+    try:
+        with os.scandir(str(root)) as it:
+            for entry in it:
+                try:
+                    if (not _is_link(entry) and entry.is_dir(follow_symlinks=False)
+                            and os.path.normcase(entry.name) in _CATEGORY_KEYS):
+                        folders.append(Path(entry.path))
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    for d in sorted(rule_dirs):
+        if os.path.isdir(d) and not os.path.islink(d):
+            folders.append(Path(d))
+    # A rule folder inside a category folder (or twice) would be read twice.
+    unique: list[Path] = []
+    taken: list[str] = []
+    for f in sorted(folders, key=lambda x: len(str(x))):
+        k = os.path.normcase(str(f))
+        if k in taken or any(k.startswith(os.path.join(t, "")) for t in taken):
+            continue
+        taken.append(k)
+        unique.append(f)
+    files: list[Path] = []
+    excluded = frozenset(str(d) for d in protected)   # type: ignore[attr-defined]
+    for folder in unique:
+        for f in _iter_files_recursive(root=folder, include_hidden=include_hidden,
+                                       max_depth=5, max_dirs=2_000, scan_timeout=10.0,
+                                       excluded_abs_paths=excluded, cancel=cancel):
+            files.append(f)
+            if len(files) >= SORTED_DUP_MAX_FILES:
+                return files
+    return files
+
 def scan_folder(
     folder:            Path,
     recursive:         bool                          = False,
@@ -467,6 +522,7 @@ def scan_folder(
     excluded_dirs:     frozenset[str] | None         = None,
     progress_callback: Callable[[int, int], None] | None = None,
     status_callback:   Callable[[str], None]       | None = None,
+    cancel:            threading.Event | None        = None,
 ) -> ScanResult:
     """Scan folder and return a ScanResult with file plans and duplicate groups.
 
@@ -550,6 +606,7 @@ def scan_folder(
                     log_callback=note,
                     left_alone=left_alone,
                     downloads=downloads,
+                    cancel=cancel,
                 )
             )
         else:
@@ -559,6 +616,18 @@ def scan_folder(
         return result
     except OSError as exc:
         result.errors.append(f"Could not read {root}: {exc}")
+        return result
+
+    def cancelled() -> bool:
+        if cancel is None or not cancel.is_set():
+            return False
+        result.plans.clear()
+        result.duplicate_groups.clear()
+        result.total_bytes = 0
+        result.cancelled = True
+        return True
+
+    if cancelled():
         return result
 
     own_files = protected_files()
@@ -591,6 +660,8 @@ def scan_folder(
         pct = idx * 100 // result.total_files
         if pct != last_pct:   # at most ~100 UI updates, however many files there are
             last_pct = pct
+            if cancelled():
+                return result
             report(0.3 * idx / result.total_files)
             if status_callback:
                 status_callback(f"Scanning: {idx} / {result.total_files} files ({pct}%)")
@@ -685,18 +756,43 @@ def scan_folder(
             dup_last[0] = pct
             report(0.3 + 0.7 * current / total if total else 1.0)
 
+    # A non-recursive scan also compares the new files with the files that are
+    # already sorted into the category and rule folders (#88). Only groups
+    # that contain a new file are reported; the sorted copy is listed first.
+    sorted_files: list[Path] = []
+    if not recursive:
+        sorted_files = _files_in_sorted_folders(root, rule_dirs, include_hidden, protected, cancel)
+    new_keys = frozenset(os.path.normcase(str(f)) for f in all_files)
+
     try:
-        result.duplicate_groups = find_duplicates(
-            files=all_files,
+        groups = find_duplicates(
+            files=sorted_files + all_files,
             progress_callback=dup_progress,
             skipped_large=skipped_large,
             deadline=time.monotonic() + max(60.0, scan_timeout * 10),
             log_callback=note,
             skipped_cloud=skipped_cloud,
             hard_links=hard_links,
+            cancel=cancel,
         )
+        if sorted_files:
+            groups = [g for g in groups
+                      if any(os.path.normcase(str(f)) in new_keys for f in g)]
+            found = sum(1 for g in groups
+                        if any(os.path.normcase(str(f)) not in new_keys for f in g))
+            if found:
+                result.notes.append(
+                    f"[DUPES]  {_plural(found, 'new file is a copy', 'new files are copies')} "
+                    "of a file that is already sorted -- see the Duplicates tab.")
+        result.duplicate_groups = groups
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"Duplicate detection error: {exc}")
+    if cancelled():
+        return result
+    # Files inside sorted folders are not part of the run: keep the counts honest.
+    skipped_large = [f for f in skipped_large if os.path.normcase(str(f)) in new_keys]
+    skipped_cloud = [f for f in skipped_cloud if os.path.normcase(str(f)) in new_keys]
+    hard_links    = [f for f in hard_links if os.path.normcase(str(f)) in new_keys]
     if skipped_cloud:
         result.notes.append(
             f"[SKIP]  {_plural(len(skipped_cloud), 'online-only cloud file', 'online-only cloud files')} "
@@ -747,6 +843,46 @@ def _remove_created_dirs(dirs: object) -> None:
             os.rmdir(d)
         except OSError:
             pass
+
+
+def _remove_emptied_dirs(
+    move_log: list[dict[str, str]],
+    created_dirs: list[str],
+    log_callback: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Remove the sub-folders that the moves in move_log left empty (#87).
+
+    Only folders between a moved file and its scanned folder are touched --
+    never the scanned folder itself, a folder this run created or moved files
+    into, or a folder that still holds anything (os.rmdir fails on those).
+    Returns the removed folders, deepest first.
+    """
+    candidates: set[str] = set()
+    for m in move_log:
+        root = m.get("root") or ""
+        if not root:
+            continue
+        root_key = os.path.normcase(root)
+        parent = os.path.dirname(m["src"])
+        while (os.path.normcase(parent).startswith(os.path.join(root_key, ""))
+               and os.path.normcase(parent) != root_key):
+            candidates.add(parent)
+            parent = os.path.dirname(parent)
+    keep = {os.path.normcase(d) for d in created_dirs}
+    keep |= {os.path.normcase(os.path.dirname(m["dst"])) for m in move_log}
+    removed: list[str] = []
+    for d in sorted(candidates, key=len, reverse=True):
+        if os.path.normcase(d) in keep or os.path.islink(d):
+            continue
+        try:
+            os.rmdir(d)
+        except OSError:
+            continue
+        removed.append(d)
+    if removed and log_callback:
+        log_callback(f"[CLEANUP]  {_plural(len(removed), 'empty folder', 'empty folders')} "
+                     "removed -- Undo brings them back.")
+    return removed
 
 
 def _blockers_first(plans: list[FilePlan]) -> list[FilePlan]:
@@ -819,8 +955,14 @@ def organise_files(
     log_callback:      Callable[[str], None]       | None = None,
     staging:           bool = False,
     scheduled:         bool = False,
+    cancel:            threading.Event | None = None,
+    remove_empty_dirs: bool = False,
 ) -> list[str]:
     """Execute planned file moves. Files are NEVER deleted or overwritten.
+
+    cancel stops the run after the current file (#89); the files moved so far
+    stay in the history and can be undone. remove_empty_dirs removes the
+    sub-folders the run emptied (#87); they are recorded and re-created on undo.
 
     scheduled marks the history run as an automatic one; automatic and manual
     runs are limited separately, so the scheduler cannot push manual runs out
@@ -835,6 +977,8 @@ def organise_files(
     timestamp                         = _now_iso()
     move_log:     list[dict[str, str]] = []
     created_dirs: list[str]           = []
+    removed_dirs: list[str]           = []
+    was_cancelled                     = False
     # The scanned folder(s), shown in History so runs of different folders can be told apart.
     folders = sorted({str(p.root) for p in actionable if p.root})
 
@@ -867,6 +1011,8 @@ def organise_files(
                 "folders":      folders,
                 "moves":        [{"src": m["src"], "dst": m["dst"]} for m in move_log],
                 "created_dirs": created_dirs,
+                "removed_dirs": removed_dirs,
+                "cancelled":    was_cancelled,
             }, log_callback, path=run_path, scheduled=scheduled)
 
     last_flush = time.monotonic()
@@ -875,6 +1021,12 @@ def organise_files(
     blocked: dict[Path, tuple] = {}   # folder -> (root, file in the way, count)
 
     for idx, plan in enumerate(actionable, start=1):
+        if cancel is not None and cancel.is_set():
+            was_cancelled = True
+            if log_callback:
+                log_callback(f"[CANCELLED]  Stopped -- {_plural(len(move_log), 'file', 'files')} "
+                             f"moved, {total - idx + 1} left in place. Undo works as usual.")
+            break
         if progress_callback:
             progress_callback(idx, total)
 
@@ -978,6 +1130,9 @@ def organise_files(
         except OSError:
             continue
         created_dirs.remove(d)
+
+    if remove_empty_dirs and not staging:
+        removed_dirs.extend(_remove_emptied_dirs(move_log, created_dirs, log_callback))
 
     # Only written when at least one file was actually moved / staged.
     write_journal()
@@ -1302,6 +1457,15 @@ def _undo_run_file(
 
     total = len(moves)
     failed: list[dict] = []
+
+    # Folders the run removed because it had emptied them (#87).
+    removed = data.get("removed_dirs")
+    if isinstance(removed, list):
+        for d in sorted((str(x) for x in removed), key=len):
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError as exc:
+                log(f"[WARN]  Could not re-create the folder {d}: {_reason(exc)}")
 
     for idx, entry in enumerate(moves, start=1):
         if progress_callback:

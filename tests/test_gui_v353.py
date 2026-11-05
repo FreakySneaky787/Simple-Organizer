@@ -37,7 +37,7 @@ import main, organizer
 
 app = main.SimpleOrganizerApp()
 app.update()
-check("title shows the version", app.title().endswith("v3.5.3"), app.title())
+check("title shows the version", app.title().endswith(f"v{main.APP_VERSION}"), app.title())
 
 # ---------- #101 Don't move survives picking the same folder or another one ----------
 folder = (APPDATA / "work").resolve(); folder.mkdir()

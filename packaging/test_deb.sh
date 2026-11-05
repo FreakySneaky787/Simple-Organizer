@@ -64,6 +64,21 @@ assert count == 1 and not errors and not (work / 'dup2.txt').exists(), errors
 print('functions OK')
 PY"
 
+echo "== start at login and tray"
+su tester -c "xvfb-run -a python3 - <<'PY'
+import sys
+sys.path.insert(0, '/usr/lib/simple-organizer')
+import autostart, tray
+assert tray.is_available(), tray.unavailable_reason()   # python3-pystray is recommended
+autostart.enable()
+entry = autostart.desktop_file().read_text()
+assert 'Exec=/usr/bin/simple-organizer --minimized' in entry, entry
+assert autostart.is_enabled()
+autostart.disable()
+assert not autostart.desktop_file().exists() and not autostart.is_enabled()
+print('autostart OK')
+PY"
+
 echo "== remove"
 apt-get purge -y -qq simple-organizer >/dev/null
 test ! -e /usr/lib/simple-organizer

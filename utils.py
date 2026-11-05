@@ -559,6 +559,32 @@ def acquire_instance_lock() -> object | None:
     return handle
 
 
+def _show_request_path() -> Path:
+    return get_data_dir() / "show.request"
+
+
+def request_show() -> bool:
+    """Ask the running instance to show its window (it may be hidden in the
+    tray). Works the same on Windows and Linux: the running app checks for
+    this file once a second. Returns False if the file cannot be written."""
+    try:
+        path = _show_request_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+        return True
+    except OSError:
+        return False
+
+
+def consume_show_request() -> bool:
+    """True once for every request_show() of a second start."""
+    try:
+        _show_request_path().unlink()
+        return True
+    except OSError:
+        return False
+
+
 # What locking reports when another process holds the lock.
 _LOCK_HELD_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK,
                                getattr(errno, "EDEADLOCK", errno.EDEADLK)})
