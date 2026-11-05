@@ -13,6 +13,8 @@ Layout:
   /usr/share/icons/hicolor/256x256/apps/simple-organizer.png
   /usr/share/doc/simple-organizer/ copyright, changelog
 The package needs only python3 (>= 3.10) and python3-tk -- Debian 12 has 3.11.
+The tray icon ("Keep running when closed") uses python3-pystray, which is
+only recommended: without it, closing the window minimises it instead.
 """
 import gzip
 import hashlib
@@ -27,7 +29,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 PACKAGE = "simple-organizer"
 PROGRAM_FILES = ("main.py", "organizer.py", "rules.py", "utils.py", "config.py",
-                 "scheduler.py", "theme.py", "icons.py", "icon.png")
+                 "scheduler.py", "theme.py", "icons.py", "autostart.py", "tray.py", "icon.png")
 HOMEPAGE = "https://github.com/FreakySneaky787/Simple-Organizer"
 
 
@@ -155,7 +157,8 @@ def build() -> Path:
                "Maintainer: Simple Organizer <simple-organizer@users.noreply.github.com>\n"
                f"Installed-Size: {installed_kb}\n"
                "Depends: python3 (>= 3.10), python3-tk\n"
-               "Recommends: libglib2.0-bin\n"
+               "Recommends: libglib2.0-bin, python3-pystray, python3-pil, python3-gi,\n"
+               " gir1.2-ayatanaappindicator3-0.1\n"
                "Section: utils\nPriority: optional\n"
                f"Homepage: {HOMEPAGE}\n"
                "Description: sort the files of a folder into category folders\n"

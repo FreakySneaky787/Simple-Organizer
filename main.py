@@ -32,6 +32,7 @@ from organizer import (
 from utils import (
     DARK_THEME, LIGHT_THEME, acquire_instance_lock, append_error_log, csv_delimiter,
     get_downloads_dir, risky_folder_reason, safe_expanduser,
+    consume_show_request, request_show,
 )
 from theme import FONTS, apply_ttk_theme, float_key, load_fonts, set_titlebar_theme
 from icons import badge, icon
@@ -41,12 +42,14 @@ from rules import (
     is_safe_target_folder, load_rules, normalize_condition_value, save_rules,
 )
 from scheduler import OrganizerScheduler
+import autostart
+import tray
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.5.3"
+APP_VERSION  = "3.6.0"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -754,7 +757,7 @@ class _Toast(tk.Toplevel):
 class SimpleOrganizerApp(tk.Tk):
     """Root window that owns all widgets and orchestrates background threads."""
 
-    def __init__(self) -> None:
+    def __init__(self, start_minimized: bool = False) -> None:
         super().__init__()
         load_fonts(self)
 
@@ -828,6 +831,18 @@ class SimpleOrganizerApp(tk.Tk):
             value=int(self._settings.get("schedule_interval_minutes", 60)))
         self._schedule_status_var: tk.StringVar = tk.StringVar(value="Off")
 
+        # v3.6.0: cancel (#89), clean up emptied folders (#87), background mode
+        self._cancel_event:   threading.Event | None = None   # set by Cancel / closing
+        self._remove_empty:   tk.BooleanVar = tk.BooleanVar(
+            value=bool(self._settings.get("remove_empty_dirs", True)))
+        self._tray_on_close:  tk.BooleanVar = tk.BooleanVar(
+            value=bool(self._settings.get("tray_on_close", False)))
+        self._autostart_var:  tk.BooleanVar = tk.BooleanVar(value=autostart.is_enabled())
+        self._tray:           tray.TrayIcon | None = None
+        self._hidden:         bool = False   # window hidden in the tray / minimised
+        self._quitting:       bool = False   # Quit was chosen: really close
+        self._hidden_hint_shown: bool = bool(self._settings.get("tray_hint_shown", False))
+
         self._theme:       dict[str, str]              = DARK_THEME if self._dark_mode else LIGHT_THEME
         self._event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._style        = ttk.Style(self)
@@ -854,9 +869,13 @@ class SimpleOrganizerApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Configure>", self._on_configure)
         self._poll_queue()
+        self._poll_show_request()
         if not self._folder.is_dir():
             self._log(f"[WARN]  The last folder {self._folder} is not available right now "
                       "(drive unplugged or disconnected?).")
+        autostart.refresh()   # keep the login entry pointing at this program
+        if start_minimized:
+            self.after_idle(self._hide_to_background)
 
     # =========================================================================
     # Window geometry
@@ -1009,23 +1028,48 @@ class SimpleOrganizerApp(tk.Tk):
             pass
 
     def _on_close(self) -> None:
-        """Save settings, stop background scheduler, then destroy the window.
-
-        While a task is moving files the window stays open and closes as soon
-        as the task has finished: killing the worker thread mid-run would leave
-        moved files without an undo record.
-        """
+        """The window's close button: hide to the tray if the user wants the
+        app to keep running in the background, otherwise quit."""
         if self._overlays:
             self._overlays[-1].lift()
             self._overlays[-1].focus_force()
             return
+        if self._tray_on_close.get() and not self._quitting:
+            self._hide_to_background()
+            return
+        self._quit_app()
+
+    def _quit_app(self) -> None:
+        """Save settings, stop the scheduler and the tray, then destroy the window.
+
+        While a task is moving files the window stays open and closes as soon
+        as the task has finished: killing the worker thread mid-run would leave
+        moved files without an undo record. A running scan or Organize is
+        cancelled after its current file (#89).
+        """
+        self._quitting = True
+        if self._overlays:
+            self._show_from_background()
+            self._overlays[-1].lift()
+            return
         if self._busy_flag:
             if not self._close_requested:
                 self._close_requested = True
-                self._status("Closing as soon as the current task has finished...")
-                self._log("[WARN]  Close requested -- waiting for the current task to "
-                          "finish so no file is left without an undo record.")
+                if self._cancel_event is not None:
+                    self._cancel_event.set()
+                self._status("Closing as soon as the current file is done...")
+                self._log("[WARN]  Close requested -- stopping after the current file "
+                          "so no file is left without an undo record.")
             return
+        if self._tray is not None:
+            self._tray.stop()
+            self._tray = None
+        job = getattr(self, "_show_poll_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except tk.TclError:
+                pass
         try:
             self._save_settings()
         except Exception:  # noqa: BLE001 — closing must never be blocked
@@ -1110,6 +1154,15 @@ class SimpleOrganizerApp(tk.Tk):
             "Off by default. Does not affect custom Rules."
         )
 
+        self._remove_empty_cb = ttk.Checkbutton(
+            scan, text="Remove emptied folders", variable=self._remove_empty,
+            style="Card.TCheckbutton", command=self._save_settings)
+        self._remove_empty_cb.pack(anchor="w")
+        _Tooltip(self._remove_empty_cb,
+                 "After organising subdirectories, remove the folders that were\n"
+                 "left empty. Undo brings them back. Only affects folders\n"
+                 "this run emptied -- never the scanned folder itself.")
+
         limits = ttk.Frame(scan, style="Panel.TFrame")
         limits.pack(fill="x", pady=(10, 0))
         limits.columnconfigure(0, weight=1)
@@ -1169,6 +1222,28 @@ class SimpleOrganizerApp(tk.Tk):
         ttk.Label(sched, textvariable=self._schedule_status_var, style="CardHint.TLabel",
                   wraplength=self._px(SIDEBAR_W - 48), justify="left").pack(
             anchor="w", pady=(8, 0))
+
+        bg = self._card(side, "Background")
+        self._tray_cb = ttk.Checkbutton(
+            bg, text="Keep running when closed", variable=self._tray_on_close,
+            style="Card.TCheckbutton", command=self._on_tray_toggle)
+        self._tray_cb.pack(anchor="w")
+        _Tooltip(self._tray_cb,
+                 "Closing the window keeps Simple Organizer running in the\n"
+                 "system tray, so Auto-organize goes on. Quit from the tray\n"
+                 "menu or with Ctrl+Q."
+                 + ("" if tray.is_available() else
+                    "\n\nNo tray available -- the window is minimised instead.\n"
+                    + tray.unavailable_reason()))
+        self._autostart_cb = ttk.Checkbutton(
+            bg, text="Start at login", variable=self._autostart_var,
+            style="Card.TCheckbutton", command=self._on_autostart_toggle)
+        self._autostart_cb.pack(anchor="w")
+        _Tooltip(self._autostart_cb,
+                 "Start Simple Organizer in the background when you log in\n"
+                 "(Windows: per user, no admin rights; Linux: ~/.config/autostart).")
+        if not autostart.is_supported():
+            self._autostart_cb.configure(state="disabled")
 
         self._steppers = {
             "max_depth":                 self._max_depth_spin,
@@ -1460,6 +1535,12 @@ class SimpleOrganizerApp(tk.Tk):
         ttk.Label(bar, textvariable=self._pct_var, style="Pct.TLabel",
                   width=4, anchor="e").grid(row=0, column=4)
 
+        # Shown only while a scan or Organize can be cancelled (#89).
+        self._cancel_btn = ttk.Button(bar, text="Cancel", style="Card.Danger.TButton",
+                                      command=self._cancel_task)
+        self._cancel_btn.grid(row=0, column=6, padx=(10, 0))
+        self._cancel_btn.grid_remove()
+
         ttk.Label(
             bar,
             text="Ctrl+R scan   Ctrl+O organize   Ctrl+Z undo   Ctrl+1-4 tabs   Ctrl+Q quit",
@@ -1640,7 +1721,7 @@ class SimpleOrganizerApp(tk.Tk):
             return handler
 
         def close(_event: Any) -> str:
-            self._on_close()
+            self._quit_app()
             return "break"
 
         def select_tab(index: int) -> Callable[[Any], str]:
@@ -1861,7 +1942,7 @@ class SimpleOrganizerApp(tk.Tk):
     def _on_schedule_fire(self) -> None:
         self._event_queue.put({"type": "schedule_fire"})
 
-    def _run_scheduled_organize(self, retry: bool = False) -> None:
+    def _run_scheduled_organize(self, retry: bool = False, force: bool = False) -> None:
         """Start a scheduled scan + organise.
 
         While a task runs or any dialog is open the run waits (re-checked every
@@ -1872,14 +1953,14 @@ class SimpleOrganizerApp(tk.Tk):
             self._schedule_pending = False
         elif self._schedule_pending:
             return   # an earlier run is already waiting
-        if self._close_requested or not self._schedule_enabled.get():
+        if self._close_requested or not (force or self._schedule_enabled.get()):
             return
         if self._busy_flag or self._modal_open():
             if not retry:
                 self._log("[SCHEDULE]  Postponed -- waiting for the current task "
                           "or dialog to finish.")
             self._schedule_pending = True
-            self.after(2000, self._run_scheduled_organize, True)
+            self.after(2000, self._run_scheduled_organize, True, force)
             return
 
         if not self._folder.is_dir():
@@ -2094,6 +2175,7 @@ class SimpleOrganizerApp(tk.Tk):
         work: Callable[[Callable[[int, int], None], Callable[[str], None]], dict[str, Any]],
         log_tab: bool = True,
         moves_files: bool = True,
+        cancel: threading.Event | None = None,
     ) -> None:
         """Run work(progress, log) on a worker thread and queue its result event.
 
@@ -2103,6 +2185,7 @@ class SimpleOrganizerApp(tk.Tk):
         shown scan result out of date.
         """
         self._task_moves_files = moves_files
+        self._cancel_event = cancel
         self._set_busy(True)
         self._set_progress(0.0)
         self._status(status)
@@ -2172,6 +2255,9 @@ class SimpleOrganizerApp(tk.Tk):
             "max_dirs":                  self._num(self._max_dirs, "max_dirs"),
             "scan_timeout":              self._num(self._scan_timeout, "scan_timeout"),
             "excluded_files":            sorted(self._excluded_keys),
+            "remove_empty_dirs":         self._remove_empty.get(),
+            "tray_on_close":             self._tray_on_close.get(),
+            "tray_hint_shown":           self._hidden_hint_shown,
         })
         if save_settings(self._settings):
             self._settings_save_failed = False
@@ -2238,6 +2324,7 @@ class SimpleOrganizerApp(tk.Tk):
         def status(msg: str) -> None:
             self._event_queue.put({"type": "status", "value": msg})
 
+        cancel = threading.Event()
         self._start_task(
             "Scanning...",
             lambda progress, _log: {
@@ -2248,10 +2335,12 @@ class SimpleOrganizerApp(tk.Tk):
                     max_dirs=max_dirs, scan_timeout=scan_timeout,
                     use_subcategories=use_subcats,
                     progress_callback=progress, status_callback=status,
+                    cancel=cancel,
                 ),
             },
             log_tab=False,
             moves_files=False,
+            cancel=cancel,
         )
 
     def _handle_scan_done(self, result: ScanResult) -> None:
@@ -2266,6 +2355,15 @@ class SimpleOrganizerApp(tk.Tk):
             self._status("The rules changed during the scan -- press Scan again.")
             self._log("[WARN]  The rules changed while scanning -- the result was discarded"
                       + (" and the automatic run skipped." if auto_mode else "."))
+            return
+        if result.cancelled:
+            self._set_busy(False)
+            self._set_progress(0.0)
+            self._scan_result = None
+            self._render_scan_result()
+            self._status("Scan cancelled.")
+            self._log("[CANCELLED]  Scan cancelled -- nothing was moved."
+                      + (" The automatic run was skipped." if auto_mode else ""))
             return
         self._scan_result = result
         kept = 0
@@ -2626,24 +2724,34 @@ class SimpleOrganizerApp(tk.Tk):
 
     def _start_organize(self, plans: list[FilePlan], staging: bool, status: str,
                         scheduled: bool = False) -> None:
+        cancel = threading.Event()
+        remove_empty = self._remove_empty.get()
         self._start_task(
             status,
             lambda progress, log: {
                 "type": "organize_done",
                 "errors": organise_files(plans=list(plans), progress_callback=progress,
                                          log_callback=log, staging=staging,
-                                         scheduled=scheduled),
+                                         scheduled=scheduled, cancel=cancel,
+                                         remove_empty_dirs=remove_empty),
                 "staging": staging,
+                "cancelled": cancel.is_set(),
             },
-            log_tab=not scheduled)   # an automatic run keeps the user's tab (#105)
+            log_tab=not scheduled,   # an automatic run keeps the user's tab (#105)
+            cancel=cancel)
 
-    def _handle_organize_done(self, errors: list[str], staging: bool) -> None:
+    def _handle_organize_done(self, errors: list[str], staging: bool,
+                              cancelled: bool = False) -> None:
         self._scan_result = None   # listed paths are stale once files have moved
         self._set_busy(False)
         self._set_progress(100.0)
         self._render_scan_result()
 
-        if errors:
+        if cancelled and not self._close_requested:
+            self._status("Organize cancelled -- the files moved so far can be undone.")
+            self._notify("Organize cancelled",
+                         "The files moved so far are in the history and can be undone.", "info")
+        elif errors:
             self._log(f"Finished with {len(errors)} error(s). See log.")
             self._status(f"Done -- {len(errors)} error(s).")
             self._notify("Organize finished with errors",
@@ -2839,7 +2947,8 @@ class SimpleOrganizerApp(tk.Tk):
                 elif etype == "scan_done":
                     self._handle_scan_done(event["result"])
                 elif etype == "organize_done":
-                    self._handle_organize_done(event["errors"], event["staging"])
+                    self._handle_organize_done(event["errors"], event["staging"],
+                                               event.get("cancelled", False))
                 elif etype == "undo_done":
                     self._handle_undo_done(event["errors"])
                 elif etype == "commit_done":
@@ -2850,6 +2959,8 @@ class SimpleOrganizerApp(tk.Tk):
                     self._handle_trash_done(event["errors"], event["count"], event["gone"])
                 elif etype == "schedule_fire":
                     self._run_scheduled_organize()
+                elif etype == "tray":
+                    self._handle_tray_action(event["value"])
                 elif etype == "error":
                     self._auto_mode = False
                     self._status("Error -- see log.")
@@ -2877,6 +2988,116 @@ class SimpleOrganizerApp(tk.Tk):
     # Helpers
     # =========================================================================
 
+    # =========================================================================
+    # Cancel, background mode and start at login (v3.6.0)
+    # =========================================================================
+
+    def _cancel_task(self) -> None:
+        """Stop the running scan or Organize after the current file (#89)."""
+        if self._cancel_event is None or self._cancel_event.is_set():
+            return
+        self._cancel_event.set()
+        self._cancel_btn.configure(state="disabled", text="Cancelling...")
+        self._status("Cancelling after the current file...")
+
+    def _ensure_tray(self) -> bool:
+        if self._tray is not None and self._tray.running:
+            return True
+        if not tray.is_available():
+            return False
+        put = self._event_queue.put   # thread-safe; Tk is only touched by _poll_queue
+        self._tray = tray.TrayIcon(
+            title=APP_TITLE,
+            on_open=lambda: put({"type": "tray", "value": "open"}),
+            on_organize=lambda: put({"type": "tray", "value": "organize"}),
+            on_toggle_schedule=lambda: put({"type": "tray", "value": "schedule"}),
+            schedule_on=lambda: bool(self._settings.get("schedule_enabled", False)),
+            on_quit=lambda: put({"type": "tray", "value": "quit"}),
+        )
+        if not self._tray.start():
+            self._tray = None
+            return False
+        return True
+
+    def _hide_to_background(self) -> None:
+        """Hide the window; the scheduler and a running task keep going."""
+        self._save_settings()
+        if self._ensure_tray():
+            self.withdraw()
+            if not self._hidden_hint_shown and self._tray is not None:
+                self._hidden_hint_shown = True
+                self._save_settings()
+                self._tray.notify("Simple Organizer keeps running in the tray. "
+                                  "Right-click the icon to open it or quit.")
+        else:
+            self.iconify()   # no tray on this desktop: the taskbar button stays
+        self._hidden = True
+
+    def _show_from_background(self) -> None:
+        self._hidden = False
+        self.deiconify()
+        self.lift()
+        try:
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def _handle_tray_action(self, action: str) -> None:
+        if action == "open":
+            self._show_from_background()
+        elif action == "organize":
+            if self._busy_flag:
+                self._tray and self._tray.notify("A task is already running.")
+                return
+            self._run_scheduled_organize(force=True)
+        elif action == "schedule":
+            self._schedule_enabled.set(not self._schedule_enabled.get())
+            self._on_schedule_toggle()
+            self._log("[SCHEDULE]  Auto-organize turned "
+                      + ("on" if self._schedule_enabled.get() else "off") + " from the tray.")
+            if self._tray is not None:
+                self._tray.refresh()
+        elif action == "quit":
+            self._quit_app()
+
+    def _on_tray_toggle(self) -> None:
+        if self._tray_on_close.get() and not tray.is_available():
+            self._notify("No system tray",
+                         "Closing the window minimises it to the taskbar instead. "
+                         + tray.unavailable_reason(), "warning")
+        if not self._tray_on_close.get() and self._tray is not None and not self._hidden:
+            self._tray.stop()
+            self._tray = None
+        self._save_settings()
+
+    def _on_autostart_toggle(self) -> None:
+        want = self._autostart_var.get()
+        try:
+            autostart.enable() if want else autostart.disable()
+        except OSError as exc:
+            self._autostart_var.set(autostart.is_enabled())
+            self._log(f"[ERROR]  Could not change start at login: {exc}")
+            _showerror("Start at login", f"The setting could not be changed:\n{exc}", parent=self)
+            return
+        self._autostart_var.set(autostart.is_enabled())
+        if want and not self._tray_on_close.get():
+            # Starting hidden only makes sense if closing does not quit.
+            self._tray_on_close.set(True)
+            self._on_tray_toggle()
+        self._log("[SETTINGS]  Start at login turned " + ("on." if want else "off."))
+
+    def _poll_show_request(self) -> None:
+        """A second start of the app asks this one to show its window."""
+        try:
+            if consume_show_request():
+                self._show_from_background()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._show_poll_job = self.after(1000, self._poll_show_request)
+        except tk.TclError:
+            pass
+
     def _set_busy(self, busy: bool) -> None:
         self._busy_flag = busy
         state = "disabled" if busy else "normal"
@@ -2885,15 +3106,25 @@ class SimpleOrganizerApp(tk.Tk):
             self._hidden_cb, self._staging_cb, self._subcats_cb,
             self._max_depth_spin, self._max_dirs_spin, self._timeout_spin,
             self._sched_cb, self._sched_spin, self._export_btn,
+            self._remove_empty_cb,
         ):
             w.configure(state=state)
         self.configure(cursor="watch" if busy else "")
         self._state_var.set("WORKING" if busy else "READY")
         self._state_dot.configure(style="Busy.TLabel" if busy else "Idle.TLabel")
+        if busy and self._cancel_event is not None:
+            self._cancel_btn.configure(state="normal", text="Cancel")
+            self._cancel_btn.grid()
+        else:
+            self._cancel_btn.grid_remove()
+        if not busy:
+            self._cancel_event = None
+        if self._tray is not None:
+            self._tray.refresh()
         self._refresh_persistent_buttons()
         if not busy and self._close_requested:
             # Close after the current handler has finished updating the window.
-            self.after_idle(self._on_close)
+            self.after_idle(self._quit_app)
 
     def _set_progress(self, value: float) -> None:
         self._progress_var.set(value)
@@ -3286,9 +3517,14 @@ def _message_without_app(title: str, message: str, error: bool = False) -> None:
 def main() -> None:
     # Only one instance: two would share and overwrite the staging manifest and
     # the history. The lock is released by the OS when this process ends.
+    minimized = "--minimized" in sys.argv[1:]
     lock = acquire_instance_lock()
     if lock is None:
-        if not _bring_running_instance_to_front():
+        # The running app may be hidden in the tray: ask it to show itself.
+        # A login start (--minimized) never pops up the window.
+        requested = minimized or request_show()
+        shown = not minimized and _bring_running_instance_to_front()
+        if not requested and not shown:
             _message_without_app(APP_TITLE, "Simple Organizer is already running.\n\n"
                                             "Switch to the open window instead.")
         return
@@ -3299,9 +3535,10 @@ def main() -> None:
                          + "".join(traceback.format_exception(
                              args.exc_type, args.exc_value, args.exc_traceback)))
     threading.excepthook = thread_crash
+    consume_show_request()   # left over from a start while an older instance quit
 
     try:
-        app = SimpleOrganizerApp()
+        app = SimpleOrganizerApp(start_minimized=minimized)
     except Exception:  # noqa: BLE001
         path = append_error_log(f"Simple Organizer v{APP_VERSION} -- failed to start\n"
                                 + traceback.format_exc())

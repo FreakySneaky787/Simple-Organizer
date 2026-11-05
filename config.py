@@ -39,6 +39,9 @@ DEFAULT_SETTINGS: dict = {
     "max_dirs":                  10000,   # max directories before abort
     "scan_timeout":              30.0,    # scan wall-clock timeout in seconds
     "excluded_files":            [],      # files of last_folder set to "Don't move" (normcase'd)
+    "remove_empty_dirs":         True,    # remove folders a recursive Organize emptied (#87)
+    "tray_on_close":             False,   # closing the window keeps the app running in the tray
+    "tray_hint_shown":           False,   # the "still running in the tray" hint was shown once
 }
 
 
