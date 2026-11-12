@@ -191,20 +191,6 @@ When reporting a bug, please attach `error.log` if there is one.
 
 ## Roadmap
 
-### Next: v3.6.1 (bug-fix release)
-
-Fixes from a code review of v3.6.0 ([milestone](https://github.com/FreakySneaky787/Simple-Organizer/milestone/3)):
-
-- Linux: tray menu with the AppIndicator/GTK backend (#108)
-- Background mode: notifications and error dialogs while the window is hidden (#109)
-- Quit with a dialog open: closing the window later quits instead of hiding (#110)
-- Cancel: wrong "cancelled" message, errors of a cancelled run (#111)
-- Duplicates of sorted files: no repeated hashing inside sorted folders (#112)
-- Build steps for the exe: install pystray and Pillow (#113)
-- Start at login: the entry is rewritten to every started copy (#114)
-
-### Later
-
 Simple Organizer is feature-complete. Ideas that may still come as packaging or maintenance work:
 
 - Flatpak / AppImage packaging for Linux
