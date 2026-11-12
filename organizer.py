@@ -181,8 +181,12 @@ def find_duplicates(
     skipped_cloud: list[Path] | None = None,
     hard_links: list[Path] | None = None,
     cancel: threading.Event | None = None,
+    only_with: frozenset[str] | None = None,
 ) -> list[list[Path]]:
     """Return groups of byte-identical files (2+ members each).
+
+    only_with (normcase'd paths): size buckets that hold none of these files
+    are dropped before anything is hashed (#112).
 
     Two-stage: size buckets first (cheap), then SHA-256 for matches only.
     Empty files are ignored: they are all "identical", and offering to trash
@@ -222,7 +226,10 @@ def find_duplicates(
         size_buckets[sz].append(f)
 
     candidates: list[tuple[int, Path]] = [
-        (sz, f) for sz, group in size_buckets.items() if len(group) > 1 for f in group
+        (sz, f) for sz, group in size_buckets.items()
+        if len(group) > 1 and (only_with is None
+                               or any(os.path.normcase(str(g)) in only_with for g in group))
+        for f in group
     ]
 
     hash_buckets: dict[tuple[int, str], list[Path]] = defaultdict(list)
@@ -774,6 +781,8 @@ def scan_folder(
             skipped_cloud=skipped_cloud,
             hard_links=hard_links,
             cancel=cancel,
+            # Equal-sized files that are all already sorted are not hashed (#112).
+            only_with=new_keys if sorted_files else None,
         )
         if sorted_files:
             groups = [g for g in groups
@@ -957,18 +966,23 @@ def organise_files(
     scheduled:         bool = False,
     cancel:            threading.Event | None = None,
     remove_empty_dirs: bool = False,
+    outcome:           dict | None = None,
 ) -> list[str]:
     """Execute planned file moves. Files are NEVER deleted or overwritten.
 
     cancel stops the run after the current file (#89); the files moved so far
     stay in the history and can be undone. remove_empty_dirs removes the
     sub-folders the run emptied (#87); they are recorded and re-created on undo.
+    outcome, if given, gets "cancelled": True only when the run really stopped
+    before its last file (#111).
 
     scheduled marks the history run as an automatic one; automatic and manual
     runs are limited separately, so the scheduler cannot push manual runs out
     of the undo history.
     """
     _ensure_data_dir()
+    if outcome is not None:
+        outcome["cancelled"] = False
 
     errors:       list[str]           = []
     actionable                        = _blockers_first(
@@ -1026,6 +1040,8 @@ def organise_files(
             if log_callback:
                 log_callback(f"[CANCELLED]  Stopped -- {_plural(len(move_log), 'file', 'files')} "
                              f"moved, {total - idx + 1} left in place. Undo works as usual.")
+            if outcome is not None:
+                outcome["cancelled"] = True
             break
         if progress_callback:
             progress_callback(idx, total)

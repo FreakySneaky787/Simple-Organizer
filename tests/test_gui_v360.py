@@ -41,7 +41,7 @@ autostart.refresh = lambda: None
 
 app = main.SimpleOrganizerApp()
 app.update()
-check("title shows 3.6.0", app.title().endswith("v3.6.0"), app.title())
+check("title shows the version", app.title().endswith(f"v{main.APP_VERSION}"), app.title())
 check("Cancel button hidden when idle", not app._cancel_btn.winfo_ismapped())
 check("Remove emptied folders on by default", app._remove_empty.get())
 check("background mode off by default", not app._tray_on_close.get())

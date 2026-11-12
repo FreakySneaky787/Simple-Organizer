@@ -40,22 +40,22 @@ All guarantees: [Safety](https://github.com/FreakySneaky787/Simple-Organizer/wik
 
 ### Windows 10 / 11
 
-1. Download `simple_organizer_windows_v3.6.0.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
+1. Download `simple_organizer_windows_v3.6.1.zip` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest)
 2. Extract it and double-click `simple_organizer.exe` — no installation needed
 3. If SmartScreen warns: right-click → **Properties** → **Unblock** (the exe is not code-signed yet)
 
 The `.sha256` file on the release page is the checksum of the exe:
 
 ```powershell
-Get-FileHash simple_organizer_windows_v3.6.0\simple_organizer.exe -Algorithm SHA256
+Get-FileHash simple_organizer_windows_v3.6.1\simple_organizer.exe -Algorithm SHA256
 ```
 
 ### Linux
 
-**Debian 12+, Ubuntu, Simple OS:** download `simple-organizer_3.6.0_all.deb` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest) and install it — it appears in the app menu:
+**Debian 12+, Ubuntu, Simple OS:** download `simple-organizer_3.6.1_all.deb` from the [latest release](https://github.com/FreakySneaky787/Simple-Organizer/releases/latest) and install it — it appears in the app menu:
 
 ```bash
-sudo apt install ./simple-organizer_3.6.0_all.deb
+sudo apt install ./simple-organizer_3.6.1_all.deb
 ```
 
 **Other distributions** — run it from source (Python 3.10+ with Tkinter):
@@ -96,6 +96,20 @@ macOS is not supported.
 Questions? See the [FAQ and Troubleshooting](https://github.com/FreakySneaky787/Simple-Organizer/wiki/FAQ-and-Troubleshooting).
 
 ---
+
+## What's New in v3.6.1
+
+Bug-fix release — fixes from a code review of v3.6.0, mostly for the background mode (#108 – #114):
+
+- **Linux tray:** the tray menu now works with the AppIndicator and GTK tray (GNOME, Simple OS) — its loop runs on its own thread instead of waiting for a GLib main loop that never ran (#108)
+- **Background mode:** while the window is hidden in the tray, messages appear as system notifications; an error no longer opens an invisible dialog that held back every later automatic run — it is shown when you open the window (#109)
+- **Quit** with a dialog open no longer makes a later click on the close button quit instead of going to the tray (#110)
+- **Cancel:** pressing Cancel during the last file no longer reports a finished run as cancelled, and errors of a cancelled run are reported (#111)
+- **Duplicates of sorted files:** equal-sized files that are all already sorted are no longer hashed on every scan (#112)
+- **Start at login** is no longer moved to every copy of the app you start; it is only repaired when its program is gone (#114)
+- Build steps for the exe install `pystray` and `Pillow` (#113)
+
+Full notes: [Release v3.6.1](https://github.com/FreakySneaky787/Simple-Organizer/releases/tag/v3.6.1)
 
 ## What's New in v3.6.0
 

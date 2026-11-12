@@ -16,6 +16,8 @@ startup settings.
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -181,13 +183,61 @@ def disable() -> None:
             pass
 
 
+def _split_command(text: str) -> list[str]:
+    """The arguments of a Windows Run value or a desktop Exec line."""
+    if sys.platform == "win32":
+        return [m.group(1) if m.group(1) is not None else m.group(2)
+                for m in re.finditer(r'"([^"]*)"|(\S+)', text)]
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
+def current_args() -> list[str] | None:
+    """The arguments of the existing login entry, or None if there is none."""
+    try:
+        if sys.platform == "win32":
+            winreg = _winreg()
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+                value, _ = winreg.QueryValueEx(key, APP_NAME)
+            return _split_command(str(value))
+        if sys.platform.startswith("linux"):
+            for line in desktop_file().read_text(encoding="utf-8").splitlines():
+                key, _, value = line.partition("=")
+                if key.strip() == "Exec":
+                    return _split_command(value.strip())
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _same_or_missing(entry: list[str]) -> bool:
+    """True if the entry starts this program, or a program that is gone."""
+    ours = [a for a in command_args() if a != MINIMIZED]
+    theirs = [a for a in entry if a != MINIMIZED]
+    if [os.path.normcase(a) for a in theirs] == [os.path.normcase(a) for a in ours]:
+        return True
+    paths = [a for a in theirs if os.path.isabs(a)]
+    return not paths or any(not os.path.exists(p) for p in paths)
+
+
 def refresh() -> None:
-    """Rewrite an existing entry, e.g. after the exe was moved or updated."""
-    if is_enabled():
-        try:
-            enable()
-        except OSError:
-            pass
+    """Rewrite an existing entry when it starts this program (e.g. an older
+    format) or a program that no longer exists (the exe was moved).
+
+    An entry for another copy that still exists is left alone: trying a
+    second copy once must not move the login start to it (#114).
+    """
+    if not is_enabled():
+        return
+    entry = current_args()
+    if entry is not None and not _same_or_missing(entry):
+        return
+    try:
+        enable()
+    except OSError:
+        pass
 
 
 __all__ = ["is_supported", "is_enabled", "enable", "disable", "refresh",

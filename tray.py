@@ -114,16 +114,25 @@ class TrayIcon:
             )
             try:
                 icon = pystray.Icon("simple_organizer", _image(), self._title, menu)
-                # run_detached lets Tk keep the main thread; where a backend
-                # cannot do that, run the icon's own loop on a thread.
-                try:
+                if sys.platform == "win32":
+                    # The Windows backend runs its own message loop thread.
                     icon.run_detached()
-                except NotImplementedError:
+                else:
+                    # Linux: the AppIndicator and GTK backends need a running
+                    # GLib main loop, which run_detached() does not start --
+                    # Tk has its own loop, so the menu would never react (#108).
+                    # icon.run() runs that loop on its own thread; GTK is then
+                    # only used from there (pystray marshals stop/notify to it).
                     threading.Thread(target=icon.run, name="tray", daemon=True).start()
             except Exception:  # noqa: BLE001 -- no tray on this desktop
                 return False
             self._icon = icon
             return True
+
+    @property
+    def can_notify(self) -> bool:
+        icon = self._icon
+        return icon is not None and bool(getattr(icon, "HAS_NOTIFICATION", False))
 
     def refresh(self) -> None:
         """Redraw the menu (the Auto-organize check mark)."""

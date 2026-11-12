@@ -49,7 +49,7 @@ import tray
 # Constants
 # ---------------------------------------------------------------------------
 APP_TITLE    = "Simple Organizer"
-APP_VERSION  = "3.6.0"
+APP_VERSION  = "3.6.1"
 MIN_W, MIN_H = 980, 720
 SIDEBAR_W    = 268
 
@@ -840,6 +840,8 @@ class SimpleOrganizerApp(tk.Tk):
         self._autostart_var:  tk.BooleanVar = tk.BooleanVar(value=autostart.is_enabled())
         self._tray:           tray.TrayIcon | None = None
         self._hidden:         bool = False   # window hidden in the tray / minimised
+        self._pending_notice: tuple[str, str, str] | None = None   # shown when the window is back (#109)
+        self._pending_error:  str | None = None
         self._quitting:       bool = False   # Quit was chosen: really close
         self._hidden_hint_shown: bool = bool(self._settings.get("tray_hint_shown", False))
 
@@ -1047,11 +1049,13 @@ class SimpleOrganizerApp(tk.Tk):
         moved files without an undo record. A running scan or Organize is
         cancelled after its current file (#89).
         """
-        self._quitting = True
         if self._overlays:
+            # A dialog is open: show it, do not quit, and do not remember the
+            # request -- closing the window later must still go to the tray (#110).
             self._show_from_background()
             self._overlays[-1].lift()
             return
+        self._quitting = True
         if self._busy_flag:
             if not self._close_requested:
                 self._close_requested = True
@@ -1683,6 +1687,15 @@ class SimpleOrganizerApp(tk.Tk):
                 widget.configure(compound="left")
 
     def _notify(self, title: str, message: str, kind: str = "success") -> None:
+        if getattr(self, "_hidden", False):
+            # The window (and every toast, which is owned by it) is hidden in
+            # the tray: use a system notification, or keep the message for
+            # when the window is shown again (#109).
+            if self._tray is not None and self._tray.running and self._tray.can_notify:
+                self._tray.notify(message, title)
+            else:
+                self._pending_notice = (title, message, kind)
+            return
         if self._toast:
             self._toast.destroy()
         self._toast = _Toast(self, title, message, kind)
@@ -2726,6 +2739,7 @@ class SimpleOrganizerApp(tk.Tk):
                         scheduled: bool = False) -> None:
         cancel = threading.Event()
         remove_empty = self._remove_empty.get()
+        outcome: dict[str, Any] = {"cancelled": False}
         self._start_task(
             status,
             lambda progress, log: {
@@ -2733,9 +2747,11 @@ class SimpleOrganizerApp(tk.Tk):
                 "errors": organise_files(plans=list(plans), progress_callback=progress,
                                          log_callback=log, staging=staging,
                                          scheduled=scheduled, cancel=cancel,
-                                         remove_empty_dirs=remove_empty),
+                                         remove_empty_dirs=remove_empty, outcome=outcome),
                 "staging": staging,
-                "cancelled": cancel.is_set(),
+                # Only when the run really stopped early, not when Cancel came
+                # during the last file (#111). Read after organise_files returned.
+                "cancelled": outcome["cancelled"],
             },
             log_tab=not scheduled,   # an automatic run keeps the user's tab (#105)
             cancel=cancel)
@@ -2748,9 +2764,17 @@ class SimpleOrganizerApp(tk.Tk):
         self._render_scan_result()
 
         if cancelled and not self._close_requested:
-            self._status("Organize cancelled -- the files moved so far can be undone.")
-            self._notify("Organize cancelled",
-                         "The files moved so far are in the history and can be undone.", "info")
+            if errors:   # files that failed before Cancel are reported too (#111)
+                self._log(f"Cancelled with {len(errors)} error(s). See log.")
+                self._status(f"Organize cancelled -- {len(errors)} error(s), see log. "
+                             "The files moved so far can be undone.")
+                self._notify("Organize cancelled",
+                             f"{len(errors)} file(s) could not be moved. The files moved "
+                             "so far are in the history and can be undone.", "warning")
+            else:
+                self._status("Organize cancelled -- the files moved so far can be undone.")
+                self._notify("Organize cancelled",
+                             "The files moved so far are in the history and can be undone.", "info")
         elif errors:
             self._log(f"Finished with {len(errors)} error(s). See log.")
             self._status(f"Done -- {len(errors)} error(s).")
@@ -2974,7 +2998,16 @@ class SimpleOrganizerApp(tk.Tk):
                         self._scan_result = None
                         self._render_scan_result()
                     self._set_busy(False)
-                    if not closing:   # the window is about to close: log only
+                    if closing:   # the window is about to close: log only
+                        pass
+                    elif self._hidden:
+                        # A dialog of a hidden window is invisible but would count
+                        # as open and hold back every automatic run (#109): notify
+                        # now, show the dialog when the window is opened.
+                        self._pending_error = event["value"]
+                        self._notify("Something went wrong",
+                                     "Open Simple Organizer to see the details.", "error")
+                    else:
                         _showerror("Error", event["value"], parent=self)
         except queue.Empty:
             pass
@@ -3034,13 +3067,24 @@ class SimpleOrganizerApp(tk.Tk):
         self._hidden = True
 
     def _show_from_background(self) -> None:
-        self._hidden = False
+        was_hidden, self._hidden = self._hidden, False
         self.deiconify()
         self.lift()
         try:
             self.focus_force()
         except tk.TclError:
             pass
+        if was_hidden:
+            self.after_idle(self._show_pending_messages)
+
+    def _show_pending_messages(self) -> None:
+        """Messages that came while the window was hidden (#109)."""
+        notice, self._pending_notice = self._pending_notice, None
+        error, self._pending_error = self._pending_error, None
+        if notice is not None:
+            self._notify(*notice)
+        if error is not None and not self._close_requested:
+            _showerror("Error", error, parent=self)
 
     def _handle_tray_action(self, action: str) -> None:
         if action == "open":
